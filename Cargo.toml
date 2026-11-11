@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/paged-collections", "crates/paged-collections-py"]
+default-members = ["crates/paged-collections"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+keywords = ["sparse-set", "paged", "collections", "ecs", "data-structures"]
+categories = ["data-structures", "no-std"]
+
+[workspace.dependencies]
+paged-collections = { path = "crates/paged-collections", version = "0.1.0" }
+pyo3 = { version = "0.30", features = ["abi3-py310"] }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"

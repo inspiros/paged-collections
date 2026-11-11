@@ -1,0 +1,19 @@
+[package]
+name = "paged-collections-py"
+description = "Python bindings for paged-collections"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+paged-collections = { workspace = true }
+pyo3 = { workspace = true }
+
+[lints]
+workspace = true

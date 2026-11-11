@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
+
+[project]
+name = "paged-collections"
+description = "Paged sparse sets, maps and stable-address containers, implemented in Rust"
+readme = "../../README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dynamic = ["version"]
+
+[dependency-groups]
+dev = ["maturin>=1.16,<2", "pytest>=8"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "paged_collections._core"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
