@@ -63,20 +63,6 @@ assert_eq!(in_range, [10, 20]);
 
 ## Python
 
-`PagedList` stores objects in pages of 1024 elements; `paged_list(dtype)`
-selects a typed list. Slices are copies. Typed `page_view` arrays share
-storage and remain valid across appends; release them before removing or
-moving elements.
-
-```python
-from paged_collections import paged_list
-
-values = paged_list("float64", [1.0, 2.0, 3.0])
-page = values.page_view(0)
-page[0] = 4.0                   # updates values[0]
-values.append(5.0)              # page still covers the original three values
-```
-
 Keys are integers in `0 <= key < 2**32`. `SparseSet` holds keys,
 `SparseMap` maps keys to any objects, and `SparseMapF64`, `SparseMapI64` and
 the other typed maps (or `sparse_map(dtype)`) store numbers unboxed:
@@ -143,6 +129,41 @@ names[c] = "new"                  # replaces a's entry
 a in ids                          # False
 a in names                        # False
 names[c]                          # "new"
+```
+
+`Hive` stores any objects in reusable slots and hands out ids of the same
+form: `insert` returns an id, removing a value makes its id stale for good,
+and a freed slot is reused with the next generation. Iteration is in slot
+order; pickles and copies keep every id and the generation history. An
+`IdMap` keyed by hive ids makes a side table.
+
+```python
+from paged_collections import Hive
+
+hive = Hive()
+a = hive.insert("a")
+ids = hive.insert_many(["b", "c"])   # array of uint64 ids
+del hive[a]
+c = hive.insert("d")                 # reuses a's slot, next generation
+a in hive                            # False
+hive[c]                              # "d"
+```
+
+`PagedList` is a list stored in pages of 1024 elements, so appending never
+moves existing elements; `paged_list(dtype)` picks a typed list (float64,
+int64 and the other map dtypes). Slices are copies. A typed list's
+`page_view(i)` is a zero-copy NumPy view of one page that stays valid while
+the list grows; while any view is alive, operations that remove, move or
+reorder elements raise `BufferError`.
+
+```python
+from paged_collections import paged_list
+
+values = paged_list("float64", [1.0, 2.0, 3.0])
+page = values.page_view(0)
+page[0] = 4.0                     # updates values[0]
+values.extend(range(5000))        # allowed: existing pages never move
+values.pop()                      # BufferError while `page` is alive
 ```
 
 ## Layout

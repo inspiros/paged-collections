@@ -13,6 +13,7 @@ use pyo3::types::{PyDict, PyIterator, PyTuple, PyType};
 mod convert;
 mod direct_map;
 mod export;
+mod hive;
 mod id_alloc;
 mod iter;
 mod object_map;
@@ -181,6 +182,8 @@ mod _core {
     };
     #[pymodule_export]
     use crate::export::ExportGuard;
+    #[pymodule_export]
+    use crate::hive::{Hive, HiveIterator};
     #[pymodule_export]
     use crate::id_alloc::{
         IdAllocator, IdAllocatorIterator, id_generation, id_index, id_indices, make_id,

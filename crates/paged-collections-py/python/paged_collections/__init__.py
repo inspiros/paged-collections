@@ -1,4 +1,4 @@
-"""Paged lists, sets and maps, and generational id allocation, implemented in Rust.
+"""Paged lists, hives, sets and maps, and generational id allocation, implemented in Rust.
 
 ``SparseSet``, ``SparseMap`` and ``DirectMap`` use integer keys in
 ``0 <= key < 2**32``. ``SparseSet`` holds keys only;
@@ -12,6 +12,10 @@ and ``id_map(dtype)`` pick the map class for a dtype.
 ``PagedList`` stores arbitrary objects in pages; typed variants store numbers
 unboxed and expose individual pages as NumPy views. ``paged_list(dtype)``
 picks the list class for a dtype.
+
+``Hive`` stores objects in reusable slots and issues generational ids.
+Removing a value makes its id stale; insertions reuse slots with new generations.
+Iteration visits ids in slot order, and ``IdMap`` can hold related values.
 
 ``IdAllocator`` issues integer ids packed as ``generation << 32 | index``.
 Freed indices are reused last freed first with a new generation. ``id_index``,
@@ -38,6 +42,7 @@ from paged_collections._core import (
     DirectMapI64,
     DirectMapU32,
     DirectMapU64,
+    Hive,
     IdAllocator,
     IdMap,
     IdMapBool,
@@ -213,6 +218,7 @@ __all__ = [
     "DirectMapI64",
     "DirectMapU32",
     "DirectMapU64",
+    "Hive",
     "IdAllocator",
     "IdMap",
     "IdMapBool",
