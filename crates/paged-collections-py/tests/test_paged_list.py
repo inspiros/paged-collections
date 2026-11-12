@@ -747,3 +747,66 @@ def test_numpy_conversion(typed_cls):
     big = np.arange(2000, dtype=np.int64)
     np.testing.assert_array_equal(a.get_many(big), a.to_numpy()[big])
     np.testing.assert_array_equal(a.get_many(big.astype(np.uint16)), a.to_numpy()[big])
+
+
+class _Index:
+    """An index whose ``__index__`` runs a callback first."""
+
+    def __init__(self, value, callback):
+        self.value, self.callback = value, callback
+
+    def __index__(self):
+        self.callback()
+        return self.value
+
+
+def test_review_reentrant_reserve_and_slice_order(list_cls):
+    a = list_cls(data(list_cls, [1, 2, 3]))
+    a.reserve(_Index(10, lambda: a.append(a[0])))
+    assert len(a) == 4
+    calls = []
+    with pytest.raises(ValueError, match="slice step cannot be zero"):
+        _ = a[_Index(0, lambda: calls.append(1))::0]
+    assert calls == [] and len(a) == 4
+
+
+def test_review_sort_reverse_int_and_reinit(list_cls):
+    a = list_cls(data(list_cls, [1, 0, 1, 0]))
+    b = list(a)
+    a.sort(reverse=1)
+    b.sort(reverse=1)
+    assert list(a) == b
+    with pytest.raises(TypeError):
+        a.sort(reverse="yes")
+    a.__init__()
+    assert len(a) == 0
+    assert len(a * 0) == 0 and len(a * -5) == 0
+
+
+def test_review_append_into_viewed_partial_page(typed_cls):
+    a = typed_cls(data(typed_cls, [1, 0, 1]))
+    view = a.page_view(0)
+    before = view.copy()
+    for _ in range(3000):
+        a.append(scalar(typed_cls, 1))
+    np.testing.assert_array_equal(view, before)
+    assert list(a[:3]) == list(before)
+
+
+def test_review_array_dtype_property_can_mutate(typed_cls):
+    a = typed_cls(data(typed_cls, [1, 0]))
+
+    class Proxy:
+        @property
+        def dtype(self):
+            a.append(scalar(typed_cls, 1))
+            return np.dtype("float64")
+
+    arr = np.asarray(a, dtype=np.float64)
+    assert arr.dtype == np.float64
+    try:
+        a.__array__(dtype=Proxy())
+    except TypeError:
+        pass  # NumPy may refuse the proxy; it must not be a borrow error
+    except RuntimeError as err:  # pragma: no cover - the bug being guarded
+        pytest.fail(f"borrow held during astype: {err}")

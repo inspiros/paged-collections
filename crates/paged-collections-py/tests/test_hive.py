@@ -568,3 +568,24 @@ def test_state_encoding_placeholders_retired_slots_and_floors():
 @pytest.mark.skip(reason="Exhaustion requires all 2**32-1 slots occupied or retired")
 def test_exhaustion():
     pass
+
+
+def test_review_bad_state_rejected_before_allocation():
+    # Many one-slot pages, then an odd floor: must be ValueError, quickly.
+    n = 4000
+    floors = np.zeros(n, dtype=np.uint32)
+    floors[-1] = 1
+    lens = np.ones(n, dtype=np.uint32)
+    versions = np.ones(n, dtype=np.uint32)
+    with pytest.raises(ValueError, match="odd page floor"):
+        Hive(None, (floors, lens, versions))
+
+
+def test_review_many_single_inserts_are_fast():
+    import time
+
+    hive = Hive()
+    start = time.perf_counter()
+    ids = [hive.insert(i) for i in range(200_000)]
+    assert time.perf_counter() - start < 5
+    assert len(hive) == 200_000 and hive[ids[-1]] == 199_999

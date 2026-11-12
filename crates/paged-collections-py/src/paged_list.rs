@@ -69,6 +69,17 @@ fn remove_positions<T>(list: &mut PagedVec<T>, mut positions: Vec<usize>) -> Vec
     removed
 }
 
+/// `list.sort`'s `reverse`: any int (bools included), by truth value.
+fn sort_reverse(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if obj.cast::<pyo3::types::PyInt>().is_err() {
+        return Err(PyTypeError::new_err(format!(
+            "'{}' object cannot be interpreted as an integer",
+            obj.get_type().name()?
+        )));
+    }
+    obj.is_truthy()
+}
+
 fn position(i: isize, len: usize, name: &str) -> PyResult<usize> {
     let i = if i < 0 {
         i.saturating_add(len as isize)
@@ -100,15 +111,21 @@ enum Subscript<'py> {
 impl<'py> Subscript<'py> {
     fn new(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
         if obj.cast::<PySlice>().is_ok() {
-            let mut parts = Vec::new();
-            for name in ["start", "stop", "step"] {
+            // As CPython does: the step first, rejected if zero before the
+            // bounds' `__index__` runs.
+            let convert = |name: &str| -> PyResult<Bound<'py, PyAny>> {
                 let part = obj.getattr(name)?;
-                parts.push(if part.is_none() {
-                    part
+                if part.is_none() {
+                    Ok(part)
                 } else {
-                    signed_index(&part)?.into_bound_py_any(obj.py())?
-                });
+                    signed_index(&part)?.into_bound_py_any(obj.py())
+                }
+            };
+            let step = convert("step")?;
+            if !step.is_none() && step.extract::<isize>()? == 0 {
+                return Err(PyValueError::new_err("slice step cannot be zero"));
             }
+            let parts = vec![convert("start")?, convert("stop")?, step];
             let slice = obj
                 .py()
                 .import("builtins")?
@@ -353,11 +370,12 @@ impl PagedList {
 
     #[pyo3(signature = (values=None))]
     fn __init__(slf: &Bound<'_, Self>, values: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
-        if let Some(values) = values {
-            Self::clear(slf)?;
-            Self::extend(slf, values)?;
+        // As `list.__init__`: always starts from empty.
+        Self::clear(slf)?;
+        match values {
+            Some(values) => Self::extend(slf, values),
+            None => Ok(()),
         }
-        Ok(())
     }
     fn __len__(&self) -> usize {
         self.list.len()
@@ -563,6 +581,9 @@ impl PagedList {
     }
     fn __mul__(slf: &Bound<'_, Self>, n: &Bound<'_, PyAny>) -> PyResult<Self> {
         let n = strict_index(n)?;
+        if n <= 0 {
+            return Ok(Self::empty());
+        }
         let vals = slf.try_borrow()?.snapshot(slf.py());
         let total = repeat_len(vals.len(), n)?;
         let mut out = Self::empty();
@@ -579,6 +600,9 @@ impl PagedList {
         let n = strict_index(n)?;
         if n <= 0 {
             return Self::clear(slf);
+        }
+        if n == 1 {
+            return Ok(());
         }
         let py = slf.py();
         let vals = slf.try_borrow()?.snapshot(py);
@@ -661,7 +685,11 @@ impl PagedList {
         Self::from_values(self.snapshot(py))
     }
     #[pyo3(signature = (*, key=None, reverse=false))]
-    fn sort(slf: &Bound<'_, Self>, key: Option<&Bound<'_, PyAny>>, reverse: bool) -> PyResult<()> {
+    fn sort(
+        slf: &Bound<'_, Self>,
+        key: Option<&Bound<'_, PyAny>>,
+        #[pyo3(from_py_with = sort_reverse)] reverse: bool,
+    ) -> PyResult<()> {
         let py = slf.py();
         let (vals, mods) = {
             let this = slf.try_borrow()?;
@@ -689,12 +717,13 @@ impl PagedList {
         drop(removed);
         Ok(())
     }
-    fn reserve(&mut self, additional: usize) -> PyResult<()> {
-        self.list
+    fn reserve(slf: &Bound<'_, Self>, additional: &Bound<'_, PyAny>) -> PyResult<()> {
+        // Convert before borrowing: `__index__` can run Python code.
+        let additional = additional.extract::<usize>()?;
+        slf.try_borrow_mut()?
+            .list
             .try_reserve(additional)
-            .map_err(crate::reserve_error)?;
-        self.changed();
-        Ok(())
+            .map_err(crate::reserve_error)
     }
     fn shrink_to_fit(&mut self) {
         self.list.shrink_to_fit();
@@ -815,8 +844,12 @@ macro_rules! typed_list {
             fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self { Self::empty() }
             #[pyo3(signature = (values=None))]
             fn __init__(slf: &Bound<'_, Self>, values: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
-                if let Some(values) = values {
-                    let vals = typed_values::<$t>(values)?;
+                // As `list.__init__`: always starts from empty.
+                let vals = match values {
+                    Some(values) => typed_values::<$t>(values)?,
+                    None => Vec::new(),
+                };
+                {
                     let mut this = slf.try_borrow_mut()?;
                     if !this.list.is_empty() { this.exports.check($pyname)?; }
                     let additional = vals.len().saturating_sub(this.list.len());
@@ -934,6 +967,7 @@ macro_rules! typed_list {
             fn __iadd__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> { Self::extend(slf, other) }
             fn __mul__(slf: &Bound<'_, Self>, n: &Bound<'_, PyAny>) -> PyResult<Self> {
                 let n = strict_index(n)?;
+                if n <= 0 { return Ok(Self::empty()); }
                 let vals = slf.try_borrow()?.snapshot();
                 let total = repeat_len(vals.len(), n)?;
                 let mut out = Self::empty();
@@ -948,6 +982,7 @@ macro_rules! typed_list {
                 let n = strict_index(n)?;
                 let mut this = slf.try_borrow_mut()?;
                 if n <= 0 { this.exports.check($pyname)?; this.list.clear(); return Ok(()); }
+                if n == 1 { return Ok(()); }
                 let vals = this.snapshot();
                 let total = repeat_len(vals.len(), n)?;
                 this.list.try_reserve(total - vals.len()).map_err(crate::reserve_error)?;
@@ -988,12 +1023,17 @@ macro_rules! typed_list {
             fn reverse(&mut self) -> PyResult<()> { self.exports.check($pyname)?; self.list.reverse(); Ok(()) }
             fn copy(&self) -> PyResult<Self> { Self::from_values(self.snapshot()) }
             #[pyo3(signature = (*, reverse=false))]
-            fn sort(&mut self, reverse: bool) -> PyResult<()> {
-                self.exports.check($pyname)?;
-                self.list.sort_by(|a,b| if reverse { numeric_order(b.get(), a.get()) } else { numeric_order(a.get(), b.get()) });
+            fn sort(slf: &Bound<'_, Self>, #[pyo3(from_py_with = sort_reverse)] reverse: bool) -> PyResult<()> {
+                let mut this = slf.try_borrow_mut()?;
+                this.exports.check($pyname)?;
+                this.list.sort_by(|a,b| if reverse { numeric_order(b.get(), a.get()) } else { numeric_order(a.get(), b.get()) });
                 Ok(())
             }
-            fn reserve(&mut self, additional: usize) -> PyResult<()> { self.list.try_reserve(additional).map_err(crate::reserve_error) }
+            fn reserve(slf: &Bound<'_, Self>, additional: &Bound<'_, PyAny>) -> PyResult<()> {
+                // Convert before borrowing: `__index__` can run Python code.
+                let additional = additional.extract::<usize>()?;
+                slf.try_borrow_mut()?.list.try_reserve(additional).map_err(crate::reserve_error)
+            }
             fn shrink_to_fit(&mut self) -> PyResult<()> { self.exports.check($pyname)?; self.list.shrink_to_fit(); Ok(()) }
             #[getter]
             fn capacity(&self) -> usize { self.list.capacity() }
@@ -1008,13 +1048,15 @@ macro_rules! typed_list {
             /// NumPy conversion (`numpy.asarray(lst)`): always a copy, since
             /// the pages are not contiguous.
             #[pyo3(signature = (dtype=None, copy=None))]
-            fn __array__<'py>(&self, py: Python<'py>, dtype: Option<&Bound<'py, PyAny>>, copy: Option<bool>) -> PyResult<Bound<'py, PyAny>> {
+            fn __array__<'py>(slf: &Bound<'py, Self>, dtype: Option<&Bound<'py, PyAny>>, copy: Option<bool>) -> PyResult<Bound<'py, PyAny>> {
+                let py = slf.py();
                 if copy == Some(false) {
                     return Err(PyValueError::new_err(concat!(
                         "a ", $pyname, " cannot be converted to a NumPy array without copying"
                     )));
                 }
-                let array = self.to_numpy(py).into_any();
+                // Release the borrow before `astype`, which can run Python code.
+                let array = slf.try_borrow()?.to_numpy(py).into_any();
                 match dtype {
                     Some(dtype) if !dtype.is_none() => array.call_method1("astype", (dtype,)),
                     _ => Ok(array),

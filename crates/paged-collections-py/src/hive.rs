@@ -353,12 +353,19 @@ impl Hive {
     }
 
     fn insert(slf: &Bound<'_, Self>, value: Py<PyAny>) -> PyResult<u64> {
-        // Keep value outside the borrow if reservation fails.
-        slf.try_borrow_mut()?.reserve_insert(1)?;
-        let mut this = slf.try_borrow_mut()?;
-        let id = this.hive.try_insert(value).expect("capacity checked");
-        this.changed();
-        Ok(id.to_bits())
+        // No `reserve_insert` here: its reservation scans the page directory,
+        // which would make a run of inserts quadratic. `try_insert` only
+        // fails once no slot index is left.
+        let result = {
+            let mut this = slf.try_borrow_mut()?;
+            let result = this.hive.try_insert(value);
+            if result.is_ok() {
+                this.changed();
+            }
+            result
+        };
+        // On failure the value comes back; drop it after the borrow ends.
+        result.map(Id::to_bits).map_err(|_| exhausted())
     }
 
     fn insert_many<'py>(
