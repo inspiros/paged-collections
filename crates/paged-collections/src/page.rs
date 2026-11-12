@@ -123,7 +123,8 @@ pub trait PageStore<T, const PAGE: usize>: Default {
     fn pages_mut(&mut self) -> Self::PagesMut<'_>;
 
     /// The allocated pages numbered in `numbers`, in ascending order. An
-    /// empty range (start above end) yields nothing.
+    /// empty range (start above end, or exhausted by iteration) yields
+    /// nothing.
     ///
     /// Reaching the first page costs O(1) for [`FlatPages`] and O(log pages)
     /// for [`TreePages`]; [`FlatPages`] then steps over the unallocated
@@ -203,6 +204,10 @@ type FlatEntry<T, const PAGE: usize> = Option<Box<[T; PAGE]>>;
 impl<T, const PAGE: usize> FlatPages<T, PAGE> {
     /// The directory positions of the page numbers in `numbers`.
     fn span(&self, numbers: RangeInclusive<usize>) -> Range<usize> {
+        // An exhausted range keeps its endpoints, so check it first.
+        if numbers.is_empty() {
+            return 0..0;
+        }
         let end = numbers.end().saturating_add(1).min(self.pages.len());
         (*numbers.start()).min(end)..end
     }
@@ -433,5 +438,46 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for TreePages<T, PAGE> {
 
     fn into_pages(self) -> Self::IntoPages {
         self.pages.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn numbers<S: PageStore<u8, 2>>(store: &mut S, range: RangeInclusive<usize>) -> Vec<usize> {
+        let shared: Vec<usize> = store.pages_in(range.clone()).map(|(n, _)| n).collect();
+        let unique: Vec<usize> = store.pages_in_mut(range).map(|(n, _)| n).collect();
+        assert_eq!(shared, unique);
+        shared
+    }
+
+    fn ranges<S: PageStore<u8, 2> + Default>() {
+        let mut store = S::default();
+        for n in [0, 2, 3] {
+            store.get_or_alloc(n);
+        }
+        assert_eq!(numbers(&mut store, 0..=usize::MAX), [0, 2, 3]);
+        assert_eq!(numbers(&mut store, 1..=2), [2]);
+        #[allow(clippy::reversed_empty_ranges)]
+        let inverted = 3..=1;
+        assert_eq!(numbers(&mut store, inverted), [0; 0]);
+        assert_eq!(numbers(&mut store, 4..=usize::MAX), [0; 0]);
+        assert_eq!(numbers(&mut store, usize::MAX..=usize::MAX), [0; 0]);
+        // An exhausted range keeps its endpoints but is empty.
+        let mut exhausted = 0..=3;
+        exhausted.by_ref().for_each(drop);
+        assert_eq!((*exhausted.start(), *exhausted.end()), (3, 3));
+        assert_eq!(numbers(&mut store, exhausted), [0; 0]);
+        let mut back = 0..=0;
+        back.next_back();
+        assert_eq!(numbers(&mut store, back), [0; 0]);
+    }
+
+    #[test]
+    fn pages_in_honours_empty_and_exhausted_ranges() {
+        ranges::<FlatPages<u8, 2>>();
+        ranges::<TreePages<u8, 2>>();
     }
 }
