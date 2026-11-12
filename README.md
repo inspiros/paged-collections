@@ -4,8 +4,8 @@ Paged sparse sets, maps and stable-address containers for Rust, with Python
 bindings built on PyO3.
 
 > Status: in development. `PagedSparseSet` and `PagedSparseMap` are
-> implemented in Rust and wrapped for Python; the other collections are not
-> yet. Nothing is published.
+> implemented in Rust and wrapped for Python; `PagedDirectMap` is in Rust
+> only; the other collections are not yet. Nothing is published.
 
 ## Why paging
 
@@ -25,7 +25,7 @@ Paging serves two separate purposes:
 |---|---|---|
 | `PagedSparseSet<K>` | index (storage optional) | Integer set with O(1) insert, remove, contains, clear, and dense iteration |
 | `PagedSparseMap<K, V>` | index (storage optional) | Sparse set with a dense value array |
-| `PagedVecMap<K, V>` | index | Direct-indexed map, values stored in place |
+| `PagedDirectMap<K, V>` | index | Direct-address map: values stored in place, iterated in slot-index (for integers, key) order |
 | `PagedVec<T>` | storage | Growable vector with stable addresses |
 | `Hive<T>` | storage | Unordered container with stable addresses and generational handles |
 | `IdAllocator` | none | Generational id allocator for use as keys |

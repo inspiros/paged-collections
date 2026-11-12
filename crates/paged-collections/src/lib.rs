@@ -14,7 +14,7 @@
 //! |---|---|---|
 //! | [`sparse_set`] | `PagedSparseSet<K>` | index; storage optional |
 //! | [`sparse_map`] | `PagedSparseMap<K, V>` | index; storage optional |
-//! | [`vec_map`] | `PagedVecMap<K, V>` | index |
+//! | [`direct_map`] | `PagedDirectMap<K, V>` | index (values in place, slot order) |
 //! | [`paged_vec`] | `PagedVec<T>` | storage (stable addresses) |
 //! | [`hive`] | `Hive<T>` | storage (stable addresses, generational handles) |
 //! | [`id_alloc`] | `IdAllocator` | none (free list of generational ids) |
@@ -35,6 +35,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod direct_map;
 pub mod hive;
 pub mod id_alloc;
 pub mod key;
@@ -42,4 +43,3 @@ pub mod page;
 pub mod paged_vec;
 pub mod sparse_map;
 pub mod sparse_set;
-pub mod vec_map;

@@ -17,9 +17,11 @@
 //! too large to allocate.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, btree_map};
 use alloc::vec::Vec;
 use core::fmt;
+use core::iter::{Enumerate, FilterMap, Map};
+use core::slice;
 
 /// Default number of slots per page.
 ///
@@ -59,7 +61,27 @@ fn new_page<T: Default, const PAGE: usize>() -> Box<[T; PAGE]> {
 /// they update their dense arrays and index together, where a panic would
 /// leave the two out of step. As with [`Key`](crate::key::Key), breaking this
 /// cannot cause undefined behaviour, only wrong results or panics.
+///
+/// The page iterators ([`pages`](Self::pages), [`pages_mut`](Self::pages_mut),
+/// [`into_pages`](Self::into_pages)) must yield every allocated page exactly
+/// once, in ascending page-number order: ordered collections rely on it.
 pub trait PageStore<T, const PAGE: usize>: Default {
+    /// Iterator over `(page number, page)` from [`pages`](Self::pages).
+    type Pages<'a>: DoubleEndedIterator<Item = (usize, &'a [T; PAGE])> + Clone
+    where
+        Self: 'a,
+        T: 'a;
+
+    /// Iterator over `(page number, page)` from [`pages_mut`](Self::pages_mut).
+    type PagesMut<'a>: DoubleEndedIterator<Item = (usize, &'a mut [T; PAGE])>
+    where
+        Self: 'a,
+        T: 'a;
+
+    /// Owning iterator over `(page number, page)` from
+    /// [`into_pages`](Self::into_pages).
+    type IntoPages: DoubleEndedIterator<Item = (usize, Box<[T; PAGE]>)>;
+
     /// The page with this number, if it is allocated.
     fn get(&self, page: usize) -> Option<&[T; PAGE]>;
 
@@ -89,6 +111,16 @@ pub trait PageStore<T, const PAGE: usize>: Default {
 
     /// Releases directory memory that no allocated page needs.
     fn shrink_to_fit(&mut self);
+
+    /// The allocated pages in ascending page-number order.
+    fn pages(&self) -> Self::Pages<'_>;
+
+    /// The allocated pages in ascending page-number order, mutably.
+    fn pages_mut(&mut self) -> Self::PagesMut<'_>;
+
+    /// Consumes the store and returns its pages in ascending page-number
+    /// order.
+    fn into_pages(self) -> Self::IntoPages;
 }
 
 /// Chooses the page store a collection uses.
@@ -151,7 +183,30 @@ impl<T, const PAGE: usize> fmt::Debug for FlatPages<T, PAGE> {
     }
 }
 
+type FlatEntry<T, const PAGE: usize> = Option<Box<[T; PAGE]>>;
+
 impl<T, const PAGE: usize> PageStore<T, PAGE> for FlatPages<T, PAGE> {
+    type Pages<'a>
+        = FilterMap<
+        Enumerate<slice::Iter<'a, FlatEntry<T, PAGE>>>,
+        fn((usize, &'a FlatEntry<T, PAGE>)) -> Option<(usize, &'a [T; PAGE])>,
+    >
+    where
+        T: 'a;
+
+    type PagesMut<'a>
+        = FilterMap<
+        Enumerate<slice::IterMut<'a, FlatEntry<T, PAGE>>>,
+        fn((usize, &'a mut FlatEntry<T, PAGE>)) -> Option<(usize, &'a mut [T; PAGE])>,
+    >
+    where
+        T: 'a;
+
+    type IntoPages = FilterMap<
+        Enumerate<alloc::vec::IntoIter<FlatEntry<T, PAGE>>>,
+        fn((usize, FlatEntry<T, PAGE>)) -> Option<(usize, Box<[T; PAGE]>)>,
+    >;
+
     #[inline]
     fn get(&self, page: usize) -> Option<&[T; PAGE]> {
         self.pages.get(page)?.as_deref()
@@ -208,6 +263,27 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for FlatPages<T, PAGE> {
         }
         self.pages.shrink_to_fit();
     }
+
+    fn pages(&self) -> Self::Pages<'_> {
+        self.pages
+            .iter()
+            .enumerate()
+            .filter_map(|(n, page)| Some((n, page.as_deref()?)))
+    }
+
+    fn pages_mut(&mut self) -> Self::PagesMut<'_> {
+        self.pages
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(n, page)| Some((n, page.as_deref_mut()?)))
+    }
+
+    fn into_pages(self) -> Self::IntoPages {
+        self.pages
+            .into_iter()
+            .enumerate()
+            .filter_map(|(n, page)| Some((n, page?)))
+    }
 }
 
 /// Pages in a B-tree keyed by page number.
@@ -241,6 +317,24 @@ impl<T, const PAGE: usize> fmt::Debug for TreePages<T, PAGE> {
 }
 
 impl<T, const PAGE: usize> PageStore<T, PAGE> for TreePages<T, PAGE> {
+    type Pages<'a>
+        = Map<
+        btree_map::Iter<'a, usize, Box<[T; PAGE]>>,
+        fn((&'a usize, &'a Box<[T; PAGE]>)) -> (usize, &'a [T; PAGE]),
+    >
+    where
+        T: 'a;
+
+    type PagesMut<'a>
+        = Map<
+        btree_map::IterMut<'a, usize, Box<[T; PAGE]>>,
+        fn((&'a usize, &'a mut Box<[T; PAGE]>)) -> (usize, &'a mut [T; PAGE]),
+    >
+    where
+        T: 'a;
+
+    type IntoPages = btree_map::IntoIter<usize, Box<[T; PAGE]>>;
+
     #[inline]
     fn get(&self, page: usize) -> Option<&[T; PAGE]> {
         self.pages.get(&page).map(|p| &**p)
@@ -272,4 +366,16 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for TreePages<T, PAGE> {
     }
 
     fn shrink_to_fit(&mut self) {}
+
+    fn pages(&self) -> Self::Pages<'_> {
+        self.pages.iter().map(|(&n, page)| (n, &**page))
+    }
+
+    fn pages_mut(&mut self) -> Self::PagesMut<'_> {
+        self.pages.iter_mut().map(|(&n, page)| (n, &mut **page))
+    }
+
+    fn into_pages(self) -> Self::IntoPages {
+        self.pages.into_iter()
+    }
 }
