@@ -342,14 +342,25 @@ impl<T, const PAGE: usize> Hive<T, PAGE> {
         if pages.len() > (MAX_INDICES as usize).div_ceil(PAGE) {
             return Err(RawPagesError::TooManyPages);
         }
-        hive.pages.reserve_exact(pages.len());
-        for (p, raw) in pages.into_iter().enumerate() {
+        // Validate everything before allocating pages, so that bad input is
+        // rejected without allocating `PAGE` slots per page read.
+        for (p, raw) in pages.iter().enumerate() {
             if raw.slots.len() > Self::limit(p) {
                 return Err(RawPagesError::PageTooLong);
             }
             if raw.floor % 2 == 1 {
                 return Err(RawPagesError::OddFloor);
             }
+            let parity_ok = raw.slots.iter().all(|slot| match slot {
+                RawSlot::Occupied { version, .. } => version % 2 == 1,
+                RawSlot::Vacant { version } => version % 2 == 0,
+            });
+            if !parity_ok {
+                return Err(RawPagesError::VersionParity);
+            }
+        }
+        hive.pages.reserve_exact(pages.len());
+        for raw in pages {
             let mut page = Page::unallocated(raw.floor);
             if !raw.slots.is_empty() {
                 page.slots.reserve_exact(PAGE);
@@ -369,7 +380,7 @@ impl<T, const PAGE: usize> Hive<T, PAGE> {
                             next: NONE,
                         }
                     }
-                    _ => return Err(RawPagesError::VersionParity),
+                    _ => unreachable!("slot parity was validated"),
                 });
             }
             for (offset, slot) in page.slots.iter_mut().enumerate().rev() {

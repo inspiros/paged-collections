@@ -201,9 +201,33 @@ impl<T, const PAGE: usize> PagedVec<T, PAGE> {
     }
 
     /// Appends an element.
+    ///
+    /// Creates no reference to existing elements: it writes only the new
+    /// slot, through `Vec::push` on a page that has room, so raw pointers to
+    /// existing elements (for example from [`pages`](PagedVec::pages)) stay
+    /// valid under the aliasing model.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the length would overflow `usize` (possible only for
+    /// zero-sized `T`).
     #[inline]
     pub fn push(&mut self, value: T) {
-        let _ = self.push_mut(value);
+        let p = self.reserve_slot();
+        self.pages[p].push(value);
+    }
+
+    /// Makes room for one more element and returns the page it goes in.
+    fn reserve_slot(&mut self) -> usize {
+        let new_len = self.len.checked_add(1).expect("PagedVec length overflow");
+        let (p, _) = split::<PAGE>(self.len);
+        if p == self.pages.len() {
+            self.pages.push(Self::new_page());
+        }
+        self.len = new_len;
+        let page = &self.pages[p];
+        debug_assert!(page.len() < PAGE && page.capacity() >= PAGE);
+        p
     }
 
     /// Appends an element and returns a reference to it.
@@ -213,14 +237,8 @@ impl<T, const PAGE: usize> PagedVec<T, PAGE> {
     /// Panics if the length would overflow `usize` (possible only for
     /// zero-sized `T`).
     pub fn push_mut(&mut self, value: T) -> &mut T {
-        let new_len = self.len.checked_add(1).expect("PagedVec length overflow");
-        let (p, _) = split::<PAGE>(self.len);
-        if p == self.pages.len() {
-            self.pages.push(Self::new_page());
-        }
-        self.len = new_len;
+        let p = self.reserve_slot();
         let page = &mut self.pages[p];
-        debug_assert!(page.len() < PAGE && page.capacity() >= PAGE);
         page.push(value);
         match page.last_mut() {
             Some(last) => last,
@@ -1464,6 +1482,28 @@ mod tests {
 
     fn addresses<T, const PAGE: usize>(v: &PagedVec<T, PAGE>) -> Vec<*const T> {
         v.iter().map(|x| x as *const T).collect()
+    }
+
+    /// `push` must not retag existing elements: a raw pointer taken from a
+    /// shared page slice (as the Python bindings' NumPy views are) stays
+    /// usable for reads and interior-mutable writes across pushes into the
+    /// same page and new pages. Meaningful under Miri.
+    #[test]
+    fn push_keeps_raw_pointers_into_the_page_valid() {
+        use core::cell::Cell;
+        let mut v: PagedVec<Cell<u32>, 4> = PagedVec::new();
+        v.push(Cell::new(1));
+        let page: *const Cell<u32> = v.pages().next().unwrap().as_ptr();
+        for i in 0..10 {
+            v.push(Cell::new(i));
+            v.extend([Cell::new(i)]);
+            v.reserve(3);
+            // SAFETY: element 0 never moves (page capacity >= PAGE, never
+            // reallocated) and nothing has a `&mut` to it.
+            let first = unsafe { &*page };
+            first.set(first.get() + 1);
+        }
+        assert_eq!(v[0].get(), 11);
     }
 
     #[test]
