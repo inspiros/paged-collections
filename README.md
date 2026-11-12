@@ -4,8 +4,8 @@ Paged sparse sets, maps and stable-address containers for Rust, with Python
 bindings built on PyO3.
 
 > Status: in development. `PagedSparseSet` and `PagedSparseMap` are
-> implemented in Rust and wrapped for Python; `PagedDirectMap` is in Rust
-> only; the other collections are not yet. Nothing is published.
+> implemented in Rust and wrapped for Python; `PagedDirectMap` and `IdAllocator`
+> are in Rust only; the other collections are not yet. Nothing is published.
 
 ## Why paging
 
