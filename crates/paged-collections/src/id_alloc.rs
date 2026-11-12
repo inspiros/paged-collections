@@ -360,6 +360,50 @@ impl IdAllocator {
         self.free.shrink_to_fit();
     }
 
+    /// The raw state: the per-index versions and the free list, in the
+    /// order indices are reused (last entry first). Together with
+    /// [`try_from_raw_parts`](IdAllocator::try_from_raw_parts) this
+    /// round-trips an allocator exactly, for formats other than serde.
+    ///
+    /// A version is `0` for a retired index, odd (`2g - 1`) for a live index
+    /// of generation `g`, and even and non-zero (`2g`) for a vacant index
+    /// whose last generation was `g`.
+    #[inline]
+    pub fn raw_parts(&self) -> (&[u32], &[u32]) {
+        (&self.versions, &self.free)
+    }
+
+    /// Rebuilds an allocator from [`raw_parts`](IdAllocator::raw_parts),
+    /// validating them: at most [`MAX_INDICES`] versions, and a free list
+    /// holding every vacant index exactly once and nothing else. Memory is
+    /// linear in the input size.
+    pub fn try_from_raw_parts(versions: Vec<u32>, free: Vec<u32>) -> Result<Self, RawPartsError> {
+        if versions.len() > MAX_INDICES as usize {
+            return Err(RawPartsError::TooManyIndices);
+        }
+        let mut listed = alloc::vec![false; versions.len()];
+        for &index in &free {
+            let i = index as usize;
+            match versions.get(i) {
+                Some(&v) if v != 0 && v % 2 == 0 => {}
+                _ => return Err(RawPartsError::NotVacant),
+            }
+            if core::mem::replace(&mut listed[i], true) {
+                return Err(RawPartsError::ListedTwice);
+            }
+        }
+        let vacant = versions.iter().filter(|&&v| v != 0 && v % 2 == 0).count();
+        if vacant != free.len() {
+            return Err(RawPartsError::MissingVacant);
+        }
+        let len = versions.iter().filter(|&&v| v % 2 == 1).count();
+        Ok(IdAllocator {
+            versions,
+            free,
+            len,
+        })
+    }
+
     /// Iterates over the live ids in index order.
     pub fn iter(&self) -> Iter<'_> {
         Iter {
@@ -383,6 +427,33 @@ impl<'a> IntoIterator for &'a IdAllocator {
         self.iter()
     }
 }
+
+/// Why [`IdAllocator::try_from_raw_parts`] rejected its input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RawPartsError {
+    /// More than [`MAX_INDICES`] versions.
+    TooManyIndices,
+    /// The free list holds an index that is not vacant (or out of range).
+    NotVacant,
+    /// The free list holds an index twice.
+    ListedTwice,
+    /// A vacant index is missing from the free list.
+    MissingVacant,
+}
+
+impl fmt::Display for RawPartsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            RawPartsError::TooManyIndices => "more than u32::MAX indices",
+            RawPartsError::NotVacant => "free list holds an index that is not vacant",
+            RawPartsError::ListedTwice => "free list holds an index twice",
+            RawPartsError::MissingVacant => "free list misses a vacant index",
+        })
+    }
+}
+
+impl core::error::Error for RawPartsError {}
 
 /// Iterator over the live ids of an [`IdAllocator`], in index order.
 #[derive(Clone)]
@@ -494,34 +565,7 @@ mod serde_impl {
     impl<'de> Deserialize<'de> for IdAllocator {
         fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
             let Repr { versions, free } = Repr::deserialize(deserializer)?;
-            if versions.len() > MAX_INDICES as usize {
-                return Err(De::Error::custom("more than u32::MAX indices"));
-            }
-            let mut listed = alloc::vec![false; versions.len()];
-            for &index in &free {
-                let i = index as usize;
-                match versions.get(i) {
-                    Some(&v) if v != 0 && v % 2 == 0 => {}
-                    _ => {
-                        return Err(De::Error::custom(
-                            "free list holds an index that is not vacant",
-                        ));
-                    }
-                }
-                if core::mem::replace(&mut listed[i], true) {
-                    return Err(De::Error::custom("free list holds an index twice"));
-                }
-            }
-            let vacant = versions.iter().filter(|&&v| v != 0 && v % 2 == 0).count();
-            if vacant != free.len() {
-                return Err(De::Error::custom("free list misses a vacant index"));
-            }
-            let len = versions.iter().filter(|&&v| v % 2 == 1).count();
-            Ok(IdAllocator {
-                versions,
-                free,
-                len,
-            })
+            IdAllocator::try_from_raw_parts(versions, free).map_err(De::Error::custom)
         }
     }
 }
@@ -649,5 +693,30 @@ mod tests {
             alloc::format!("{}", (1u64 << 32) | 1)
         );
         assert!(serde_json::from_str::<Id>("5").is_err());
+    }
+
+    #[test]
+    fn raw_parts_round_trip_and_validation() {
+        let mut ids = IdAllocator::new();
+        let a = ids.alloc();
+        let b = ids.alloc();
+        ids.alloc();
+        ids.free(b);
+        ids.free(a);
+        let (versions, free) = ids.raw_parts();
+        assert_eq!((versions, free), (&[2, 2, 1][..], &[1, 0][..]));
+        let back = IdAllocator::try_from_raw_parts(versions.to_vec(), free.to_vec()).unwrap();
+        assert_eq!(back, ids);
+        assert_eq!(back.len(), 1);
+        let bad = |v: &[u32], f: &[u32]| IdAllocator::try_from_raw_parts(v.to_vec(), f.to_vec());
+        assert_eq!(bad(&[1], &[0]), Err(RawPartsError::NotVacant));
+        assert_eq!(bad(&[0], &[0]), Err(RawPartsError::NotVacant));
+        assert_eq!(bad(&[2], &[1]), Err(RawPartsError::NotVacant));
+        assert_eq!(bad(&[2], &[0, 0]), Err(RawPartsError::ListedTwice));
+        assert_eq!(bad(&[2, 4], &[1]), Err(RawPartsError::MissingVacant));
+        assert_eq!(
+            bad(&[0, 3], &[]).map(|a| (a.len(), a.retired_len())),
+            Ok((1, 1))
+        );
     }
 }
