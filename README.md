@@ -95,6 +95,20 @@ call overridden methods (`set_many` and `update` do not go through your
 `copy.copy` and `copy.deepcopy` keep the subclass and its attributes, and
 never call the subclass's `__init__`.
 
+`DirectMap` and its typed variants (or `direct_map(dtype)`) store values in
+pages at their key's slot and always visit entries in ascending key order.
+They support nearest-entry and half-open range queries. Array results are
+copies, and structural changes are always allowed.
+
+```python
+from paged_collections import direct_map
+
+ordered = direct_map("float64", [2048, 7, 1024], [3.0, 1.0, 2.0])
+ordered.next_occupant(8)          # (1024, 2.0)
+ordered.items_range(7, 2048)      # [(7, 1.0), (1024, 2.0)]
+ordered.popitem()                 # (2048, 3.0)
+```
+
 ## Layout
 
 ```text

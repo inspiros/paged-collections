@@ -69,3 +69,73 @@ macro_rules! key_iterator {
 }
 
 pub(crate) use key_iterator;
+
+/// Defines a cursor-based iterator over `$owner`'s keys in ascending order.
+/// The owner supplies `mods`, `__len__()` and `next_key_from(u64)`; the u64
+/// cursor can advance one past the largest u32 key without wrapping.
+macro_rules! ordered_key_iterator {
+    ($iter:ident, $owner:ident, $owner_name:literal) => {
+        #[doc = concat!("Iterator over the keys of a ``", $owner_name, "`` in ascending order.")]
+        #[pyclass(module = "paged_collections._core")]
+        pub(crate) struct $iter {
+            owner: Py<$owner>,
+            cursor: u64,
+            remaining: usize,
+            mods: u64,
+            /// Later changes do not matter once exhaustion has been observed.
+            done: bool,
+        }
+
+        impl $iter {
+            pub(crate) fn new(owner: &Bound<'_, $owner>) -> PyResult<Self> {
+                let this = owner.try_borrow()?;
+                Ok(Self {
+                    owner: owner.clone().unbind(),
+                    cursor: 0,
+                    remaining: this.__len__(),
+                    mods: this.mods,
+                    done: false,
+                })
+            }
+        }
+
+        #[pymethods]
+        impl $iter {
+            fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+                slf
+            }
+
+            fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<$crate::convert::Key>> {
+                if self.done {
+                    return Ok(None);
+                }
+                let owner = self.owner.try_borrow(py)?;
+                if owner.mods != self.mods {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(concat!(
+                        $owner_name,
+                        " changed during iteration"
+                    )));
+                }
+                let key = owner.next_key_from(self.cursor);
+                if let Some(key) = key {
+                    self.cursor = u64::from(key) + 1;
+                    self.remaining = self.remaining.saturating_sub(1);
+                } else {
+                    self.remaining = 0;
+                    self.done = true;
+                }
+                Ok(key)
+            }
+
+            fn __traverse__(&self, visit: pyo3::PyVisit<'_>) -> Result<(), pyo3::PyTraverseError> {
+                visit.call(&self.owner)
+            }
+
+            fn __length_hint__(&self) -> usize {
+                self.remaining
+            }
+        }
+    };
+}
+
+pub(crate) use ordered_key_iterator;

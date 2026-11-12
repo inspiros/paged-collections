@@ -11,6 +11,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyTuple, PyType};
 
 mod convert;
+mod direct_map;
 mod export;
 mod iter;
 mod object_map;
@@ -155,6 +156,13 @@ mod _core {
 
     #[pymodule_export]
     use super::_rebuild;
+    #[pymodule_export]
+    use crate::direct_map::{
+        DirectMap, DirectMapBool, DirectMapBoolIterator, DirectMapF32, DirectMapF32Iterator,
+        DirectMapF64, DirectMapF64Iterator, DirectMapI32, DirectMapI32Iterator, DirectMapI64,
+        DirectMapI64Iterator, DirectMapIterator, DirectMapU32, DirectMapU32Iterator, DirectMapU64,
+        DirectMapU64Iterator,
+    };
     #[pymodule_export]
     use crate::export::ExportGuard;
     #[pymodule_export]
