@@ -3,9 +3,9 @@
 Paged sparse sets, maps and stable-address containers for Rust, with Python
 bindings built on PyO3.
 
-> Status: in development. `PagedSparseSet` and `PagedSparseMap` are
-> implemented in Rust and wrapped for Python; `PagedDirectMap`, `IdAllocator` and
-> `PagedVec` are in Rust only; the other collections are not yet. Nothing is published.
+> Status: in development. Every collection below is implemented in Rust;
+> `PagedSparseSet` and `PagedSparseMap` are also wrapped for Python, the
+> others not yet. Nothing is published.
 
 ## Why paging
 
@@ -19,7 +19,7 @@ Paging serves two separate purposes:
   references stay valid while the collection grows and growth never copies
   the whole buffer.
 
-## Planned collections
+## Collections
 
 | Type | Paging | Purpose |
 |---|---|---|
@@ -29,6 +29,37 @@ Paging serves two separate purposes:
 | `PagedVec<T>` | storage | Growable vector with stable addresses |
 | `Hive<T>` | storage | Unordered container with stable addresses and generational handles |
 | `IdAllocator` | none | Generational id allocator for use as keys |
+
+## Rust
+
+A `Hive` owns elements at stable addresses and hands out generational ids;
+the ids are keys for the paged maps, which makes side tables:
+
+```rust
+use paged_collections::direct_map::PagedDirectMap;
+use paged_collections::hive::Hive;
+use paged_collections::id_alloc::Id;
+
+let mut hive: Hive<&str> = Hive::new();
+let a = hive.insert("a");
+let b = hive.insert("b");
+
+let mut score: PagedDirectMap<Id, u32> = PagedDirectMap::new();
+score.insert(a, 10);
+score.insert(b, 20);
+
+// Removing frees the slot; its next occupant gets a new generation, so the
+// stale id finds nothing, in the hive or in the side table.
+hive.remove(a);
+let c = hive.insert("c");
+assert_eq!(c.index(), a.index());
+assert_eq!(hive.get(a), None);
+assert_eq!(score.get(c), None);
+
+// A direct map iterates in slot order and answers range queries.
+let in_range: Vec<u32> = score.range(a..=b).map(|(_, &s)| s).collect();
+assert_eq!(in_range, [10, 20]);
+```
 
 ## Python
 
@@ -66,7 +97,7 @@ never call the subclass's `__init__`.
 
 ## Layout
 
-```
+```text
 crates/paged-collections      Rust library (no_std + alloc)
 crates/paged-collections-py   PyO3 bindings, built with maturin
 ```

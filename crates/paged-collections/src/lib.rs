@@ -47,3 +47,8 @@ pub mod page;
 pub mod paged_vec;
 pub mod sparse_map;
 pub mod sparse_set;
+
+// Runs the README's Rust examples as doctests.
+#[cfg(all(doctest, any(target_pointer_width = "32", target_pointer_width = "64")))]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeDoctests;
