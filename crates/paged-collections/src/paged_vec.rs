@@ -13,8 +13,11 @@
 //!   occasional copy and the momentary doubling are small.
 //!
 //! Operations that change which element sits at an index ([`insert`],
-//! [`remove`], [`swap`], [`swap_remove`], [`retain`]) move elements between
-//! addresses, as they do in a `Vec`.
+//! [`remove`], [`swap`], [`swap_remove`], [`retain`], [`dedup`](PagedVec::dedup),
+//! [`drain`](PagedVec::drain)) can move elements between addresses, as they
+//! do in a `Vec`. Splitting at a page boundary transfers whole pages without
+//! moving their elements. Draining removes its range eagerly, even if the
+//! returned iterator is leaked.
 //!
 //! The price is that the elements are not one contiguous slice: there is no
 //! `as_slice` or `Deref<Target = [T]>`. Use [`pages`](PagedVec::pages) for
@@ -32,6 +35,11 @@
 //! | [`push`](PagedVec::push) | amortized O(1): a page allocation every `PAGE` pushes, rare directory growth |
 //! | [`insert`], [`remove`] | O(len − index): elements shift across pages |
 //! | [`truncate`](PagedVec::truncate), [`clear`](PagedVec::clear) | O(removed) drops; pages are kept |
+//! | [`dedup`](PagedVec::dedup) and variants | O(len), no allocation |
+//! | [`split_off`](PagedVec::split_off) | O(transferred allocated pages) at a page boundary; otherwise O(len − at) |
+//! | [`append`](PagedVec::append), [`extend_from_slice`](PagedVec::extend_from_slice) | O(added), plus page allocation; cloning costs extra |
+//! | [`drain`](PagedVec::drain) | O(len − start + allocated pages), eager removal |
+//! | [`range`](PagedVec::range), [`range_mut`](PagedVec::range_mut) | O(1) setup; O(1) amortized per element, no allocation |
 //! | [`binary_search`](PagedVec::binary_search), [`partition_point`](PagedVec::partition_point) | O(log n), no allocation |
 //! | [`sort`](PagedVec::sort) and variants | the slice sort's cost, plus moving all elements out and back and a temporary buffer of `len` elements |
 //!
@@ -62,7 +70,8 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter::FusedIterator;
-use core::ops::{Index, IndexMut};
+use core::marker::PhantomData;
+use core::ops::{Bound, Index, IndexMut, RangeBounds};
 
 use crate::page::{DEFAULT_PAGE, split};
 
@@ -431,6 +440,261 @@ impl<T, const PAGE: usize> PagedVec<T, PAGE> {
         self.resize_with(new_len, || value.clone());
     }
 
+    /// Appends clones of `other`. Costs O(other.len()), plus cloning and
+    /// page allocation. Existing elements keep their addresses. If cloning
+    /// panics, the clones already pushed stay in the vector.
+    ///
+    /// # Panics
+    ///
+    /// Panics on capacity overflow, as [`reserve`](PagedVec::reserve) does.
+    pub fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Clone,
+    {
+        self.reserve(other.len());
+        for value in other {
+            self.push(value.clone());
+        }
+    }
+
+    /// Splits into `..at` and a returned vector holding `at..`, in order.
+    /// Elements staying in `self` keep their addresses. At a multiple of
+    /// `PAGE`, whole pages (including spares) transfer without moving their
+    /// elements, costing O(transferred allocated pages). Otherwise the
+    /// returned elements move, costing O(len − at), and `self` keeps its
+    /// pages. Splitting at `len` returns an unallocated empty vector.
+    ///
+    /// Allocation happens before moving anything; an allocation panic
+    /// leaves the elements unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at > len` or allocation size overflows.
+    pub fn split_off(&mut self, at: usize) -> Self {
+        assert!(
+            at <= self.len,
+            "split index (is {at}) should be <= len (is {})",
+            self.len
+        );
+        let result = self.split_buffer(at);
+        self.split_into(at, result)
+    }
+
+    // Allocate all storage before the first move. Aligned splits need only
+    // directory entries; unaligned splits need fresh full-capacity pages.
+    fn split_buffer(&self, at: usize) -> Self {
+        if at == self.len {
+            Self::new()
+        } else if at % PAGE == 0 {
+            Self {
+                pages: Vec::with_capacity(self.pages.len() - at / PAGE),
+                len: 0,
+            }
+        } else {
+            Self::with_capacity(self.len - at)
+        }
+    }
+
+    // `result` is empty, with directory capacity for an aligned split or
+    // preallocated pages for an unaligned one, as in `split_buffer(at)`.
+    // Nothing below allocates or invokes user code; pages are filled only
+    // by individual pushes.
+    fn split_into(&mut self, at: usize, mut result: Self) -> Self {
+        if at == self.len {
+            return result;
+        }
+        if at % PAGE == 0 {
+            result.len = self.len - at;
+            for page in self.pages.drain(at / PAGE..) {
+                result.pages.push(page);
+            }
+            self.len = at;
+        } else {
+            while self.len > at {
+                let Some(value) = self.pop() else {
+                    unreachable!()
+                };
+                result.push(value);
+            }
+            result.reverse();
+        }
+        result
+    }
+
+    /// Moves all elements of `other` to the end, in order. Costs O(other.len()),
+    /// plus page allocation. Existing elements in `self` keep their
+    /// addresses; moved elements may change addresses. `other` becomes
+    /// empty and keeps all its capacity.
+    ///
+    /// All allocation happens before moving anything. If it panics, both
+    /// vectors keep their elements, though `self` may gain spare pages.
+    /// After reserving, the individual pushes cannot allocate or panic.
+    ///
+    /// # Panics
+    ///
+    /// Panics on capacity overflow, as [`reserve`](PagedVec::reserve) does.
+    pub fn append(&mut self, other: &mut Self) {
+        self.reserve(other.len);
+        let used = other.used_pages();
+        other.len = 0;
+        for page in &mut other.pages[..used] {
+            for value in page.drain(..) {
+                self.push(value);
+            }
+        }
+    }
+
+    /// Removes `range` eagerly and returns its elements in order. Costs
+    /// O(len − start + allocated pages), with up to O(len − start) extra
+    /// element storage and a directory for transferred pages. Elements
+    /// before the range keep their addresses; elements after it shift down
+    /// and may change addresses. An empty range moves nothing. When the
+    /// start is a page boundary, the removed pages are reused, including a
+    /// partial last page. If both ends are page boundaries, the following
+    /// pages also keep their element addresses.
+    ///
+    /// Unlike [`Vec::drain`], removal finishes before this method returns.
+    /// Dropping the iterator drops the unconsumed removed elements;
+    /// leaking it only leaks those elements and their storage. Neither
+    /// changes the remaining vector. Allocation happens before any moves.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the start exceeds the end, the end exceeds `len`, a bound
+    /// overflows `usize`, or allocation size overflows.
+    pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, T, PAGE> {
+        let (start, end) = range_indices(range, self.len);
+        let removed = if start == end {
+            Self::new()
+        } else if end == self.len {
+            self.split_off(start)
+        } else if start % PAGE == 0 && end % PAGE == 0 {
+            let mut result = Self {
+                pages: Vec::with_capacity((end - start) / PAGE),
+                len: end - start,
+            };
+            for page in self.pages.drain(start / PAGE..end / PAGE) {
+                result.pages.push(page);
+            }
+            self.len -= result.len;
+            result
+        } else if start % PAGE == 0 {
+            // Preserve the removed pages even when the last is partial.
+            // Allocate both outputs before moving the unaligned tail.
+            let tail_buffer = self.split_buffer(end);
+            let removed_buffer = Self {
+                pages: Vec::with_capacity(self.pages.len() - start / PAGE),
+                len: 0,
+            };
+            let tail = self.split_into(end, tail_buffer);
+            let result = self.split_into(start, removed_buffer);
+            // The prefix is full pages. Its original directory has room
+            // for these fresh tail pages: the combined length is smaller
+            // than the original length. No element pushes are needed.
+            for page in tail.pages {
+                self.pages.push(page);
+            }
+            self.len += tail.len;
+            result
+        } else {
+            let new_len = self.len - (end - start);
+            let result = self.split_buffer(new_len);
+            // Rotate [removed, tail] to [tail, removed] using only swaps.
+            // Allocate first, then split off the removed suffix without
+            // further allocation. The prefix is never touched.
+            for (lo, hi) in [(start, end), (end, self.len), (start, self.len)] {
+                for offset in 0..(hi - lo) / 2 {
+                    self.swap(lo + offset, hi - 1 - offset);
+                }
+            }
+            self.split_into(new_len, result)
+        };
+        Drain {
+            inner: removed.into_iter(),
+            _borrow: PhantomData,
+        }
+    }
+
+    /// Removes consecutive equal elements, keeping the first of each run.
+    /// Costs O(len), without allocation. Elements before the first removed
+    /// one keep their addresses; later kept elements move down. If equality
+    /// panics, the guarantees of [`dedup_by`](PagedVec::dedup_by) apply.
+    pub fn dedup(&mut self)
+    where
+        T: PartialEq,
+    {
+        self.dedup_by(|later, earlier| later == earlier);
+    }
+
+    /// Removes consecutive elements with equal keys, keeping the first of
+    /// each run. `key` receives mutable access, later element first, as in
+    /// [`Vec::dedup_by_key`]. Costs O(len), plus key computation, without
+    /// allocation. Addresses and panic behaviour are as in
+    /// [`dedup_by`](PagedVec::dedup_by).
+    pub fn dedup_by_key<K: PartialEq>(&mut self, mut key: impl FnMut(&mut T) -> K) {
+        self.dedup_by(|later, earlier| key(later) == key(earlier));
+    }
+
+    /// Removes consecutive elements for which `same_bucket(later, earlier)`
+    /// returns `true`, keeping `earlier`. Costs O(len), without allocation.
+    /// Elements before the first removed one keep their addresses; later
+    /// kept elements move down.
+    ///
+    /// Duplicates are dropped at the end. If the closure panics, only the
+    /// duplicates already identified are dropped; the kept prefix, element
+    /// being compared and unvisited tail remain in order, including closure
+    /// mutations. If a duplicate's destructor panics, duplicates not yet
+    /// dropped remain at the end, as in [`retain`](PagedVec::retain).
+    pub fn dedup_by(&mut self, mut same_bucket: impl FnMut(&mut T, &mut T) -> bool) {
+        struct Guard<'a, T, const PAGE: usize> {
+            vec: &'a mut PagedVec<T, PAGE>,
+            read: usize,
+            write: usize,
+        }
+
+        impl<T, const PAGE: usize> Drop for Guard<'_, T, PAGE> {
+            fn drop(&mut self) {
+                let mut write = self.write;
+                for read in self.read..self.vec.len {
+                    self.vec.swap(write, read);
+                    write += 1;
+                }
+                self.vec.truncate(write);
+            }
+        }
+
+        if self.len < 2 {
+            return;
+        }
+        let len = self.len;
+        let mut guard = Guard {
+            vec: self,
+            read: 1,
+            write: 1,
+        };
+        while guard.read < len {
+            let (earlier_page, earlier_offset) = split::<PAGE>(guard.write - 1);
+            let (later_page, later_offset) = split::<PAGE>(guard.read);
+            let duplicate = if earlier_page == later_page {
+                let (earlier, later) = guard.vec.pages[later_page].split_at_mut(later_offset);
+                same_bucket(&mut later[0], &mut earlier[earlier_offset])
+            } else {
+                let (earlier, later) = guard.vec.pages.split_at_mut(later_page);
+                same_bucket(
+                    &mut later[0][later_offset],
+                    &mut earlier[earlier_page][earlier_offset],
+                )
+            };
+            if !duplicate {
+                if guard.write != guard.read {
+                    guard.vec.swap(guard.write, guard.read);
+                }
+                guard.write += 1;
+            }
+            guard.read += 1;
+        }
+    }
+
     /// Keeps only the elements for which `keep` returns `true`, in order.
     ///
     /// Rejected elements are dropped together at the end, not as they are
@@ -700,6 +964,85 @@ impl<T, const PAGE: usize> PagedVec<T, PAGE> {
         }
     }
 
+    /// Iterates over `range` in order, from either end, with an exact length.
+    /// Setup costs O(1), seeking directly to the boundary pages. Does not
+    /// allocate or move elements.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the start exceeds the end, the end exceeds `len`, or a
+    /// bound overflows `usize`, like slicing a slice.
+    pub fn range<R: RangeBounds<usize>>(&self, range: R) -> Iter<'_, T> {
+        let (start, end) = range_indices(range, self.len);
+        if start == end {
+            return Iter {
+                pages: [].iter(),
+                front: [].iter(),
+                back: [].iter(),
+                remaining: 0,
+            };
+        }
+        let first = start / PAGE;
+        let last = (end - 1) / PAGE;
+        let mut pages = self.pages[first..=last].iter();
+        let Some(page) = pages.next() else {
+            unreachable!()
+        };
+        let front_end = if first == last {
+            end - first * PAGE
+        } else {
+            page.len()
+        };
+        let front = page[start % PAGE..front_end].iter();
+        let back = match pages.next_back() {
+            Some(page) => page[..end - last * PAGE].iter(),
+            None => [].iter(),
+        };
+        Iter {
+            pages,
+            front,
+            back,
+            remaining: end - start,
+        }
+    }
+
+    /// Like [`range`](PagedVec::range), with mutable access to each element.
+    /// Setup costs O(1); no allocation or moves. Panics on the same invalid
+    /// bounds as [`range`](PagedVec::range).
+    pub fn range_mut<R: RangeBounds<usize>>(&mut self, range: R) -> IterMut<'_, T> {
+        let (start, end) = range_indices(range, self.len);
+        if start == end {
+            return IterMut {
+                pages: [].iter_mut(),
+                front: [].iter_mut(),
+                back: [].iter_mut(),
+                remaining: 0,
+            };
+        }
+        let first = start / PAGE;
+        let last = (end - 1) / PAGE;
+        let mut pages = self.pages[first..=last].iter_mut();
+        let Some(page) = pages.next() else {
+            unreachable!()
+        };
+        let front_end = if first == last {
+            end - first * PAGE
+        } else {
+            page.len()
+        };
+        let front = page[start % PAGE..front_end].iter_mut();
+        let back = match pages.next_back() {
+            Some(page) => page[..end - last * PAGE].iter_mut(),
+            None => [].iter_mut(),
+        };
+        IterMut {
+            pages,
+            front,
+            back,
+            remaining: end - start,
+        }
+    }
+
     /// The non-empty pages as slices, in order. Every page but the last is
     /// full.
     pub fn pages(
@@ -717,7 +1060,32 @@ impl<T, const PAGE: usize> PagedVec<T, PAGE> {
     }
 }
 
-fn capacity_overflow() -> TryReserveError {
+// Resolve excluded starts and included ends with checked addition, including
+// bounds supplied by a custom RangeBounds implementation.
+#[track_caller]
+fn range_indices(range: impl RangeBounds<usize>, len: usize) -> (usize, usize) {
+    let start = match range.start_bound() {
+        Bound::Included(&start) => start,
+        Bound::Excluded(&start) => start.checked_add(1).expect("range start index overflow"),
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(&end) => end.checked_add(1).expect("range end index overflow"),
+        Bound::Excluded(&end) => end,
+        Bound::Unbounded => len,
+    };
+    assert!(
+        start <= end,
+        "range start (is {start}) should be <= end (is {end})"
+    );
+    assert!(
+        end <= len,
+        "range end (is {end}) should be <= len (is {len})"
+    );
+    (start, end)
+}
+
+pub(crate) fn capacity_overflow() -> TryReserveError {
     // `try_reserve` has no public constructor for its error; a request over
     // `isize::MAX` bytes always fails with the capacity-overflow kind.
     match Vec::<u8>::new().try_reserve(usize::MAX) {
@@ -968,6 +1336,59 @@ paged_iter!(
     IntoIter<T>, T, alloc::vec::IntoIter<Vec<T>>, alloc::vec::IntoIter<T>,
     |page: Vec<T>| page.into_iter()
 );
+
+/// Owning iterator over elements eagerly removed by [`PagedVec::drain`].
+///
+/// The vector stays mutably borrowed for this iterator's lifetime, though
+/// removal has already finished. Dropping it drops the remaining removed
+/// elements; leaking it leaves the vector intact and leaks only the removed
+/// elements and their storage.
+pub struct Drain<'a, T, const PAGE: usize = DEFAULT_PAGE> {
+    inner: IntoIter<T>,
+    _borrow: PhantomData<&'a mut PagedVec<T, PAGE>>,
+}
+
+impl<T, const PAGE: usize> Iterator for Drain<'_, T, PAGE> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<T, const PAGE: usize> DoubleEndedIterator for Drain<'_, T, PAGE> {
+    fn next_back(&mut self) -> Option<T> {
+        self.inner.next_back()
+    }
+}
+
+impl<T, const PAGE: usize> ExactSizeIterator for Drain<'_, T, PAGE> {}
+impl<T, const PAGE: usize> FusedIterator for Drain<'_, T, PAGE> {}
+
+impl<T: fmt::Debug, const PAGE: usize> fmt::Debug for Drain<'_, T, PAGE> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let middle = self
+            .inner
+            .pages
+            .as_slice()
+            .iter()
+            .flat_map(|page| page.iter());
+        f.debug_list()
+            .entries(
+                self.inner
+                    .front
+                    .as_slice()
+                    .iter()
+                    .chain(middle)
+                    .chain(self.inner.back.as_slice()),
+            )
+            .finish()
+    }
+}
 
 impl<T> Clone for Iter<'_, T> {
     fn clone(&self) -> Self {
