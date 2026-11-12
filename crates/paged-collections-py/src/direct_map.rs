@@ -21,6 +21,12 @@ const KEY_LIMIT: u64 = 1_u64 << 32;
 /// oversized ints are clamped, while non-ints still raise `TypeError`.
 fn query_index(index: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
     let index = index.cast::<PyInt>()?;
+    // `operator.index` returns an exact `int` copy of an `int` subclass, so
+    // an overridden `__lt__` cannot change the sign test below.
+    let index = index
+        .py()
+        .import("operator")?
+        .call_method1("index", (index,))?;
     if index.lt(0)? {
         Ok(None)
     } else {

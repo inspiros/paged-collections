@@ -628,3 +628,17 @@ def test_methods_bypass_subclass_setitem():
     m.update({4: 4.0})
     assert calls == [1]
     assert m.items() == [(1, 1.0), (2, 2.0), (3, 2.0), (4, 4.0)]
+
+
+def test_query_index_ignores_int_subclass_comparisons():
+    from paged_collections import DirectMap
+
+    class I(int):
+        def __lt__(self, other):
+            return False
+
+    m = DirectMap()
+    m[0] = "a"
+    m[2] = "b"
+    assert m.prev_occupant(I(-1)) is None
+    assert m.items_range(I(-1)) == [(0, "a"), (2, "b")]
