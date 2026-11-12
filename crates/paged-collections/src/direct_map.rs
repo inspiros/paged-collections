@@ -33,7 +33,9 @@
 //! [`insert`](PagedDirectMap::insert) and
 //! [`get_or_insert_with`](PagedDirectMap::get_or_insert_with) evict it,
 //! [`replace`](PagedDirectMap::replace) evicts it and returns it, and
-//! [`try_insert`](PagedDirectMap::try_insert) refuses.
+//! [`try_insert`](PagedDirectMap::try_insert) refuses. An
+//! [`entry`](PagedDirectMap::entry) is occupied only by the key itself; a
+//! vacant entry's inserts evict another generation.
 //!
 //! # Ordered queries
 //!
@@ -95,15 +97,15 @@ use crate::key::Key;
 use crate::page::{DEFAULT_PAGE, Directory, Flat, PageStore, split};
 
 /// One slot of a [`PagedDirectMap`] page: the entry held there, if any.
-pub type Entry<K, V> = Option<(K, V)>;
+pub type Slot<K, V> = Option<(K, V)>;
 
-type Store<K, V, const PAGE: usize, D> = <D as Directory>::Store<Entry<K, V>, PAGE>;
+type Store<K, V, const PAGE: usize, D> = <D as Directory>::Store<Slot<K, V>, PAGE>;
 type Pages<'a, K, V, const PAGE: usize, D> =
-    <Store<K, V, PAGE, D> as PageStore<Entry<K, V>, PAGE>>::Pages<'a>;
+    <Store<K, V, PAGE, D> as PageStore<Slot<K, V>, PAGE>>::Pages<'a>;
 type PagesMut<'a, K, V, const PAGE: usize, D> =
-    <Store<K, V, PAGE, D> as PageStore<Entry<K, V>, PAGE>>::PagesMut<'a>;
+    <Store<K, V, PAGE, D> as PageStore<Slot<K, V>, PAGE>>::PagesMut<'a>;
 type IntoPages<K, V, const PAGE: usize, D> =
-    <Store<K, V, PAGE, D> as PageStore<Entry<K, V>, PAGE>>::IntoPages;
+    <Store<K, V, PAGE, D> as PageStore<Slot<K, V>, PAGE>>::IntoPages;
 
 /// A map from [`Key`]s to values stored in place at each key's slot index.
 ///
@@ -153,13 +155,13 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     }
 
     #[inline]
-    fn slot(&self, index: usize) -> Option<&Entry<K, V>> {
+    fn slot(&self, index: usize) -> Option<&Slot<K, V>> {
         let (page, offset) = split::<PAGE>(index);
         self.pages.get(page).map(|page| &page[offset])
     }
 
     #[inline]
-    fn slot_mut(&mut self, index: usize) -> Option<&mut Entry<K, V>> {
+    fn slot_mut(&mut self, index: usize) -> Option<&mut Slot<K, V>> {
         let (page, offset) = split::<PAGE>(index);
         self.pages.get_mut(page).map(|page| &mut page[offset])
     }
@@ -167,7 +169,7 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     /// The slot for `index`, allocating its page if needed, and the entry
     /// count.
     #[inline]
-    fn slot_or_alloc(&mut self, index: usize) -> (&mut Entry<K, V>, &mut usize) {
+    fn slot_or_alloc(&mut self, index: usize) -> (&mut Slot<K, V>, &mut usize) {
         let (page, offset) = split::<PAGE>(index);
         (&mut self.pages.get_or_alloc(page)[offset], &mut self.len)
     }
@@ -515,6 +517,38 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
         self.remove_occupant(index)
     }
 
+    /// The entry for `key`, for in-place access or insertion.
+    ///
+    /// The entry is [`Occupied`](Entry::Occupied) only if `key` itself is in
+    /// the map. A slot held by a different key (another generation) gives a
+    /// [`Vacant`](Entry::Vacant) entry, whose inserts evict that key as
+    /// [`insert`](Self::insert) does; [`VacantEntry::occupant`] shows it.
+    /// No page is allocated until a vacant entry is inserted into.
+    ///
+    /// ```
+    /// use paged_collections::direct_map::PagedDirectMap;
+    ///
+    /// let mut counts: PagedDirectMap<u32, u32> = PagedDirectMap::new();
+    /// for word in [3, 1, 3, 3] {
+    ///     *counts.entry(word).or_insert(0) += 1;
+    /// }
+    /// assert_eq!((counts[3], counts[1]), (3, 1));
+    /// ```
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, PAGE, D> {
+        let index = key.index();
+        if !matches!(self.slot(index), Some(Some((stored, _))) if *stored == key) {
+            return Entry::Vacant(VacantEntry { map: self, key });
+        }
+        let (page, offset) = split::<PAGE>(index);
+        match self.pages.get_mut(page) {
+            Some(page) => Entry::Occupied(OccupiedEntry {
+                slot: &mut page[offset],
+                len: &mut self.len,
+            }),
+            None => unreachable!("the slot was just found"),
+        }
+    }
+
     /// Consumes the map and returns its keys in slot-index order.
     pub fn into_keys(self) -> IntoKeys<K, V, PAGE, D> {
         IntoKeys(self.into_iter())
@@ -702,21 +736,21 @@ trait SlotEntry {
     fn entry(self) -> Option<Self::Entry>;
 }
 
-impl<'a, K, V> SlotEntry for &'a Entry<K, V> {
+impl<'a, K, V> SlotEntry for &'a Slot<K, V> {
     type Entry = (&'a K, &'a V);
     fn entry(self) -> Option<Self::Entry> {
         self.as_ref().map(|(key, value)| (key, value))
     }
 }
 
-impl<'a, K, V> SlotEntry for &'a mut Entry<K, V> {
+impl<'a, K, V> SlotEntry for &'a mut Slot<K, V> {
     type Entry = (&'a K, &'a mut V);
     fn entry(self) -> Option<Self::Entry> {
         self.as_mut().map(|(key, value)| (&*key, value))
     }
 }
 
-impl<K, V> SlotEntry for Entry<K, V> {
+impl<K, V> SlotEntry for Slot<K, V> {
     type Entry = (K, V);
     fn entry(self) -> Option<Self::Entry> {
         self
@@ -924,7 +958,7 @@ macro_rules! range_iterator {
     ) => {
         $(#[$doc])*
         pub struct $name<'a, K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat>(
-            Cursor<Trim<$pages<'a, K, V, PAGE, D>, PAGE>, slice::$slots<'a, Entry<K, V>>>,
+            Cursor<Trim<$pages<'a, K, V, PAGE, D>, PAGE>, slice::$slots<'a, Slot<K, V>>>,
         )
         where
             K: 'a,
@@ -1069,7 +1103,7 @@ entry_iterator!(
     /// Iterator over the entries of a [`PagedDirectMap`] in slot-index
     /// order, from [`iter`](PagedDirectMap::iter).
     Iter<'a, K, V, PAGE, D>,
-    Cursor<Pages<'a, K, V, PAGE, D>, slice::Iter<'a, Entry<K, V>>>,
+    Cursor<Pages<'a, K, V, PAGE, D>, slice::Iter<'a, Slot<K, V>>>,
     (&'a K, &'a V),
     |entry| entry
 );
@@ -1078,7 +1112,7 @@ entry_iterator!(
     /// Iterator over the entries of a [`PagedDirectMap`] with mutable
     /// values, from [`iter_mut`](PagedDirectMap::iter_mut).
     IterMut<'a, K, V, PAGE, D>,
-    Cursor<PagesMut<'a, K, V, PAGE, D>, slice::IterMut<'a, Entry<K, V>>>,
+    Cursor<PagesMut<'a, K, V, PAGE, D>, slice::IterMut<'a, Slot<K, V>>>,
     (&'a K, &'a mut V),
     |entry| entry
 );
@@ -1087,7 +1121,7 @@ entry_iterator!(
     /// Owning iterator over the entries of a [`PagedDirectMap`] in
     /// slot-index order.
     IntoIter<K, V, PAGE, D>,
-    Cursor<IntoPages<K, V, PAGE, D>, vec::IntoIter<Entry<K, V>>>,
+    Cursor<IntoPages<K, V, PAGE, D>, vec::IntoIter<Slot<K, V>>>,
     (K, V),
     |entry| entry
 );
@@ -1217,6 +1251,250 @@ mod serde_impl {
     }
 }
 
+/// A view into one key's place in a [`PagedDirectMap`], from
+/// [`entry`](PagedDirectMap::entry).
+pub enum Entry<'a, K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+    /// The key is in the map.
+    Occupied(OccupiedEntry<'a, K, V>),
+    /// The key is not in the map; its slot is empty or held by another
+    /// generation of the key.
+    Vacant(VacantEntry<'a, K, V, PAGE, D>),
+}
+
+/// An [`Entry`] for a key that is in the map.
+pub struct OccupiedEntry<'a, K, V> {
+    // Invariant: `*slot` is `Some`, and `len` is the map's entry count.
+    slot: &'a mut Slot<K, V>,
+    len: &'a mut usize,
+}
+
+/// An [`Entry`] for a key that is not in the map.
+pub struct VacantEntry<'a, K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+    map: &'a mut PagedDirectMap<K, V, PAGE, D>,
+    key: K,
+}
+
+impl<'a, K: Key, V, const PAGE: usize, D: Directory> Entry<'a, K, V, PAGE, D> {
+    /// The entry's key: the stored key if occupied, else the key given to
+    /// [`entry`](PagedDirectMap::entry).
+    #[inline]
+    pub fn key(&self) -> &K {
+        match self {
+            Entry::Occupied(entry) => entry.key(),
+            Entry::Vacant(entry) => entry.key(),
+        }
+    }
+
+    /// The value, inserting `default` first if the key is absent (evicting
+    /// another generation in its slot).
+    #[inline]
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// The value, inserting `make()` first if the key is absent. `make` runs
+    /// before the map changes, so if it panics the map is unchanged.
+    #[inline]
+    pub fn or_insert_with(self, make: impl FnOnce() -> V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(make()),
+        }
+    }
+
+    /// Like [`or_insert_with`](Self::or_insert_with), but `make` is given the
+    /// key.
+    #[inline]
+    pub fn or_insert_with_key(self, make: impl FnOnce(&K) -> V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let value = make(&entry.key);
+                entry.insert(value)
+            }
+        }
+    }
+
+    /// The value, inserting `V::default()` first if the key is absent.
+    #[inline]
+    pub fn or_default(self) -> &'a mut V
+    where
+        V: Default,
+    {
+        self.or_insert_with(V::default)
+    }
+
+    /// Calls `f` on the value if the key is present, and returns the entry.
+    #[inline]
+    pub fn and_modify(mut self, f: impl FnOnce(&mut V)) -> Self {
+        if let Entry::Occupied(entry) = &mut self {
+            f(entry.get_mut());
+        }
+        self
+    }
+
+    /// Stores `value` for the key and returns the occupied entry. An occupied
+    /// entry keeps its stored key; a vacant one evicts any other generation.
+    #[inline]
+    pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V> {
+        match self {
+            Entry::Occupied(mut entry) => {
+                entry.insert(value);
+                entry
+            }
+            Entry::Vacant(entry) => entry.insert_entry(value),
+        }
+    }
+}
+
+impl<'a, K, V> OccupiedEntry<'a, K, V> {
+    #[inline]
+    fn pair(&self) -> &(K, V) {
+        match &*self.slot {
+            Some(pair) => pair,
+            None => unreachable!("an occupied entry's slot is full"),
+        }
+    }
+
+    #[inline]
+    fn pair_mut(&mut self) -> &mut (K, V) {
+        match &mut *self.slot {
+            Some(pair) => pair,
+            None => unreachable!("an occupied entry's slot is full"),
+        }
+    }
+
+    /// The stored key.
+    #[inline]
+    pub fn key(&self) -> &K {
+        &self.pair().0
+    }
+
+    /// The value.
+    #[inline]
+    pub fn get(&self) -> &V {
+        &self.pair().1
+    }
+
+    /// Mutable access to the value.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut V {
+        &mut self.pair_mut().1
+    }
+
+    /// Mutable access to the value, for the lifetime of the map borrow.
+    #[inline]
+    pub fn into_mut(self) -> &'a mut V {
+        match self.slot {
+            Some((_, value)) => value,
+            None => unreachable!("an occupied entry's slot is full"),
+        }
+    }
+
+    /// Replaces the value and returns the old one; the stored key is kept.
+    #[inline]
+    pub fn insert(&mut self, value: V) -> V {
+        mem::replace(self.get_mut(), value)
+    }
+
+    /// Removes the entry and returns its value.
+    #[inline]
+    pub fn remove(self) -> V {
+        self.remove_entry().1
+    }
+
+    /// Removes the entry and returns the stored key and its value.
+    pub fn remove_entry(self) -> (K, V) {
+        match self.slot.take() {
+            Some(pair) => {
+                *self.len -= 1;
+                pair
+            }
+            None => unreachable!("an occupied entry's slot is full"),
+        }
+    }
+}
+
+impl<'a, K: Key, V, const PAGE: usize, D: Directory> VacantEntry<'a, K, V, PAGE, D> {
+    /// The key given to [`entry`](PagedDirectMap::entry).
+    #[inline]
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Gives the key back.
+    #[inline]
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    /// The entry of another generation holding the key's slot, which an
+    /// insert would evict.
+    #[inline]
+    pub fn occupant(&self) -> Option<(&K, &V)> {
+        self.map.occupant(self.key.index())
+    }
+
+    /// Stores `value` for the key and returns it, evicting (and dropping)
+    /// any other generation in the slot.
+    ///
+    /// # Panics
+    ///
+    /// As [`PagedDirectMap::insert`]. If an evicted value's `drop` panics,
+    /// the new entry is already in place.
+    #[inline]
+    pub fn insert(self, value: V) -> &'a mut V {
+        self.insert_entry(value).into_mut()
+    }
+
+    /// Like [`insert`](Self::insert), but returns the occupied entry.
+    pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V> {
+        let VacantEntry { map, key } = self;
+        let (slot, len) = map.slot_or_alloc(key.index());
+        if slot.is_none() {
+            *len += 1;
+        }
+        // Drop an evicted entry only once the slot is consistent: `V::drop`
+        // may panic.
+        drop(slot.replace((key, value)));
+        OccupiedEntry { slot, len }
+    }
+}
+
+impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
+    for Entry<'_, K, V, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Entry::Occupied(entry) => f.debug_tuple("Occupied").field(entry).finish(),
+            Entry::Vacant(entry) => f.debug_tuple("Vacant").field(entry).finish(),
+        }
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for OccupiedEntry<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OccupiedEntry")
+            .field("key", self.key())
+            .field("value", self.get())
+            .finish()
+    }
+}
+
+impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
+    for VacantEntry<'_, K, V, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VacantEntry")
+            .field("key", &self.key)
+            .field("occupant", &self.occupant())
+            .finish()
+    }
+}
+
 // The tests use `u32` keys, which implement `Key` only on 32- and 64-bit
 // targets.
 #[cfg(all(test, any(target_pointer_width = "32", target_pointer_width = "64")))]
@@ -1294,6 +1572,61 @@ mod tests {
         assert_eq!(map.remove(new), None);
         assert_eq!(map.remove_occupant(3), Some((old, "back")));
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn entry_occupied_and_vacant() {
+        let mut map: PagedDirectMap<u32, i32> = PagedDirectMap::new();
+        assert!(matches!(map.entry(9), Entry::Vacant(_)));
+        assert_eq!(map.allocated_pages(), 0, "a vacant entry allocates nothing");
+        *map.entry(9).or_insert(1) += 10;
+        map.entry(9).and_modify(|v| *v *= 2).or_insert(-1);
+        assert_eq!(map.get(9), Some(&22));
+        assert_eq!(*map.entry(70_000).or_default(), 0);
+        assert_eq!(*map.entry(5).or_insert_with_key(|&k| k as i32), 5);
+        assert_eq!(map.len(), 3);
+        match map.entry(9) {
+            Entry::Occupied(mut e) => {
+                assert_eq!((e.key(), e.get()), (&9, &22));
+                assert_eq!(e.insert(4), 22);
+                assert_eq!(e.remove_entry(), (9, 4));
+            }
+            Entry::Vacant(_) => panic!("9 is present"),
+        }
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(9), None);
+        let e = map.entry(9).insert_entry(8);
+        assert_eq!(e.remove(), 8);
+        assert_eq!(entries(&map), [(5, 5), (70_000, 0)]);
+    }
+
+    #[test]
+    fn entry_treats_another_generation_as_vacant_and_evicts_it() {
+        let mut map: PagedDirectMap<Gen, &str, 4, Tree> = PagedDirectMap::new();
+        let (old, new) = (Gen(3), Gen(3 | 1 << 16));
+        map.insert(old, "old");
+        match map.entry(new) {
+            Entry::Vacant(e) => {
+                assert_eq!(e.occupant(), Some((&old, &"old")));
+                assert_eq!(*e.insert("new"), "new");
+            }
+            Entry::Occupied(_) => panic!("only `old` is present"),
+        }
+        assert_eq!(map.len(), 1);
+        assert_eq!(entries(&map), [(new, "new")]);
+        // An occupied entry keeps its stored key.
+        assert_eq!(*map.entry(new).or_insert("x"), "new");
+    }
+
+    #[test]
+    fn entry_or_insert_with_panic_leaves_map_unchanged() {
+        let mut map: PagedDirectMap<u32, i32> = PagedDirectMap::new();
+        let result = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            map.entry(3).or_insert_with(|| panic!("make"));
+        }));
+        assert!(result.is_err());
+        assert!(map.is_empty());
+        assert_eq!(map.allocated_pages(), 0);
     }
 
     #[test]
