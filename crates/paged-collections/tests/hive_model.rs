@@ -1116,6 +1116,386 @@ fn reserve_probe<const PAGE: usize>(operations: &[Op], n: usize, fallible: bool)
     }
 }
 
+// Probe every old slot, including free slots on pages with no live elements.
+// Equality alone does not compare free lists or vacant-slot generations.
+fn compare_future_ids<const PAGE: usize>(machine: &mut Machine<PAGE>, twin: &mut Hive<i32, PAGE>) {
+    check(&mut machine.hive, &machine.model);
+    check(twin, &machine.model);
+    let stable = addresses(&machine.hive);
+    let probes = machine.hive.index_bound() + 1;
+    for i in 0..probes {
+        let value = i as i32;
+        let expected = twin.insert(value);
+        assert_eq!(machine.hive.insert(value), expected);
+        assert_eq!(machine.model.insert::<PAGE>(value), expected);
+    }
+    assert_eq!(machine.hive, *twin);
+    assert_stable(&machine.hive, &stable);
+    check(&mut machine.hive, &machine.model);
+    check(twin, &machine.model);
+}
+
+fn drain_prefix<const PAGE: usize>(initial: &[i32], operations: &[Op], raw: u16, leak: bool) {
+    let mut machine = sequence::<PAGE>(initial, operations);
+    let mut twin = machine.hive.clone();
+    let expected = machine.model.pairs();
+    let stable = addresses(&machine.hive);
+    let k = usize::from(raw) % (expected.len() + 1);
+    let mut drain = machine.hive.drain();
+    let mut yielded = Vec::new();
+    for (i, &pair) in expected.iter().take(k).enumerate() {
+        let left = expected.len() - i;
+        assert_eq!(drain.len(), left);
+        assert_eq!(drain.size_hint(), (left, Some(left)));
+        let actual = drain.next().unwrap();
+        assert_eq!(actual, pair);
+        yielded.push(actual);
+    }
+    let left = expected.len() - k;
+    assert_eq!(drain.len(), left);
+    assert_eq!(drain.size_hint(), (left, Some(left)));
+    if left == 0 {
+        assert_eq!(drain.next(), None);
+        assert_eq!(drain.next(), None);
+    }
+    assert_eq!(yielded, expected[..k]);
+    if leak {
+        std::mem::forget(drain);
+        for &(candidate, value) in &yielded {
+            assert_eq!(twin.remove(candidate), Some(value));
+            assert_eq!(machine.model.remove::<PAGE>(candidate), Some(value));
+        }
+        assert_eq!(machine.model.pairs(), expected[k..]);
+    } else {
+        drop(drain);
+        twin.clear();
+        for (candidate, value) in expected {
+            assert_eq!(machine.model.remove::<PAGE>(candidate), Some(value));
+        }
+        assert!(machine.hive.is_empty());
+    }
+    assert_stable(&machine.hive, &stable);
+    compare_future_ids(&mut machine, &mut twin);
+}
+
+fn drain_drops<const PAGE: usize>(values: &[i32], raw: u16) {
+    let ledger = Rc::new(Ledger::default());
+    let mut hive = Hive::<Item, PAGE>::new();
+    let mut model = Model::default();
+    let mut serials = BTreeMap::new();
+    for &value in values {
+        insert_item(&mut hive, &mut model, &ledger, &mut serials, value, false);
+    }
+    // Include holes and values already dropped before the drain starts.
+    for (candidate, _) in model.pairs().into_iter().skip(1).step_by(3) {
+        drop(hive.remove(candidate));
+        model.remove::<PAGE>(candidate).unwrap();
+    }
+    let expected = model.pairs();
+    let k = usize::from(raw) % (expected.len() + 1);
+    let mut drain = hive.drain();
+    let mut yielded = Vec::new();
+    for &(candidate, value) in expected.iter().take(k) {
+        let (actual, item) = drain.next().unwrap();
+        assert_eq!(
+            (actual, item.serial, item.value),
+            (candidate, serials[&candidate], value)
+        );
+        yielded.push(item);
+    }
+    ledger.check_live(expected.iter().map(|&(candidate, _)| serials[&candidate]));
+    drop(drain);
+    assert!(hive.is_empty());
+    ledger.check_live(yielded.iter().map(|item| item.serial));
+    drop(yielded);
+    for (candidate, _) in expected {
+        model.remove::<PAGE>(candidate).unwrap();
+    }
+    check_items(&mut hive, &model, &ledger, &serials);
+    drop(hive);
+    ledger.check_live([]);
+}
+
+fn extract_prefix<const PAGE: usize>(initial: &[i32], operations: &[Op], rule: Rule, raw: u16) {
+    let mut machine = sequence::<PAGE>(initial, operations);
+    let mut twin = machine.hive.clone();
+    let before = machine.model.pairs();
+    let stable = addresses(&machine.hive);
+    // One extra next() can exhaust the scan even when no value matches.
+    let k = usize::from(raw) % (before.len() + 2);
+    let mut expected = Vec::new();
+    let mut expected_visits = Vec::new();
+    for &(candidate, old) in &before {
+        if expected.len() == k {
+            break;
+        }
+        expected_visits.push((candidate, old));
+        let value = old.wrapping_add(rule.delta);
+        twin[candidate] = value;
+        machine.model.live.get_mut(&candidate.index()).unwrap().1 = value;
+        if !rule.keep(candidate, value) {
+            expected.push((candidate, value));
+            assert_eq!(twin.remove(candidate), Some(value));
+            assert_eq!(machine.model.remove::<PAGE>(candidate), Some(value));
+        }
+    }
+    let mut visits = Vec::new();
+    let mut yielded = Vec::new();
+    {
+        let mut extract = machine.hive.extract_if(|candidate, value| {
+            visits.push((candidate, *value));
+            *value = value.wrapping_add(rule.delta);
+            !rule.keep(candidate, *value)
+        });
+        for _ in 0..k {
+            match extract.next() {
+                Some(pair) => yielded.push(pair),
+                None => {
+                    assert_eq!(extract.next(), None);
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(yielded, expected);
+    assert_eq!(visits, expected_visits);
+    assert_eq!(visits, before[..visits.len()]);
+    assert_stable(&machine.hive, &stable);
+    compare_future_ids(&mut machine, &mut twin);
+}
+
+fn extract_panic<const PAGE: usize>(rule: Rule, raw: u16) {
+    let ledger = Rc::new(Ledger::default());
+    let mut hive = Hive::<Item, PAGE>::new();
+    let mut model = Model::default();
+    let mut serials = BTreeMap::new();
+    for i in 0..2 * PAGE + 5 {
+        insert_item(
+            &mut hive,
+            &mut model,
+            &ledger,
+            &mut serials,
+            i as i32,
+            false,
+        );
+    }
+    for index in [1, PAGE + 1] {
+        let candidate = id(index as u32, 1);
+        drop(hive.remove(candidate));
+        model.remove::<PAGE>(candidate).unwrap();
+    }
+    let before = model.pairs();
+    let stable = addresses(&hive);
+    let stop = usize::from(raw) % before.len();
+    let mut visits = Vec::new();
+    let mut yielded = Vec::new();
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let extract = hive.extract_if(|candidate, item| {
+                let turn = visits.len();
+                visits.push((candidate, item.value));
+                item.value = item.value.wrapping_add(rule.delta);
+                assert_ne!(turn, stop, "extract predicate bomb");
+                turn == 0 || !rule.keep(candidate, item.value)
+            });
+            for (candidate, item) in extract {
+                yielded.push((candidate, item.value));
+                drop(item);
+            }
+        }))
+        .is_err()
+    );
+    assert_eq!(visits, before[..=stop]);
+    let mut expected = Vec::new();
+    for (turn, &(candidate, old)) in before.iter().enumerate().take(stop + 1) {
+        let value = old.wrapping_add(rule.delta);
+        // The panicking call mutates its value but never returns a decision.
+        if turn == stop || (turn != 0 && rule.keep(candidate, value)) {
+            model.live.get_mut(&candidate.index()).unwrap().1 = value;
+        } else {
+            expected.push((candidate, value));
+            model.remove::<PAGE>(candidate).unwrap();
+        }
+    }
+    assert_eq!(yielded, expected);
+    assert_stable(&hive, &stable);
+    check_items(&mut hive, &model, &ledger, &serials);
+    // Exercise the free lists left behind by completed extractions.
+    for i in 0..=before.len() {
+        insert_item(&mut hive, &mut model, &ledger, &mut serials, i as i32, true);
+    }
+    assert_stable(&hive, &stable);
+    check_items(&mut hive, &model, &ledger, &serials);
+    drop(hive);
+    ledger.check_live([]);
+}
+
+fn disjoint_batch<const PAGE: usize, const N: usize>(
+    machine: &mut Machine<PAGE>,
+    ids: [Id; N],
+    marker: i32,
+) {
+    let stable = addresses(&machine.hive);
+    let expected = ids.map(|candidate| machine.model.get(candidate));
+    let got = machine.hive.get_disjoint_mut(ids);
+    for (i, value) in got.into_iter().enumerate() {
+        assert_eq!(value.as_deref().copied(), expected[i]);
+        if let Some(value) = value {
+            let new = marker.wrapping_add(i as i32);
+            *value = new;
+            machine.model.live.get_mut(&ids[i].index()).unwrap().1 = new;
+        }
+    }
+    assert_stable(&machine.hive, &stable);
+    check(&mut machine.hive, &machine.model);
+}
+
+fn disjoint_model<const PAGE: usize>(operations: &[Op], targets: &[Target], marker: i32) {
+    let mut machine = sequence::<PAGE>(&[10, 20, 30, 40], operations);
+    // Guarantee both live and stale choices even if the sequence cleared it.
+    machine.insert(-1, false);
+    let stale = machine.model.pairs().last().unwrap().0;
+    assert_eq!(
+        machine.hive.remove(stale),
+        machine.model.remove::<PAGE>(stale)
+    );
+    for value in [10, 20, 30, 40] {
+        machine.insert(value, false);
+    }
+    let mut twin = machine.hive.clone();
+    let mut selected = BTreeSet::new();
+    let ids: [Id; 4] = std::array::from_fn(|i| {
+        let candidate = targets[i].resolve(&machine.model);
+        if machine.model.get(candidate).is_some() && !selected.insert(candidate) {
+            Target::Never(candidate.index()).resolve(&machine.model)
+        } else {
+            candidate
+        }
+    });
+    disjoint_batch(&mut machine, [], marker);
+    disjoint_batch(&mut machine, [ids[0]], marker);
+    disjoint_batch(&mut machine, [ids[0], ids[1]], marker);
+    disjoint_batch(&mut machine, [ids[0], ids[1], ids[2]], marker);
+    disjoint_batch(&mut machine, ids, marker);
+    // Force input order to differ from slot order and mix all three kinds.
+    let live = machine.model.pairs();
+    let first = live[0].0;
+    let last = live.last().unwrap().0;
+    disjoint_batch(
+        &mut machine,
+        [last, stale, first, id(MAX_INDICES, 1)],
+        marker,
+    );
+    disjoint_batch(&mut machine, [stale, stale], marker);
+    for (candidate, value) in machine.model.pairs() {
+        twin[candidate] = value;
+    }
+    compare_future_ids(&mut machine, &mut twin);
+}
+
+fn disjoint_duplicates<const PAGE: usize>(operations: &[Op]) {
+    let mut machine = sequence::<PAGE>(&[], operations);
+    for value in [10, 20, 30] {
+        machine.insert(value, false);
+    }
+    let pairs = machine.model.pairs();
+    let (a, b, c) = (pairs[0].0, pairs[1].0, pairs[2].0);
+    let stable = addresses(&machine.hive);
+    let mut twin = machine.hive.clone();
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _ = machine.hive.get_disjoint_mut([a, a]);
+        }))
+        .is_err()
+    );
+    check(&mut machine.hive, &machine.model);
+    assert_stable(&machine.hive, &stable);
+    // For PAGE=1 these distinct live ids necessarily occupy different pages.
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _ = machine.hive.get_disjoint_mut([c, a, b, c]);
+        }))
+        .is_err()
+    );
+    assert_stable(&machine.hive, &stable);
+    compare_future_ids(&mut machine, &mut twin);
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    #[test]
+    fn drain_prefix_drop_matches_clear_and_future_ids(
+        initial in prop::collection::vec(any::<i32>(), 0..9),
+        operations in prop::collection::vec(operation(), 0..max_len() / 3),
+        raw in any::<u16>(),
+    ) {
+        drain_prefix::<1>(&initial, &operations, raw, false);
+        drain_prefix::<2>(&initial, &operations, raw, false);
+        drain_prefix::<4>(&initial, &operations, raw, false);
+    }
+
+    #[test]
+    fn leaked_drain_keeps_unyielded_values_and_matches_remove(
+        initial in prop::collection::vec(any::<i32>(), 0..9),
+        operations in prop::collection::vec(operation(), 0..max_len() / 3),
+        raw in any::<u16>(),
+    ) {
+        drain_prefix::<1>(&initial, &operations, raw, true);
+        drain_prefix::<2>(&initial, &operations, raw, true);
+        drain_prefix::<4>(&initial, &operations, raw, true);
+    }
+
+    #[test]
+    fn drain_caller_and_iterator_drop_each_value_once(
+        values in prop::collection::vec(any::<i32>(), 0..max_len() / 3),
+        raw in any::<u16>(),
+    ) {
+        drain_drops::<1>(&values, raw);
+        drain_drops::<2>(&values, raw);
+        drain_drops::<4>(&values, raw);
+    }
+
+    #[test]
+    fn extract_if_prefix_matches_visited_mutations_and_removes(
+        initial in prop::collection::vec(any::<i32>(), 0..9),
+        operations in prop::collection::vec(operation(), 0..max_len() / 3),
+        rule in rule(),
+        raw in any::<u16>(),
+    ) {
+        extract_prefix::<1>(&initial, &operations, rule, raw);
+        extract_prefix::<2>(&initial, &operations, rule, raw);
+        extract_prefix::<4>(&initial, &operations, rule, raw);
+    }
+
+    #[test]
+    fn extract_if_predicate_panic_preserves_state_and_ownership(rule in rule(), raw in any::<u16>()) {
+        extract_panic::<1>(rule, raw);
+        extract_panic::<2>(rule, raw);
+        extract_panic::<4>(rule, raw);
+    }
+
+    #[test]
+    fn get_disjoint_mut_matches_model_in_input_order(
+        operations in prop::collection::vec(operation(), 0..max_len() / 3),
+        targets in prop::collection::vec(target(), 4),
+        marker in any::<i32>(),
+    ) {
+        disjoint_model::<1>(&operations, &targets, marker);
+        disjoint_model::<2>(&operations, &targets, marker);
+        disjoint_model::<4>(&operations, &targets, marker);
+    }
+
+    #[test]
+    fn get_disjoint_mut_repeated_live_ids_panic_without_changes(
+        operations in prop::collection::vec(operation(), 0..max_len() / 3),
+    ) {
+        disjoint_duplicates::<1>(&operations);
+        disjoint_duplicates::<2>(&operations);
+        disjoint_duplicates::<4>(&operations);
+    }
+}
+
 fn retain_panic<const PAGE: usize>(rule: Rule, raw: u16) {
     let ledger = Rc::new(Ledger::default());
     let mut hive = Hive::<Item, PAGE>::new();
