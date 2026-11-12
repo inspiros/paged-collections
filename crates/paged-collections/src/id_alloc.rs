@@ -73,10 +73,38 @@ pub const MAX_INDICES: u32 = u32::MAX;
 /// Ids order by index, then generation. [`to_bits`](Id::to_bits) packs one
 /// into a `u64` (generation in the high half), for storage or for passing
 /// across an FFI boundary.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// # Layout
+///
+/// An `Id` has size 8 and alignment 8 (at least the alignment of `u64` on
+/// every target), and its bytes are exactly those of
+/// [`to_bits`](Id::to_bits) in native byte order. FFI
+/// code may therefore view a `[Id]` as a `[u64]` of bits without copying.
+/// (The reverse is not sound: a `u64` with a zero high half is not an `Id`.)
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C, align(8))]
 pub struct Id {
+    // Field order follows the byte order, so the high half of the native
+    // `u64` holds the generation.
+    #[cfg(target_endian = "little")]
     index: u32,
     generation: NonZeroU32,
+    #[cfg(target_endian = "big")]
+    index: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<Id>() == 8 && core::mem::align_of::<Id>() == 8);
+
+impl Ord for Id {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (self.index, self.generation).cmp(&(other.index, other.generation))
+    }
+}
+
+impl PartialOrd for Id {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Id {
@@ -717,6 +745,16 @@ mod tests {
         assert_eq!(
             bad(&[0, 3], &[]).map(|a| (a.len(), a.retired_len())),
             Ok((1, 1))
+        );
+    }
+
+    #[test]
+    fn ids_order_by_index_then_generation() {
+        assert!(Id::new(0, g(2)) < Id::new(1, g(1)));
+        assert!(Id::new(1, g(1)) < Id::new(1, g(2)));
+        assert_eq!(
+            Id::new(3, g(4)).cmp(&Id::new(3, g(4))),
+            core::cmp::Ordering::Equal
         );
     }
 }
