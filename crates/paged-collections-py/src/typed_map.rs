@@ -1,4 +1,5 @@
-//! `SparseMapF64` and friends: `PagedSparseMap<u32, T>` for NumPy dtypes `T`.
+//! `SparseMapF64` and friends: `PagedSparseMap<u32, T>` for NumPy dtypes `T`;
+//! `IdMapF64` and friends: the same keyed by `Id`.
 
 use numpy::PyArray1;
 use paged_collections::sparse_map::PagedSparseMap;
@@ -7,19 +8,24 @@ use pyo3::exceptions::{PyKeyError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use crate::convert::{Key, KeyBatch, TypedValue, insert_key, lookup_key, value_batch};
+use crate::convert::{Key, KeyBatch, PyKey, TypedValue, value_batch};
 use crate::export::{Exports, ValueCell, cell_view, read_only_view};
 use crate::iter::key_iterator;
 use crate::repr_items;
+use paged_collections::id_alloc::Id;
 
 /// Writes `values` for `keys` (duplicates: the last wins) and returns how
 /// many keys were new. With views alive, only keys already present may be
 /// written, and the call fails before writing anything otherwise.
-pub(crate) fn write_batch<V>(
-    map: &mut PagedSparseMap<Key, V>,
+///
+/// A key counts as new if the map did not hold it (exactly) before it was
+/// written, so an id that evicts another generation of its slot is new,
+/// although the length does not change.
+pub(crate) fn write_batch<K: PyKey, V>(
+    map: &mut PagedSparseMap<K, V>,
     exports: &Exports,
     type_name: &str,
-    keys: Vec<Key>,
+    keys: Vec<K>,
     values: Vec<V>,
 ) -> PyResult<usize> {
     debug_assert_eq!(keys.len(), values.len());
@@ -28,21 +34,22 @@ pub(crate) fn write_batch<V>(
         exports.check(type_name)?;
         map.try_reserve(keys.len()).map_err(crate::reserve_error)?;
     }
-    let before = map.len();
+    let mut added = 0;
     for (key, value) in keys.into_iter().zip(values) {
+        added += usize::from(!map.contains_key(key));
         map.insert(key, value);
     }
-    Ok(map.len() - before)
+    Ok(added)
 }
 
 /// As [`write_batch`], for maps whose values are atomic cells that may be
 /// exported: existing values are written with `ValueCell::set`, never through a
 /// `&mut` (see the invariants in [`crate::export`]).
-fn write_cells<T: TypedValue>(
-    map: &mut PagedSparseMap<Key, ValueCell<T>>,
+fn write_cells<K: PyKey, T: TypedValue>(
+    map: &mut PagedSparseMap<K, ValueCell<T>>,
     exports: &Exports,
     type_name: &str,
-    keys: Vec<Key>,
+    keys: Vec<K>,
     values: Vec<T>,
 ) -> PyResult<usize> {
     debug_assert_eq!(keys.len(), values.len());
@@ -51,16 +58,17 @@ fn write_cells<T: TypedValue>(
         exports.check(type_name)?;
         map.try_reserve(keys.len()).map_err(crate::reserve_error)?;
     }
-    let before = map.len();
+    let mut added = 0;
     for (key, value) in keys.into_iter().zip(values) {
         match map.get(key) {
             Some(cell) => cell.set(value),
             None => {
+                added += 1;
                 map.insert(key, ValueCell::new(value));
             }
         }
     }
-    Ok(map.len() - before)
+    Ok(added)
 }
 
 /// The optional `default` of `pop`-like methods, given as `*args`.
@@ -80,8 +88,17 @@ pub(crate) fn optional_default<'py>(
 
 macro_rules! typed_map {
     ($name:ident, $iter:ident, $pyname:literal, $t:ty, $view:ident) => {
+        typed_map!(
+            $name, $iter, $pyname, $t, $view,
+            Key, "integers in ``0 <= key < 2**32``", "uint32"
+        );
+    };
+    (
+        $name:ident, $iter:ident, $pyname:literal, $t:ty, $view:ident,
+        $K:ty, $keydoc:literal, $keydtype:literal
+    ) => {
         #[doc = concat!(
-            "A map from integers in ``0 <= key < 2**32`` to ``",
+            "A map from ", $keydoc, " to ``",
             stringify!($t),
             "`` values, with O(1) insert, delete and lookup.\n\n",
             "Keys and values live in two parallel contiguous arrays (in insertion order ",
@@ -97,7 +114,7 @@ macro_rules! typed_map {
         pub(crate) struct $name {
             /// Values are atomic cells so they can be exported to NumPy and still
             /// be written by Rust (see [`crate::export`]).
-            map: PagedSparseMap<Key, ValueCell<$t>>,
+            map: PagedSparseMap<$K, ValueCell<$t>>,
             exports: Exports,
             /// Changes on every structural change, so iterators can detect them.
             mods: u64,
@@ -116,7 +133,7 @@ macro_rules! typed_map {
                 self.mods = self.mods.wrapping_add(1);
             }
 
-            pub(crate) fn dense_keys(&self) -> &[Key] {
+            pub(crate) fn dense_keys(&self) -> &[$K] {
                 self.map.key_slice()
             }
 
@@ -125,7 +142,7 @@ macro_rules! typed_map {
                 keys: &Bound<'_, PyAny>,
                 values: &Bound<'_, PyAny>,
             ) -> PyResult<usize> {
-                let keys = KeyBatch::new(keys)?.to_insert_keys()?;
+                let keys = KeyBatch::<$K>::new(keys)?.to_insert_keys()?;
                 let values = value_batch::<$t>(values, keys.len())?;
                 let new = write_cells(&mut self.map, &self.exports, $pyname, keys, values)?;
                 if new > 0 {
@@ -134,7 +151,7 @@ macro_rules! typed_map {
                 Ok(new)
             }
 
-            fn remove_present(&mut self, key: Key) -> PyResult<$t> {
+            fn remove_present(&mut self, key: $K) -> PyResult<$t> {
                 self.exports.check($pyname)?;
                 let value = self.map.remove(key);
                 self.changed();
@@ -170,17 +187,17 @@ macro_rules! typed_map {
             }
 
             fn __contains__(&self, key: &Bound<'_, PyAny>) -> bool {
-                lookup_key(key).is_some_and(|k| self.map.contains_key(k))
+                <$K as PyKey>::lookup(key).is_some_and(|k| self.map.contains_key(k))
             }
 
             fn __getitem__(&self, key: &Bound<'_, PyAny>) -> PyResult<$t> {
-                lookup_key(key)
+                <$K as PyKey>::lookup(key)
                     .and_then(|k| self.map.get(k).map(ValueCell::get))
                     .ok_or_else(|| PyKeyError::new_err(key.clone().unbind()))
             }
 
             fn __setitem__(&mut self, key: &Bound<'_, PyAny>, value: $t) -> PyResult<()> {
-                let key = insert_key(key)?;
+                let key = <$K as PyKey>::insert(key)?;
                 if let Some(cell) = self.map.get(key) {
                     cell.set(value);
                 } else {
@@ -192,7 +209,7 @@ macro_rules! typed_map {
             }
 
             fn __delitem__(&mut self, key: &Bound<'_, PyAny>) -> PyResult<()> {
-                match lookup_key(key).filter(|&k| self.map.contains_key(k)) {
+                match <$K as PyKey>::lookup(key).filter(|&k| self.map.contains_key(k)) {
                     Some(k) => self.remove_present(k).map(drop),
                     None => Err(PyKeyError::new_err(key.clone().unbind())),
                 }
@@ -209,7 +226,7 @@ macro_rules! typed_map {
             fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
                 let py = slf.py();
                 let this = slf.try_borrow()?;
-                let items = repr_items(this.map.iter().map(|(&k, v)| (k, v.get())), py)?;
+                let items = repr_items(this.map.iter().map(|(&k, v)| (k.to_bits(), v.get())), py)?;
                 Ok(format!("{}({{{items}}})", slf.get_type().name()?))
             }
 
@@ -237,7 +254,7 @@ macro_rules! typed_map {
                 key: &Bound<'py, PyAny>,
                 default: Option<Bound<'py, PyAny>>,
             ) -> PyResult<Bound<'py, PyAny>> {
-                match lookup_key(key).and_then(|k| self.map.get(k)) {
+                match <$K as PyKey>::lookup(key).and_then(|k| self.map.get(k)) {
                     Some(value) => value.get().into_bound_py_any(py),
                     None => Ok(default.unwrap_or_else(|| py.None().into_bound(py))),
                 }
@@ -253,7 +270,7 @@ macro_rules! typed_map {
                 default: &Bound<'py, PyTuple>,
             ) -> PyResult<Bound<'py, PyAny>> {
                 let default = optional_default(default, "pop")?;
-                match lookup_key(key).filter(|&k| self.map.contains_key(k)) {
+                match <$K as PyKey>::lookup(key).filter(|&k| self.map.contains_key(k)) {
                     Some(k) => {
                         self.remove_present(k)?.into_bound_py_any(py)
                     }
@@ -263,17 +280,17 @@ macro_rules! typed_map {
 
             /// Remove and return the last ``(key, value)`` pair in dense order;
             /// raise ``KeyError`` if the map is empty.
-            fn popitem(&mut self) -> PyResult<(Key, $t)> {
+            fn popitem(&mut self) -> PyResult<(<$K as PyKey>::Bits, $t)> {
                 let &key = self.map.key_slice().last().ok_or_else(|| {
                     PyKeyError::new_err(concat!("popitem(): ", $pyname, " is empty"))
                 })?;
-                Ok((key, self.remove_present(key)?))
+                Ok((key.to_bits(), self.remove_present(key)?))
             }
 
             /// Return the value for ``key``, first inserting ``default`` if
             /// ``key`` is absent.
             fn setdefault(&mut self, key: &Bound<'_, PyAny>, default: $t) -> PyResult<$t> {
-                let key = insert_key(key)?;
+                let key = <$K as PyKey>::insert(key)?;
                 if let Some(value) = self.map.get(key) {
                     return Ok(value.get());
                 }
@@ -313,9 +330,9 @@ macro_rules! typed_map {
                 Ok(())
             }
 
-            /// Return the keys as a new ``uint32`` array, in dense order.
-            fn keys<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<Key>> {
-                PyArray1::from_slice(py, self.map.key_slice())
+            #[doc = concat!("Return the keys as a new ``", $keydtype, "`` array, in dense order.")]
+            fn keys<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<<$K as PyKey>::Bits>> {
+                PyArray1::from_slice(py, <$K as PyKey>::bits_slice(self.map.key_slice()))
             }
 
             #[doc = concat!("Return the values as a new ``", stringify!($t), "`` array, in dense order.")]
@@ -324,17 +341,23 @@ macro_rules! typed_map {
             }
 
             /// Return a list of ``(key, value)`` pairs in dense order.
-            fn items(&self) -> Vec<(Key, $t)> {
-                self.map.iter().map(|(&k, v)| (k, v.get())).collect()
+            fn items(&self) -> Vec<(<$K as PyKey>::Bits, $t)> {
+                self.map.iter().map(|(&k, v)| (k.to_bits(), v.get())).collect()
             }
 
-            /// Return a zero-copy, read-only ``uint32`` array of the keys in
-            /// dense order. See the class docs for what views prevent.
-            fn keys_view<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyArray1<Key>>> {
+            #[doc = concat!(
+                "Return a zero-copy, read-only ``", $keydtype, "`` array of the keys in ",
+                "dense order. See the class docs for what views prevent."
+            )]
+            fn keys_view<'py>(
+                slf: &Bound<'py, Self>,
+            ) -> PyResult<Bound<'py, PyArray1<<$K as PyKey>::Bits>>> {
                 let this = slf.try_borrow()?;
-                // SAFETY: the keys are the map's dense key `Vec`, and every
-                // method that could move them checks `exports` first.
-                unsafe { read_only_view(slf.as_any(), &this.exports, this.map.key_slice()) }
+                let keys = <$K as PyKey>::bits_slice(this.map.key_slice());
+                // SAFETY: the keys are the map's dense key `Vec` (seen as
+                // their bits), and every method that could move them checks
+                // `exports` first.
+                unsafe { read_only_view(slf.as_any(), &this.exports, keys) }
             }
 
             /// Return a zero-copy array of the values in dense order:
@@ -369,7 +392,7 @@ macro_rules! typed_map {
                 keys: &Bound<'py, PyAny>,
                 default: Option<$t>,
             ) -> PyResult<Bound<'py, PyArray1<$t>>> {
-                let batch = KeyBatch::new(keys)?;
+                let batch = KeyBatch::<$K>::new(keys)?;
                 let mut out = Vec::with_capacity(batch.len());
                 let mut missing = None;
                 batch.for_each(|k| match (k.and_then(|k| self.map.get(k)), default) {
@@ -392,7 +415,7 @@ macro_rules! typed_map {
                 py: Python<'py>,
                 keys: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, PyArray1<bool>>> {
-                let batch = KeyBatch::new(keys)?;
+                let batch = KeyBatch::<$K>::new(keys)?;
                 let mut out = Vec::with_capacity(batch.len());
                 batch.for_each(|k| out.push(k.is_some_and(|k| self.map.contains_key(k))));
                 Ok(PyArray1::from_vec(py, out))
@@ -401,7 +424,7 @@ macro_rules! typed_map {
             /// Remove every key in ``keys`` that is present and return how
             /// many were removed. Absent and out-of-range keys are ignored.
             fn discard_many(&mut self, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
-                let batch = KeyBatch::new(keys)?;
+                let batch = KeyBatch::<$K>::new(keys)?;
                 let mut present = Vec::new();
                 batch.for_each(|k| present.extend(k.filter(|&k| self.map.contains_key(k))));
                 if present.is_empty() {
@@ -416,7 +439,7 @@ macro_rules! typed_map {
                 Ok(removed)
             }
 
-            /// Sort the entries by key, ascending.
+            /// Sort the entries by key, ascending (ids: by index, then generation).
             fn sort_keys(&mut self) -> PyResult<()> {
                 self.exports.check($pyname)?;
                 self.map.sort_unstable_keys();
@@ -450,7 +473,7 @@ macro_rules! typed_map {
             }
         }
 
-        key_iterator!($iter, $name, $pyname);
+        key_iterator!($iter, $name, $pyname, $K);
     };
 
     (@view writeable, $slf:ident) => {{
@@ -519,4 +542,74 @@ typed_map!(
     "SparseMapBool",
     bool,
     read_only
+);
+typed_map!(
+    IdMapF64,
+    IdMapF64Iterator,
+    "IdMapF64",
+    f64,
+    writeable,
+    Id,
+    "generational ids (see ``IdAllocator``)",
+    "uint64"
+);
+typed_map!(
+    IdMapF32,
+    IdMapF32Iterator,
+    "IdMapF32",
+    f32,
+    writeable,
+    Id,
+    "generational ids (see ``IdAllocator``)",
+    "uint64"
+);
+typed_map!(
+    IdMapI64,
+    IdMapI64Iterator,
+    "IdMapI64",
+    i64,
+    writeable,
+    Id,
+    "generational ids (see ``IdAllocator``)",
+    "uint64"
+);
+typed_map!(
+    IdMapI32,
+    IdMapI32Iterator,
+    "IdMapI32",
+    i32,
+    writeable,
+    Id,
+    "generational ids (see ``IdAllocator``)",
+    "uint64"
+);
+typed_map!(
+    IdMapU64,
+    IdMapU64Iterator,
+    "IdMapU64",
+    u64,
+    writeable,
+    Id,
+    "generational ids (see ``IdAllocator``)",
+    "uint64"
+);
+typed_map!(
+    IdMapU32,
+    IdMapU32Iterator,
+    "IdMapU32",
+    u32,
+    writeable,
+    Id,
+    "generational ids (see ``IdAllocator``)",
+    "uint64"
+);
+typed_map!(
+    IdMapBool,
+    IdMapBoolIterator,
+    "IdMapBool",
+    bool,
+    read_only,
+    Id,
+    "generational ids (see ``IdAllocator``)",
+    "uint64"
 );

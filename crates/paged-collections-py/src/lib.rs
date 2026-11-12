@@ -135,8 +135,8 @@ fn truncated(items: impl ExactSizeIterator<Item = String>) -> String {
 }
 
 /// `key: repr(value)` for each entry, truncated as by [`truncated`].
-fn repr_items<'py, V: IntoPyObject<'py>>(
-    entries: impl ExactSizeIterator<Item = (convert::Key, V)>,
+fn repr_items<'py, K: std::fmt::Display, V: IntoPyObject<'py>>(
+    entries: impl ExactSizeIterator<Item = (K, V)>,
     py: Python<'py>,
 ) -> PyResult<String> {
     let more = entries.len() > REPR_ITEMS;
@@ -171,9 +171,15 @@ mod _core {
         IdAllocator, IdAllocatorIterator, id_generation, id_index, id_indices, make_id,
     };
     #[pymodule_export]
-    use crate::object_map::{SparseMap, SparseMapIterator};
+    use crate::object_map::{IdMap, IdMapIterator, SparseMap, SparseMapIterator};
     #[pymodule_export]
     use crate::set::{SparseSet, SparseSetIterator};
+    #[pymodule_export]
+    use crate::typed_map::{
+        IdMapBool, IdMapBoolIterator, IdMapF32, IdMapF32Iterator, IdMapF64, IdMapF64Iterator,
+        IdMapI32, IdMapI32Iterator, IdMapI64, IdMapI64Iterator, IdMapU32, IdMapU32Iterator,
+        IdMapU64, IdMapU64Iterator,
+    };
     #[pymodule_export]
     use crate::typed_map::{
         SparseMapBool, SparseMapBoolIterator, SparseMapF32, SparseMapF32Iterator, SparseMapF64,

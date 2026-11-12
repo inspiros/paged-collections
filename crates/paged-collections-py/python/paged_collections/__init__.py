@@ -1,17 +1,19 @@
 """Paged sets and maps, and generational id allocation, implemented in Rust.
 
-Keys are integers in ``0 <= key < 2**32``. ``SparseSet`` holds keys only;
+``SparseSet``, ``SparseMap`` and ``DirectMap`` use integer keys in
+``0 <= key < 2**32``. ``SparseSet`` holds keys only;
 ``SparseMap`` maps keys to arbitrary objects; ``SparseMapF64`` and the other
 typed maps store numeric values unboxed and expose them as NumPy arrays.
 ``DirectMap`` and its typed variants keep entries in ascending key order and
-provide nearest-entry and range queries. ``sparse_map(dtype)`` and
-``direct_map(dtype)`` pick the map class for a dtype.
+provide nearest-entry and range queries. ``IdMap`` and its typed variants
+map generational ids to values. ``sparse_map(dtype)``, ``direct_map(dtype)``
+and ``id_map(dtype)`` pick the map class for a dtype.
 
 ``IdAllocator`` issues integer ids packed as ``generation << 32 | index``.
 Freed indices are reused last freed first with a new generation. ``id_index``,
 ``id_generation``, ``make_id`` and vectorized ``id_indices`` convert their parts;
 ``make_id`` accepts generations through 2**32-1, while the allocator issues at
-most ``MAX_GENERATION`` (2**31). Ids are distinct from the maps' uint32 keys.
+most ``MAX_GENERATION`` (2**31). Use ``IdMap`` to key a map by these ids.
 """
 
 from __future__ import annotations
@@ -33,6 +35,14 @@ from paged_collections._core import (
     DirectMapU32,
     DirectMapU64,
     IdAllocator,
+    IdMap,
+    IdMapBool,
+    IdMapF32,
+    IdMapF64,
+    IdMapI32,
+    IdMapI64,
+    IdMapU32,
+    IdMapU64,
     SparseMap,
     SparseMapBool,
     SparseMapF32,
@@ -75,9 +85,22 @@ _TYPED_DIRECT_MAPS = {
     )
 }
 
+_TYPED_ID_MAPS = {
+    np.dtype(cls.dtype): cls
+    for cls in (
+        IdMapF64,
+        IdMapF32,
+        IdMapI64,
+        IdMapI32,
+        IdMapU64,
+        IdMapU32,
+        IdMapBool,
+    )
+}
+
 
 def _map_class(dtype: Any, object_class: Any, typed_maps: dict, kind: str) -> Any:
-    """Resolve the value dtype shared by the two map families."""
+    """Resolve the value dtype shared by the map families."""
     if dtype is None or dtype is object:
         return object_class
     resolved = np.dtype(dtype)
@@ -98,6 +121,20 @@ def sparse_map(dtype: Any = None, keys: Any = None, values: Any = None) -> Any:
     ``values`` are passed to the constructor.
     """
     cls = _map_class(dtype, SparseMap, _TYPED_MAPS, "sparse")
+    if keys is None and values is None:
+        return cls()
+    return cls(keys, values)
+
+
+def id_map(dtype: Any = None, keys: Any = None, values: Any = None) -> Any:
+    """Create a generational-id map whose values have ``dtype``.
+
+    ``dtype=None`` or ``object`` gives an ``IdMap`` of arbitrary objects.
+    Otherwise ``dtype`` is anything ``numpy.dtype`` accepts and must be one of
+    float64, float32, int64, int32, uint64, uint32 or bool. ``keys`` and
+    ``values`` are passed to the constructor.
+    """
+    cls = _map_class(dtype, IdMap, _TYPED_ID_MAPS, "id")
     if keys is None and values is None:
         return cls()
     return cls(keys, values)
@@ -131,6 +168,14 @@ __all__ = [
     "DirectMapU32",
     "DirectMapU64",
     "IdAllocator",
+    "IdMap",
+    "IdMapBool",
+    "IdMapF32",
+    "IdMapF64",
+    "IdMapI32",
+    "IdMapI64",
+    "IdMapU32",
+    "IdMapU64",
     "SparseMap",
     "SparseMapBool",
     "SparseMapF32",
@@ -144,6 +189,7 @@ __all__ = [
     "id_generation",
     "id_index",
     "id_indices",
+    "id_map",
     "make_id",
     "sparse_map",
     "direct_map",

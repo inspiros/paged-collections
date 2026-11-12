@@ -12,24 +12,142 @@ use numpy::{
     Element, PyArray1, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods, PyReadonlyArray1,
     PyUntypedArray, PyUntypedArrayMethods,
 };
+use paged_collections::id_alloc::Id;
 use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyInt;
+use std::fmt;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU8, AtomicU32, AtomicU64};
 
-/// The key type every Python collection uses.
+/// The key type of the integer-keyed collections.
 pub(crate) type Key = u32;
 
-/// The key `obj` names, for a lookup: `None` if `obj` is not an integer in
-/// range, so the lookup finds nothing.
-pub(crate) fn lookup_key(obj: &Bound<'_, PyAny>) -> Option<Key> {
-    obj.extract::<Key>().ok()
+/// A key type a Python collection can use: `u32` (integer keys) or
+/// [`Id`] (generational ids from `IdAllocator`, as `to_bits` integers).
+pub(crate) trait PyKey: paged_collections::key::Key + Copy + Eq + Ord + 'static {
+    /// The integer a key is in Python and in NumPy arrays.
+    type Bits: Element + Copy + fmt::Display + for<'py> IntoPyObject<'py>;
+
+    /// What is wrong with an invalid key, for messages.
+    const INVALID: &'static str;
+
+    /// Whether a plain sequence that NumPy reads as float or object is
+    /// converted element by element (ids need all 64 bits).
+    const SEQUENCE_FALLBACK: bool = false;
+
+    fn to_bits(self) -> Self::Bits;
+
+    /// The key with these bits, if they are valid.
+    fn from_bits(bits: Self::Bits) -> Option<Self>;
+
+    fn from_i64(value: i64) -> Option<Self>;
+
+    fn from_u64(value: u64) -> Option<Self>;
+
+    /// The keys as their bits, without copying.
+    fn bits_slice(keys: &[Self]) -> &[Self::Bits];
+
+    /// The error for an integer that is not a valid key, for an insertion.
+    fn invalid(message: String) -> PyErr;
+
+    /// The key `obj` names, for a lookup: `None` if `obj` is not an integer
+    /// that is a valid key, so the lookup finds nothing.
+    fn lookup(obj: &Bound<'_, PyAny>) -> Option<Self> {
+        obj.extract::<u64>().ok().and_then(Self::from_u64)
+    }
+
+    /// The key `obj` names, for an insertion: `TypeError` if it is not an
+    /// integer, else `OverflowError` (u32) or `ValueError` (id) if it is not
+    /// a valid key.
+    fn insert(obj: &Bound<'_, PyAny>) -> PyResult<Self>;
 }
 
-/// The key `obj` names, for an insertion: `OverflowError` if it is an
-/// integer out of range, `TypeError` if it is not an integer.
+impl PyKey for u32 {
+    type Bits = u32;
+    const INVALID: &'static str = "out of range for uint32";
+
+    fn to_bits(self) -> u32 {
+        self
+    }
+
+    fn from_bits(bits: u32) -> Option<Self> {
+        Some(bits)
+    }
+
+    fn from_i64(value: i64) -> Option<Self> {
+        u32::try_from(value).ok()
+    }
+
+    fn from_u64(value: u64) -> Option<Self> {
+        u32::try_from(value).ok()
+    }
+
+    fn bits_slice(keys: &[u32]) -> &[u32] {
+        keys
+    }
+
+    fn invalid(message: String) -> PyErr {
+        PyOverflowError::new_err(message)
+    }
+
+    fn lookup(obj: &Bound<'_, PyAny>) -> Option<Self> {
+        obj.extract::<u32>().ok()
+    }
+
+    fn insert(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        obj.extract::<u32>()
+    }
+}
+
+impl PyKey for Id {
+    type Bits = u64;
+    const INVALID: &'static str = "not a valid id";
+    const SEQUENCE_FALLBACK: bool = true;
+
+    fn to_bits(self) -> u64 {
+        Id::to_bits(self)
+    }
+
+    fn from_bits(bits: u64) -> Option<Self> {
+        Id::from_bits(bits)
+    }
+
+    fn from_i64(value: i64) -> Option<Self> {
+        u64::try_from(value).ok().and_then(Id::from_bits)
+    }
+
+    fn from_u64(value: u64) -> Option<Self> {
+        Id::from_bits(value)
+    }
+
+    fn bits_slice(keys: &[Id]) -> &[u64] {
+        // SAFETY: `Id` has size 8 and alignment 8 (at least that of `u64`),
+        // and its bytes are those of `to_bits` in native order (its
+        // documented layout), so every `Id` is a valid `u64`. The lifetime is
+        // carried over.
+        unsafe { std::slice::from_raw_parts(keys.as_ptr().cast::<u64>(), keys.len()) }
+    }
+
+    fn invalid(message: String) -> PyErr {
+        PyValueError::new_err(message)
+    }
+
+    fn insert(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let bits = obj.extract::<u64>()?;
+        Id::from_bits(bits)
+            .ok_or_else(|| PyValueError::new_err(format!("{bits} is not a valid id")))
+    }
+}
+
+/// The key `obj` names, for a lookup in an integer-keyed collection.
+pub(crate) fn lookup_key(obj: &Bound<'_, PyAny>) -> Option<Key> {
+    Key::lookup(obj)
+}
+
+/// The key `obj` names, for an insertion into an integer-keyed collection.
 pub(crate) fn insert_key(obj: &Bound<'_, PyAny>) -> PyResult<Key> {
-    obj.extract::<Key>()
+    Key::insert(obj)
 }
 
 /// `obj` as a base-class NumPy array, through `numpy.asarray`. Subclasses
@@ -43,20 +161,20 @@ pub(crate) fn as_ndarray<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, Py
 }
 
 /// A batch of keys converted from a Python object.
-pub(crate) struct KeyBatch<'py> {
+pub(crate) struct KeyBatch<'py, K: PyKey = Key> {
     /// The keys as given (after `asarray`), for error messages.
     source: Bound<'py, PyUntypedArray>,
-    keys: Keys<'py>,
+    keys: Keys<'py, K>,
 }
 
-enum Keys<'py> {
-    /// A `uint32` array, read in place.
-    Native(PyReadonlyArray1<'py, Key>),
-    /// Any other integer array, converted; `None` marks a value out of range.
-    Converted(Vec<Option<Key>>),
+enum Keys<'py, K: PyKey> {
+    /// An array of the key's bits dtype, read in place.
+    Native(PyReadonlyArray1<'py, K::Bits>),
+    /// Any other integer array, converted; `None` marks an invalid value.
+    Converted(Vec<Option<K>>),
 }
 
-impl<'py> KeyBatch<'py> {
+impl<'py, K: PyKey> KeyBatch<'py, K> {
     /// Converts `obj` (a 1-D array or sequence of integers) to keys.
     pub(crate) fn new(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
         let source = as_ndarray(obj)?;
@@ -73,24 +191,33 @@ impl<'py> KeyBatch<'py> {
                 keys: Keys::Converted(Vec::new()),
             });
         }
-        if let Ok(native) = source.cast::<PyArray1<Key>>() {
+        if let Ok(native) = source.cast::<PyArray1<K::Bits>>() {
             if is_aligned(native.as_any())? {
                 let keys = Keys::Native(native.try_readonly().map_err(borrow_error)?);
                 return Ok(Self { source, keys });
             }
         }
         let dtype = source.dtype();
+        // NumPy infers float64 (or object) for a sequence that mixes ints
+        // above `i64::MAX` with others, so a plain sequence of ids is read
+        // element by element instead, as Python ints.
+        if K::SEQUENCE_FALLBACK
+            && matches!(dtype.kind(), b'f' | b'O')
+            && obj.cast::<PyUntypedArray>().is_err()
+        {
+            return Self::from_sequence(obj);
+        }
         let keys = match dtype.kind() {
             b'i' => Keys::Converted(
                 cast_to::<i64>(&source, "int64")?
                     .into_iter()
-                    .map(|k| Key::try_from(k).ok())
+                    .map(K::from_i64)
                     .collect(),
             ),
             b'u' => Keys::Converted(
                 cast_to::<u64>(&source, "uint64")?
                     .into_iter()
-                    .map(|k| Key::try_from(k).ok())
+                    .map(K::from_u64)
                     .collect(),
             ),
             _ => {
@@ -102,6 +229,33 @@ impl<'py> KeyBatch<'py> {
         Ok(Self { source, keys })
     }
 
+    /// Reads a 1-D sequence (not an array) element by element through
+    /// `operator.index`; `TypeError` for any element that is not an integer.
+    fn from_sequence(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let source = obj
+            .py()
+            .import("numpy")?
+            .call_method1("array", (obj, "object"))?
+            .cast_into::<PyUntypedArray>()?;
+        let index = obj.py().import("operator")?.getattr("index")?;
+        let mut keys = Vec::with_capacity(source.len());
+        for item in obj.try_iter()? {
+            // `operator.index` accepts ints and NumPy integer scalars and
+            // raises `TypeError` for anything else (floats included).
+            let int = index.call1((item?,))?;
+            keys.push(int.extract::<u64>().ok().and_then(K::from_u64));
+        }
+        if keys.len() != source.len() {
+            return Err(PyValueError::new_err(
+                "keys changed length while being read",
+            ));
+        }
+        Ok(Self {
+            source,
+            keys: Keys::Converted(keys),
+        })
+    }
+
     /// Number of keys in the batch.
     pub(crate) fn len(&self) -> usize {
         match &self.keys {
@@ -111,37 +265,42 @@ impl<'py> KeyBatch<'py> {
     }
 
     /// Calls `f` with each key in order, or `None` for a value out of range.
-    pub(crate) fn for_each(&self, mut f: impl FnMut(Option<Key>)) {
+    pub(crate) fn for_each(&self, mut f: impl FnMut(Option<K>)) {
         match &self.keys {
-            Keys::Native(array) => array.as_array().iter().for_each(|&k| f(Some(k))),
+            Keys::Native(array) => array.as_array().iter().for_each(|&k| f(K::from_bits(k))),
             Keys::Converted(keys) => keys.iter().for_each(|&k| f(k)),
         }
     }
 
     /// The batch as keys for insertion: `OverflowError` names the first
     /// value out of range.
-    pub(crate) fn to_insert_keys(&self) -> PyResult<Vec<Key>> {
-        match &self.keys {
-            Keys::Native(array) => Ok(array.as_array().to_vec()),
-            Keys::Converted(keys) => keys
-                .iter()
-                .enumerate()
-                .map(|(pos, &k)| {
-                    k.ok_or_else(|| match self.item(pos) {
-                        Ok(value) => PyOverflowError::new_err(format!(
-                            "key {value} at position {pos} is out of range for uint32"
-                        )),
-                        Err(err) => err,
-                    })
-                })
-                .collect(),
+    pub(crate) fn to_insert_keys(&self) -> PyResult<Vec<K>> {
+        let mut keys = Vec::with_capacity(self.len());
+        let mut bad = None;
+        self.for_each(|k| match k {
+            Some(k) => keys.push(k),
+            None => {
+                bad.get_or_insert(keys.len());
+            }
+        });
+        match bad {
+            None => Ok(keys),
+            Some(pos) => Err(match self.item(pos) {
+                Ok(value) => K::invalid(format!("key {value} at position {pos} is {}", K::INVALID)),
+                Err(err) => err,
+            }),
         }
     }
 
     /// The key at `pos` as given, as a Python scalar (`int` for integer
     /// arrays).
     pub(crate) fn item(&self, pos: usize) -> PyResult<Bound<'py, PyAny>> {
-        self.source.as_any().get_item(pos)?.call_method0("item")
+        let item = self.source.as_any().get_item(pos)?;
+        // Object arrays hold Python ints already.
+        match item.getattr_opt("item")? {
+            Some(method) if item.cast::<PyInt>().is_err() => method.call0(),
+            _ => Ok(item),
+        }
     }
 }
 

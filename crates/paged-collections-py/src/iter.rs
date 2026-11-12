@@ -7,6 +7,9 @@
 /// `RuntimeError` on the next step after such a change.
 macro_rules! key_iterator {
     ($iter:ident, $owner:ident, $owner_name:literal) => {
+        $crate::iter::key_iterator!($iter, $owner, $owner_name, $crate::convert::Key);
+    };
+    ($iter:ident, $owner:ident, $owner_name:literal, $key:ty) => {
         #[doc = concat!("Iterator over the keys of a ``", $owner_name, "``.")]
         #[pyclass(module = "paged_collections._core")]
         pub(crate) struct $iter {
@@ -35,7 +38,10 @@ macro_rules! key_iterator {
                 slf
             }
 
-            fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<$crate::convert::Key>> {
+            fn __next__(
+                &mut self,
+                py: Python<'_>,
+            ) -> PyResult<Option<<$key as $crate::convert::PyKey>::Bits>> {
                 if self.done {
                     return Ok(None);
                 }
@@ -46,7 +52,10 @@ macro_rules! key_iterator {
                         " changed during iteration"
                     )));
                 }
-                let key = owner.dense_keys().get(self.pos).copied();
+                let key = owner
+                    .dense_keys()
+                    .get(self.pos)
+                    .map(|&k| $crate::convert::PyKey::to_bits(k));
                 self.pos += 1;
                 self.done = key.is_none();
                 Ok(key)
