@@ -3,7 +3,9 @@
 Paged sparse sets, maps and stable-address containers for Rust, with Python
 bindings built on PyO3.
 
-> Status: scaffold. No collection is implemented yet; nothing is published.
+> Status: in development. `PagedSparseSet` and `PagedSparseMap` are
+> implemented in Rust; the other collections and the Python bindings are not
+> yet. Nothing is published.
 
 ## Why paging
 

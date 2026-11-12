@@ -51,6 +51,14 @@ fn new_page<T: Default, const PAGE: usize>() -> Box<[T; PAGE]> {
 ///
 /// Implemented by [`FlatPages`] and [`TreePages`]; collections reach them
 /// through a [`Directory`] marker.
+///
+/// # Contract for other implementations
+///
+/// [`get`](Self::get), [`get_mut`](Self::get_mut) and
+/// [`allocated`](Self::allocated) must not panic. Collections call them while
+/// they update their dense arrays and index together, where a panic would
+/// leave the two out of step. As with [`Key`](crate::key::Key), breaking this
+/// cannot cause undefined behaviour, only wrong results or panics.
 pub trait PageStore<T, const PAGE: usize>: Default {
     /// The page with this number, if it is allocated.
     fn get(&self, page: usize) -> Option<&[T; PAGE]>;

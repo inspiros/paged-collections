@@ -127,7 +127,7 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
 
     /// Dense position of the key occupying slot `index`, if any.
     #[inline]
-    fn occupant_pos(&self, index: usize) -> Option<usize> {
+    pub(crate) fn occupant_pos(&self, index: usize) -> Option<usize> {
         let (page, offset) = split::<PAGE>(index);
         let slot = self.sparse.get(page)?[offset]?;
         // Stored slots never exceed the dense length, which fits in `usize`.
@@ -191,7 +191,10 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
     }
 
     /// Appends `key`, whose slot `index` the caller has checked is vacant.
-    fn insert_vacant(&mut self, key: K, index: usize) {
+    ///
+    /// If this panics, the set is unchanged as far as lookups can tell, and
+    /// `len` is unchanged.
+    pub(crate) fn insert_vacant(&mut self, key: K, index: usize) {
         let pos = self.dense.len();
         let slot = encode(pos).expect("PagedSparseSet cannot hold more than u32::MAX keys");
         let (page, offset) = split::<PAGE>(index);
@@ -212,7 +215,7 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
     pub fn replace(&mut self, key: K) -> Option<K> {
         let index = key.index();
         match self.occupant_pos(index) {
-            Some(pos) => Some(core::mem::replace(&mut self.dense[pos], key)),
+            Some(pos) => Some(self.overwrite_at(pos, key)),
             None => {
                 self.insert_vacant(key, index);
                 None
@@ -220,13 +223,28 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
         }
     }
 
+    /// Replaces the key at dense position `pos` with `key`, which must have
+    /// the same slot index, and returns the old key.
+    #[inline]
+    pub(crate) fn overwrite_at(&mut self, pos: usize, key: K) -> K {
+        debug_assert_eq!(self.dense[pos].index(), key.index());
+        core::mem::replace(&mut self.dense[pos], key)
+    }
+
     /// Removes the key at dense position `pos` by moving the last key into
-    /// its place.
-    fn remove_at(&mut self, pos: usize) -> K {
+    /// its place, as `Vec::swap_remove` does.
+    pub(crate) fn remove_at(&mut self, pos: usize) -> K {
+        // Read both slot indices before changing anything, so that nothing
+        // after the first mutation calls into `Key`.
+        let index = self.dense[pos].index();
+        let moved_index = match self.dense.last() {
+            Some(last) if self.dense.len() - 1 != pos => Some(last.index()),
+            _ => None,
+        };
         let key = self.dense.swap_remove(pos);
-        self.set_slot(key.index(), None);
-        if let Some(&moved) = self.dense.get(pos) {
-            self.set_slot(moved.index(), encode(pos));
+        self.set_slot(index, None);
+        if let Some(moved_index) = moved_index {
+            self.set_slot(moved_index, encode(pos));
         }
         key
     }
@@ -279,6 +297,13 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
         self.sparse.clear();
     }
 
+    /// Frees every page without touching the dense array, which the caller
+    /// must have emptied.
+    pub(crate) fn free_pages(&mut self) {
+        debug_assert!(self.dense.is_empty());
+        self.sparse.clear();
+    }
+
     /// Shrinks the dense array and the page directory. Frees every page if
     /// the set is empty.
     pub fn shrink_to_fit(&mut self) {
@@ -313,7 +338,7 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
     ///
     /// The index is rewritten even if `reorder` panics, so a caught panic in
     /// a user comparator leaves the set consistent (in some order).
-    fn reorder_dense(&mut self, reorder: impl FnOnce(&mut [K])) {
+    pub(crate) fn reorder_dense(&mut self, reorder: impl FnOnce(&mut [K])) {
         struct Reindex<'a, K: Key, const PAGE: usize, D: Directory>(
             &'a mut PagedSparseSet<K, PAGE, D>,
         );

@@ -38,6 +38,9 @@
 ///
 /// - `index` must be a pure function of the key: equal keys have equal
 ///   indices, and calling it twice gives the same result.
+/// - `index` must not panic. Collections call it while they rewrite their
+///   index (after removing or sorting), where a panic would leave them
+///   inconsistent.
 /// - Different keys may share an index (generational ids do); the collections
 ///   then treat them as competing for one slot.
 /// - Memory use follows the indices in use, not the number of keys, so keys
