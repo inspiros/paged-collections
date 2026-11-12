@@ -109,6 +109,23 @@ ordered.items_range(7, 2048)      # [(7, 1.0), (1024, 2.0)]
 ordered.popitem()                 # (2048, 3.0)
 ```
 
+`IdAllocator` issues generational ids as Python ints packed as
+`generation << 32 | index`. Freed indices are reused last freed first with
+the next generation, so a stale id is never alive again; pickles and copies
+keep the whole allocation history. Ids are `uint64`, not map keys: key a map
+by `id_index(id)` (or `id_indices(ids)` for an array).
+
+```python
+from paged_collections import IdAllocator, id_generation, id_index
+
+ids = IdAllocator()
+a, b = ids.alloc(), ids.alloc()
+ids.free(a)                       # True
+c = ids.alloc()                   # reuses index 0
+(id_index(c), id_generation(c))   # (0, 2)
+a in ids                          # False
+```
+
 ## Layout
 
 ```text

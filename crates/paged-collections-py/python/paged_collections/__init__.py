@@ -1,4 +1,4 @@
-"""Paged sparse sets and maps, and ordered direct maps, implemented in Rust.
+"""Paged sets and maps, and generational id allocation, implemented in Rust.
 
 Keys are integers in ``0 <= key < 2**32``. ``SparseSet`` holds keys only;
 ``SparseMap`` maps keys to arbitrary objects; ``SparseMapF64`` and the other
@@ -6,6 +6,12 @@ typed maps store numeric values unboxed and expose them as NumPy arrays.
 ``DirectMap`` and its typed variants keep entries in ascending key order and
 provide nearest-entry and range queries. ``sparse_map(dtype)`` and
 ``direct_map(dtype)`` pick the map class for a dtype.
+
+``IdAllocator`` issues integer ids packed as ``generation << 32 | index``.
+Freed indices are reused last freed first with a new generation. ``id_index``,
+``id_generation``, ``make_id`` and vectorized ``id_indices`` convert their parts;
+``make_id`` accepts generations through 2**32-1, while the allocator issues at
+most ``MAX_GENERATION`` (2**31). Ids are distinct from the maps' uint32 keys.
 """
 
 from __future__ import annotations
@@ -16,6 +22,8 @@ import numpy as np
 
 from paged_collections._core import (
     KEY_LIMIT,
+    MAX_GENERATION,
+    MAX_INDICES,
     DirectMap,
     DirectMapBool,
     DirectMapF32,
@@ -24,6 +32,7 @@ from paged_collections._core import (
     DirectMapI64,
     DirectMapU32,
     DirectMapU64,
+    IdAllocator,
     SparseMap,
     SparseMapBool,
     SparseMapF32,
@@ -34,6 +43,10 @@ from paged_collections._core import (
     SparseMapU64,
     SparseSet,
     __version__,
+    id_generation,
+    id_index,
+    id_indices,
+    make_id,
 )
 
 _TYPED_MAPS = {
@@ -107,6 +120,8 @@ def direct_map(dtype: Any = None, keys: Any = None, values: Any = None) -> Any:
 
 __all__ = [
     "KEY_LIMIT",
+    "MAX_GENERATION",
+    "MAX_INDICES",
     "DirectMap",
     "DirectMapBool",
     "DirectMapF32",
@@ -115,6 +130,7 @@ __all__ = [
     "DirectMapI64",
     "DirectMapU32",
     "DirectMapU64",
+    "IdAllocator",
     "SparseMap",
     "SparseMapBool",
     "SparseMapF32",
@@ -125,6 +141,10 @@ __all__ = [
     "SparseMapU64",
     "SparseSet",
     "__version__",
+    "id_generation",
+    "id_index",
+    "id_indices",
+    "make_id",
     "sparse_map",
     "direct_map",
 ]

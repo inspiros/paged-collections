@@ -13,6 +13,7 @@ use pyo3::types::{PyDict, PyIterator, PyTuple, PyType};
 mod convert;
 mod direct_map;
 mod export;
+mod id_alloc;
 mod iter;
 mod object_map;
 mod set;
@@ -166,6 +167,10 @@ mod _core {
     #[pymodule_export]
     use crate::export::ExportGuard;
     #[pymodule_export]
+    use crate::id_alloc::{
+        IdAllocator, IdAllocatorIterator, id_generation, id_index, id_indices, make_id,
+    };
+    #[pymodule_export]
     use crate::object_map::{SparseMap, SparseMapIterator};
     #[pymodule_export]
     use crate::set::{SparseSet, SparseSetIterator};
@@ -180,6 +185,11 @@ mod _core {
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+        m.add(
+            "MAX_GENERATION",
+            paged_collections::id_alloc::MAX_GENERATION,
+        )?;
+        m.add("MAX_INDICES", paged_collections::id_alloc::MAX_INDICES)?;
         m.add("KEY_LIMIT", 1_u64 << 32)
     }
 }
