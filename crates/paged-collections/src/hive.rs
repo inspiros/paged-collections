@@ -89,6 +89,59 @@ use crate::paged_vec::capacity_overflow;
 /// End of a page's free list.
 const NONE: u32 = u32::MAX;
 
+/// One slot of a [`RawPage`], with versions as in
+/// [`IdAllocator::raw_parts`](crate::id_alloc::IdAllocator::raw_parts).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RawSlot<T> {
+    /// An occupied slot: an odd version (`2g - 1`) and its element.
+    Occupied {
+        /// The odd version, for generation `g = version / 2 + 1`.
+        version: u32,
+        /// The element in the slot.
+        value: T,
+    },
+    /// A vacant slot: an even non-zero version (`2g`), or `0` if retired.
+    Vacant {
+        /// The even version, or `0` if the slot can never be reused.
+        version: u32,
+    },
+}
+
+/// A page's raw state: its even generation floor and its slots in offset order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawPage<T> {
+    /// The even generation floor; new slots start at `floor + 1`.
+    pub floor: u32,
+    /// The slots in offset order, including vacant and retired slots.
+    pub slots: Vec<RawSlot<T>>,
+}
+
+/// Why [`Hive::try_from_raw_pages`] rejected its input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawPagesError {
+    /// More pages than the slot indices below [`MAX_INDICES`] can cover.
+    TooManyPages,
+    /// A page exceeds `PAGE`, or the last page exceeds its usable slot indices.
+    PageTooLong,
+    /// A page's generation floor is odd.
+    OddFloor,
+    /// An occupied slot has an even version, or a vacant slot an odd version.
+    VersionParity,
+}
+
+impl fmt::Display for RawPagesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            RawPagesError::TooManyPages => "more pages than slot indices",
+            RawPagesError::PageTooLong => "page holds too many slots",
+            RawPagesError::OddFloor => "odd page floor",
+            RawPagesError::VersionParity => "slot version parity mismatch",
+        })
+    }
+}
+
+impl core::error::Error for RawPagesError {}
+
 /// One slot. Versions follow [`IdAllocator`](crate::id_alloc::IdAllocator):
 /// odd while occupied (generation `version / 2 + 1`), even and non-zero
 /// while vacant and in the page's free list, 0 once retired.
@@ -244,6 +297,95 @@ impl<T, const PAGE: usize> Hive<T, PAGE> {
             .len()
             .saturating_mul(PAGE)
             .min(MAX_INDICES as usize)
+    }
+
+    /// The raw state: every page in order, including unallocated pages,
+    /// with elements borrowed. Together with
+    /// [`try_from_raw_pages`](Hive::try_from_raw_pages) this round-trips a
+    /// hive for formats other than serde.
+    ///
+    /// A round trip keeps every id, generation, value, floor and retired
+    /// slot. It need not keep allocations or free-list and page reuse
+    /// order, so the next insert may use a different slot.
+    pub fn raw_pages(&self) -> impl ExactSizeIterator<Item = RawPage<&T>> + '_ {
+        self.pages.iter().map(|page| RawPage {
+            floor: page.floor,
+            slots: page
+                .slots
+                .iter()
+                .map(|slot| match slot {
+                    Slot::Occupied { version, value } => RawSlot::Occupied {
+                        version: *version,
+                        value,
+                    },
+                    Slot::Vacant { version, .. } => RawSlot::Vacant { version: *version },
+                })
+                .collect(),
+        })
+    }
+
+    /// Rebuilds a hive from [`raw_pages`](Hive::raw_pages), validating
+    /// them: pages must fit below [`MAX_INDICES`], each page must fit its
+    /// usable slot limit (at most `PAGE`), floors must be even, occupied
+    /// versions odd, and vacant versions even (including `0` for retired).
+    ///
+    /// Free lists are rebuilt lowest offset first. Allocated pages with
+    /// room are reused before unallocated pages, lowest page first within
+    /// each group. Every non-empty page is allocated with room for `PAGE`
+    /// slots; empty pages remain unallocated. Memory can therefore reach
+    /// `PAGE` slots per page read.
+    pub fn try_from_raw_pages(
+        pages: impl IntoIterator<Item = RawPage<T>>,
+    ) -> Result<Self, RawPagesError> {
+        let mut hive = Self::new();
+        let pages: Vec<_> = pages.into_iter().collect();
+        if pages.len() > (MAX_INDICES as usize).div_ceil(PAGE) {
+            return Err(RawPagesError::TooManyPages);
+        }
+        hive.pages.reserve_exact(pages.len());
+        for (p, raw) in pages.into_iter().enumerate() {
+            if raw.slots.len() > Self::limit(p) {
+                return Err(RawPagesError::PageTooLong);
+            }
+            if raw.floor % 2 == 1 {
+                return Err(RawPagesError::OddFloor);
+            }
+            let mut page = Page::unallocated(raw.floor);
+            if !raw.slots.is_empty() {
+                page.slots.reserve_exact(PAGE);
+            }
+            for slot in raw.slots {
+                page.slots.push(match slot {
+                    RawSlot::Occupied { version, value } if version % 2 == 1 => {
+                        page.len += 1;
+                        Slot::Occupied { version, value }
+                    }
+                    RawSlot::Vacant { version } if version % 2 == 0 => {
+                        if version == 0 {
+                            page.retired += 1;
+                        }
+                        Slot::Vacant {
+                            version,
+                            next: NONE,
+                        }
+                    }
+                    _ => return Err(RawPagesError::VersionParity),
+                });
+            }
+            for (offset, slot) in page.slots.iter_mut().enumerate().rev() {
+                if let Slot::Vacant { version, next } = slot {
+                    if *version != 0 {
+                        *next = page.free_head;
+                        // `offset < PAGE <= u32::MAX`.
+                        page.free_head = offset as u32;
+                    }
+                }
+            }
+            hive.len += page.len as usize;
+            hive.pages.push(page);
+        }
+        hive.rebuild_open();
+        Ok(hive)
     }
 
     /// Appends an unallocated page to the directory, with room reserved in
@@ -1337,55 +1479,22 @@ mod serde_impl {
     impl<'de, T: Deserialize<'de>, const PAGE: usize> Deserialize<'de> for Hive<T, PAGE> {
         fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
             let reprs = Vec::<PageRepr<T>>::deserialize(deserializer)?;
-            let mut hive = Hive::<T, PAGE>::new();
-            if reprs.len() > (MAX_INDICES as usize).div_ceil(PAGE) {
-                return Err(De::Error::custom("more pages than slot indices"));
-            }
-            hive.pages.reserve_exact(reprs.len());
-            for (p, repr) in reprs.into_iter().enumerate() {
-                let limit = Hive::<T, PAGE>::limit(p);
-                if repr.slots.len() > limit {
-                    return Err(De::Error::custom("page holds too many slots"));
-                }
-                if repr.floor % 2 == 1 {
-                    return Err(De::Error::custom("odd page floor"));
-                }
-                let mut page = Page::unallocated(repr.floor);
-                if !repr.slots.is_empty() {
-                    page.slots.reserve_exact(PAGE);
-                }
-                for slot in repr.slots {
-                    page.slots.push(match slot {
-                        SlotRepr::Occupied(version, value) if version % 2 == 1 => {
-                            page.len += 1;
-                            Slot::Occupied { version, value }
-                        }
-                        SlotRepr::Vacant(version) if version % 2 == 0 => {
-                            if version == 0 {
-                                page.retired += 1;
+            Hive::try_from_raw_pages(reprs.into_iter().map(|repr| {
+                RawPage {
+                    floor: repr.floor,
+                    slots: repr
+                        .slots
+                        .into_iter()
+                        .map(|slot| match slot {
+                            SlotRepr::Occupied(version, value) => {
+                                RawSlot::Occupied { version, value }
                             }
-                            Slot::Vacant {
-                                version,
-                                next: NONE,
-                            }
-                        }
-                        _ => return Err(De::Error::custom("slot version parity mismatch")),
-                    });
+                            SlotRepr::Vacant(version) => RawSlot::Vacant { version },
+                        })
+                        .collect(),
                 }
-                for (offset, slot) in page.slots.iter_mut().enumerate().rev() {
-                    if let Slot::Vacant { version, next } = slot {
-                        if *version != 0 {
-                            *next = page.free_head;
-                            // `offset < PAGE <= u32::MAX`.
-                            page.free_head = offset as u32;
-                        }
-                    }
-                }
-                hive.len += page.len as usize;
-                hive.pages.push(page);
-            }
-            hive.rebuild_open();
-            Ok(hive)
+            }))
+            .map_err(De::Error::custom)
         }
     }
 }
@@ -1443,6 +1552,95 @@ mod tests {
         }
         assert!(hive.open.iter().all(|&p| p < hive.pages.len()));
         assert_eq!(hive.len, len);
+    }
+
+    #[test]
+    fn raw_rebuild_preserves_page_and_hive_invariants() {
+        let mut original = Hive::<u32, 4>::with_capacity(20);
+        let ids: Vec<_> = (0..9).map(|value| original.insert(value)).collect();
+        for &id in &ids[..5] {
+            original.remove(id);
+        }
+        original.shrink_to_fit();
+        check(&original);
+        let snapshot = |hive: &Hive<u32, 4>| {
+            hive.raw_pages()
+                .map(|raw| RawPage {
+                    floor: raw.floor,
+                    slots: raw
+                        .slots
+                        .into_iter()
+                        .map(|slot| match slot {
+                            RawSlot::Occupied { version, value } => RawSlot::Occupied {
+                                version,
+                                value: *value,
+                            },
+                            RawSlot::Vacant { version } => RawSlot::Vacant { version },
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let rebuilt = Hive::try_from_raw_pages(snapshot(&original)).unwrap();
+        check(&rebuilt);
+        assert_eq!(original, rebuilt);
+        assert_eq!(snapshot(&original), snapshot(&rebuilt));
+        check(&Hive::<u32, 4>::try_from_raw_pages([]).unwrap());
+
+        // Retired slots pin their page; empty pages keep their floors and
+        // directory positions, including never-used trailing pages.
+        let raw = alloc::vec![
+            RawPage {
+                floor: 2,
+                slots: alloc::vec![
+                    RawSlot::Vacant { version: 0 },
+                    RawSlot::Vacant { version: 4 },
+                    RawSlot::Occupied {
+                        version: u32::MAX,
+                        value: 7,
+                    },
+                    RawSlot::Vacant { version: 2 },
+                ],
+            },
+            RawPage {
+                floor: 8,
+                slots: Vec::new(),
+            },
+            RawPage {
+                floor: 0,
+                slots: alloc::vec![RawSlot::Occupied {
+                    version: 1,
+                    value: 9,
+                }],
+            },
+            RawPage {
+                floor: u32::MAX - 1,
+                slots: Vec::new(),
+            },
+            RawPage {
+                floor: 0,
+                slots: Vec::new(),
+            },
+        ];
+        let mut rebuilt = Hive::<u32, 4>::try_from_raw_pages(raw.clone()).unwrap();
+        check(&rebuilt);
+        assert_eq!(snapshot(&rebuilt), raw);
+        assert_eq!(rebuilt.allocated_pages(), 2);
+        assert_eq!(rebuilt.index_bound(), 20);
+        let last = Id::new(2, g(crate::id_alloc::MAX_GENERATION));
+        assert_eq!(rebuilt.remove(last), Some(7));
+        check(&rebuilt);
+        for expected in [1, 3, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15, 16] {
+            assert_eq!(rebuilt.insert(10).index(), expected);
+            assert!(!rebuilt.contains(last));
+            check(&rebuilt);
+        }
+        rebuilt.clear();
+        check(&rebuilt);
+        rebuilt.shrink_to_fit();
+        check(&rebuilt);
+        let rebuilt = Hive::<u32, 4>::try_from_raw_pages(snapshot(&rebuilt)).unwrap();
+        check(&rebuilt);
     }
 
     #[test]
