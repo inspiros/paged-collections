@@ -12,6 +12,7 @@
 //! | [`clear`](PagedSparseMap::clear) | O(1) for the index, plus dropping the values |
 //! | iteration, [`value_slice`](PagedSparseMap::value_slice) | over the dense arrays only |
 //! | sorting | O(n log n) comparisons, O(n) swaps, then one index write per entry; allocates `n` indices |
+//! | [`binary_search_key`](PagedSparseMap::binary_search_key), [`binary_search_by`](PagedSparseMap::binary_search_by), [`partition_point`](PagedSparseMap::partition_point) | O(log n), on entries the caller keeps sorted |
 //!
 //! # Slots and generational keys
 //!
@@ -456,6 +457,113 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedSparseMap<K, V, PAGE, D> {
         let values = &mut self.values;
         self.keys
             .reorder_dense(|keys| permute(&mut perm, keys, values));
+    }
+
+    /// Sorts the entries by `compare`, keeping the order of equal entries,
+    /// and updates the index.
+    ///
+    /// If `compare` panics, the dense order and the key-value pairing are
+    /// unchanged (values that `compare` changed through interior mutability
+    /// stay changed).
+    pub fn sort_by(&mut self, mut compare: impl FnMut((&K, &V), (&K, &V)) -> Ordering) {
+        self.reorder_by(|perm, keys, values| {
+            perm.sort_by(|&a, &b| compare((&keys[a], &values[a]), (&keys[b], &values[b])));
+        });
+    }
+
+    /// Sorts the entries by a key function, keeping the order of entries
+    /// with equal sort keys, and updates the index.
+    ///
+    /// `f` may be called more than once per entry. If it panics, the dense
+    /// order and the key-value pairing are unchanged.
+    pub fn sort_by_key<T: Ord>(&mut self, mut f: impl FnMut(&K, &V) -> T) {
+        self.reorder_by(|perm, keys, values| {
+            perm.sort_by_key(|&i| f(&keys[i], &values[i]));
+        });
+    }
+
+    /// Sorts the entries by a key function that is called at most once per
+    /// entry (not at all when there is nothing to compare), keeping the order of entries with equal sort keys, and updates the
+    /// index. Use it when `f` is expensive.
+    ///
+    /// If `f` panics, the dense order and the key-value pairing are
+    /// unchanged.
+    pub fn sort_by_cached_key<T: Ord>(&mut self, mut f: impl FnMut(&K, &V) -> T) {
+        self.reorder_by(|perm, keys, values| {
+            perm.sort_by_cached_key(|&i| f(&keys[i], &values[i]));
+        });
+    }
+
+    /// Sorts the entries by key in ascending order, keeping the order of
+    /// entries with equal keys, and updates the index.
+    ///
+    /// Stable, which matters only if equal keys can be told apart; prefer
+    /// [`sort_unstable_keys`](Self::sort_unstable_keys) otherwise.
+    pub fn sort_keys(&mut self)
+    where
+        K: Ord,
+    {
+        self.reorder_by(|perm, keys, _| perm.sort_by_key(|&i| keys[i]));
+    }
+
+    /// Binary searches the dense order for `key`, which must be sorted by
+    /// key in ascending order (as after
+    /// [`sort_unstable_keys`](Self::sort_unstable_keys)).
+    ///
+    /// Returns `Ok` with the dense position of an entry whose key equals
+    /// `key`, or `Err` with the position where such an entry would keep the
+    /// order. If the entries are not sorted the result is unspecified.
+    ///
+    /// For an exact lookup [`position`](Self::position) is O(1); this is for
+    /// the neighbours of a key that may be absent: the entries before the
+    /// returned position have smaller keys, those from it on have keys at
+    /// least as large.
+    pub fn binary_search_key(&self, key: &K) -> Result<usize, usize>
+    where
+        K: Ord,
+    {
+        self.keys.as_slice().binary_search(key)
+    }
+
+    /// Binary searches the dense order with a comparator, as
+    /// `[T]::binary_search_by`: `compare` returns the ordering of an
+    /// entry relative to the target. The entries must be sorted consistently
+    /// with it; otherwise the result is unspecified.
+    pub fn binary_search_by(
+        &self,
+        mut compare: impl FnMut(&K, &V) -> Ordering,
+    ) -> Result<usize, usize> {
+        let (keys, values) = (self.keys.as_slice(), &self.values);
+        // Search the positions: both arrays are indexed by them.
+        let mut size = keys.len();
+        let mut base = 0;
+        while size > 0 {
+            let half = size / 2;
+            let mid = base + half;
+            match compare(&keys[mid], &values[mid]) {
+                Ordering::Less => {
+                    base = mid + 1;
+                    size -= half + 1;
+                }
+                Ordering::Greater => size = half,
+                Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(base)
+    }
+
+    /// The dense position of the first entry for which `pred` is false,
+    /// assuming the entries are partitioned: `pred` holds for a prefix and
+    /// for nothing after it. As `[T]::partition_point`.
+    pub fn partition_point(&self, mut pred: impl FnMut(&K, &V) -> bool) -> usize {
+        self.binary_search_by(|key, value| {
+            if pred(key, value) {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        })
+        .unwrap_or_else(|pos| pos)
     }
 
     /// Sorts the entries by `compare` (unstable) and updates the index.
@@ -913,6 +1021,47 @@ mod tests {
         assert_eq!(map.key_slice(), &[7, 8, 1, 2]);
         assert_eq!(map.value_slice(), &[701, 801, 101, 201]);
         assert_parallel(&map);
+    }
+
+    #[test]
+    fn stable_sorts_keep_ties_in_order_and_searches_find_positions() {
+        let mut map: PagedSparseMap<u32, u32, 4> = [(5, 1), (9, 0), (2, 1), (7, 0), (40, 1)]
+            .into_iter()
+            .collect();
+        map.sort_by_key(|_, &v| v);
+        assert_eq!(map.key_slice(), &[9, 7, 5, 2, 40]);
+        assert_eq!(map.value_slice(), &[0, 0, 1, 1, 1]);
+        assert_parallel(&map);
+        assert_eq!(map.partition_point(|_, &v| v == 0), 2);
+        assert_eq!(map.partition_point(|_, _| true), 5);
+        assert_eq!(map.partition_point(|_, _| false), 0);
+
+        map.sort_by(|(a, _), (b, _)| (a % 2).cmp(&(b % 2)));
+        assert_eq!(map.key_slice(), &[2, 40, 9, 7, 5]);
+        let mut calls = 0;
+        map.sort_by_cached_key(|&k, _| {
+            calls += 1;
+            k / 10
+        });
+        assert_eq!(calls, 5);
+        assert_eq!(map.key_slice(), &[2, 9, 7, 5, 40]);
+        assert_parallel(&map);
+
+        map.sort_keys();
+        assert_eq!(map.key_slice(), &[2, 5, 7, 9, 40]);
+        assert_eq!(map.value_slice(), &[1, 1, 0, 0, 1]);
+        assert_parallel(&map);
+        assert_eq!(map.binary_search_key(&7), Ok(2));
+        assert_eq!(map.binary_search_key(&0), Err(0));
+        assert_eq!(map.binary_search_key(&8), Err(3));
+        assert_eq!(map.binary_search_key(&41), Err(5));
+        for (pos, &key) in map.key_slice().iter().enumerate() {
+            assert_eq!(map.binary_search_by(|k, _| k.cmp(&key)), Ok(pos));
+        }
+        assert_eq!(map.binary_search_by(|k, _| k.cmp(&6)), Err(2));
+        let empty: PagedSparseMap<u32, u32> = PagedSparseMap::new();
+        assert_eq!(empty.binary_search_key(&1), Err(0));
+        assert_eq!(empty.partition_point(|_, _| true), 0);
     }
 
     #[test]

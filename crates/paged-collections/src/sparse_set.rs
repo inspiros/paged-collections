@@ -359,6 +359,35 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
         reorder(&mut guard.0.dense);
     }
 
+    /// Sorts the dense array by `compare`, keeping the order of equal keys,
+    /// and updates the index.
+    ///
+    /// If `compare` panics, the keys are left in an unspecified order but the
+    /// set stays consistent.
+    pub fn sort_by(&mut self, compare: impl FnMut(&K, &K) -> core::cmp::Ordering) {
+        self.reorder_dense(|dense| dense.sort_by(compare));
+    }
+
+    /// Sorts the dense array by a key function, keeping the order of keys
+    /// with equal sort keys, and updates the index.
+    ///
+    /// If `f` panics, the keys are left in an unspecified order but the set
+    /// stays consistent.
+    pub fn sort_by_key<T: Ord>(&mut self, f: impl FnMut(&K) -> T) {
+        self.reorder_dense(|dense| dense.sort_by_key(f));
+    }
+
+    /// Sorts the dense array in ascending order and updates the index.
+    ///
+    /// Stable, which matters only if equal keys can be told apart; prefer
+    /// [`sort_unstable`](Self::sort_unstable) otherwise: it allocates nothing.
+    pub fn sort(&mut self)
+    where
+        K: Ord,
+    {
+        self.reorder_dense(<[K]>::sort);
+    }
+
     /// Sorts the dense array by `compare` (unstable) and updates the index.
     ///
     /// If `compare` panics, the keys are left in an unspecified order but the
@@ -598,6 +627,22 @@ mod tests {
             assert_eq!(set.position(k), Some(pos));
         }
         assert!(!set.contains(3) && !set.contains(9));
+    }
+
+    #[test]
+    fn stable_sorts_keep_ties_in_order() {
+        let mut set: PagedSparseSet<u32, 4> = [5, 9, 2, 7, 40, 12].into_iter().collect();
+        set.sort_by_key(|&k| k % 2);
+        assert_eq!(set.as_slice(), &[2, 40, 12, 5, 9, 7]);
+        set.sort_by(|a, b| (b / 10).cmp(&(a / 10)));
+        assert_eq!(set.as_slice(), &[40, 12, 2, 5, 9, 7]);
+        for (pos, &key) in set.as_slice().iter().enumerate() {
+            assert_eq!(set.position(key), Some(pos));
+        }
+        set.sort();
+        assert_eq!(set.as_slice(), &[2, 5, 7, 9, 12, 40]);
+        assert_eq!(set.position(12), Some(4));
+        assert_eq!(set.as_slice().binary_search(&9), Ok(3));
     }
 
     #[test]
