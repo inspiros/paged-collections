@@ -18,6 +18,7 @@
 //! |---|---|
 //! | [`get`](PagedDirectMap::get), [`insert`](PagedDirectMap::insert), [`remove`](PagedDirectMap::remove) | O(1) (O(log pages) with [`Tree`](crate::page::Tree)); the first key in a page also allocates the page (and, with [`Flat`], grows the directory up to it) |
 //! | iteration, [`clear`](PagedDirectMap::clear), [`retain`](PagedDirectMap::retain) | O(allocated pages × `PAGE`), plus with [`Flat`] O(directory length) to skip unallocated pages |
+//! | [`range`](PagedDirectMap::range), [`next_occupant`](PagedDirectMap::next_occupant), [`first_key_value`](PagedDirectMap::first_key_value) and the other [ordered queries](self#ordered-queries) | reaching the first page of the range is O(1) (O(log pages) with [`Tree`](crate::page::Tree)); then the slots of the allocated pages in the range are scanned up to the entry wanted, plus with [`Flat`] the unallocated directory entries between them |
 //! | [`len`](PagedDirectMap::len) | O(1) |
 //!
 //! Pages are not freed when they empty, as `HashMap` keeps its capacity;
@@ -33,6 +34,34 @@
 //! [`get_or_insert_with`](PagedDirectMap::get_or_insert_with) evict it,
 //! [`replace`](PagedDirectMap::replace) evicts it and returns it, and
 //! [`try_insert`](PagedDirectMap::try_insert) refuses.
+//!
+//! # Ordered queries
+//!
+//! Entries are ordered by slot index, so the map answers the questions an
+//! ordered map does, without keeping a tree:
+//! [`range`](PagedDirectMap::range) and
+//! [`range_mut`](PagedDirectMap::range_mut) iterate the entries between two
+//! keys, [`first_key_value`](PagedDirectMap::first_key_value),
+//! [`last_key_value`](PagedDirectMap::last_key_value),
+//! [`pop_first`](PagedDirectMap::pop_first) and
+//! [`pop_last`](PagedDirectMap::pop_last) reach the ends, and
+//! [`next_occupant`](PagedDirectMap::next_occupant) and
+//! [`prev_occupant`](PagedDirectMap::prev_occupant) find the nearest entry at
+//! or after, or at or before, a slot index. The order is that of
+//! [`Key::index`]: key order for plain integers, index order (whatever the
+//! generation) for generational keys.
+//!
+//! ```
+//! use paged_collections::direct_map::PagedDirectMap;
+//!
+//! let map: PagedDirectMap<u32, char> =
+//!     [(2, 'a'), (5, 'b'), (70_000, 'c')].into_iter().collect();
+//! let keys: Vec<u32> = map.range(3..=70_000).map(|(&k, _)| k).collect();
+//! assert_eq!(keys, [5, 70_000]);
+//! assert_eq!(map.next_occupant(6), Some((&70_000, &'c')));
+//! assert_eq!(map.prev_occupant(4), Some((&2, &'a')));
+//! assert_eq!(map.last_key_value(), Some((&70_000, &'c')));
+//! ```
 //!
 //! ```
 //! use paged_collections::direct_map::PagedDirectMap;
@@ -59,7 +88,7 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter::{Fuse, FusedIterator};
 use core::mem;
-use core::ops::Index;
+use core::ops::{Bound, Index, RangeBounds};
 use core::slice;
 
 use crate::key::Key;
@@ -397,6 +426,95 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
         ValuesMut(self.iter_mut())
     }
 
+    /// Iterates over the entries whose slot index lies between the slot
+    /// indices of the bounds, in slot-index order.
+    ///
+    /// The bounds are keys, compared by [`Key::index`]: for plain integer
+    /// keys this is the usual key range. A generational key bounds by its
+    /// index only, so `range(id..=id)` yields whichever generation holds
+    /// `id`'s slot. An empty or inverted range yields nothing.
+    ///
+    /// See the [module docs](self) for the cost.
+    pub fn range(&self, keys: impl RangeBounds<K>) -> Range<'_, K, V, PAGE, D> {
+        self.slot_range(index_bounds(&keys))
+    }
+
+    /// Like [`range`](Self::range), with mutable access to the values.
+    pub fn range_mut(&mut self, keys: impl RangeBounds<K>) -> RangeMut<'_, K, V, PAGE, D> {
+        self.slot_range_mut(index_bounds(&keys))
+    }
+
+    /// Iterates over the entries whose slot index is in `indices`, in
+    /// slot-index order. An empty or inverted range yields nothing.
+    pub fn slot_range(&self, indices: impl RangeBounds<usize>) -> Range<'_, K, V, PAGE, D> {
+        let span = Span::new::<PAGE>(&indices, self.len);
+        Range(Cursor::new(
+            Trim {
+                pages: self.pages.pages_in(span.pages.clone()),
+                first: span.first,
+                last: span.last,
+            },
+            span.most,
+        ))
+    }
+
+    /// Like [`slot_range`](Self::slot_range), with mutable access to the
+    /// values.
+    pub fn slot_range_mut(
+        &mut self,
+        indices: impl RangeBounds<usize>,
+    ) -> RangeMut<'_, K, V, PAGE, D> {
+        let span = Span::new::<PAGE>(&indices, self.len);
+        RangeMut(Cursor::new(
+            Trim {
+                pages: self.pages.pages_in_mut(span.pages.clone()),
+                first: span.first,
+                last: span.last,
+            },
+            span.most,
+        ))
+    }
+
+    /// The first entry at slot `index` or after it, in slot-index order.
+    ///
+    /// For plain integer keys, the entry with the smallest key `>= index`.
+    #[inline]
+    pub fn next_occupant(&self, index: usize) -> Option<(&K, &V)> {
+        self.slot_range(index..).next()
+    }
+
+    /// The last entry at slot `index` or before it, in slot-index order.
+    ///
+    /// For plain integer keys, the entry with the largest key `<= index`.
+    #[inline]
+    pub fn prev_occupant(&self, index: usize) -> Option<(&K, &V)> {
+        self.slot_range(..=index).next_back()
+    }
+
+    /// The entry with the smallest slot index.
+    #[inline]
+    pub fn first_key_value(&self) -> Option<(&K, &V)> {
+        self.iter().next()
+    }
+
+    /// The entry with the largest slot index.
+    #[inline]
+    pub fn last_key_value(&self) -> Option<(&K, &V)> {
+        self.iter().next_back()
+    }
+
+    /// Removes and returns the entry with the smallest slot index.
+    pub fn pop_first(&mut self) -> Option<(K, V)> {
+        let index = self.first_key_value()?.0.index();
+        self.remove_occupant(index)
+    }
+
+    /// Removes and returns the entry with the largest slot index.
+    pub fn pop_last(&mut self) -> Option<(K, V)> {
+        let index = self.last_key_value()?.0.index();
+        self.remove_occupant(index)
+    }
+
     /// Consumes the map and returns its keys in slot-index order.
     pub fn into_keys(self) -> IntoKeys<K, V, PAGE, D> {
         IntoKeys(self.into_iter())
@@ -542,6 +660,20 @@ trait PageSlots {
     fn slots(self) -> Self::Slots;
 }
 
+impl<'a, T> PageSlots for &'a [T] {
+    type Slots = slice::Iter<'a, T>;
+    fn slots(self) -> Self::Slots {
+        self.iter()
+    }
+}
+
+impl<'a, T> PageSlots for &'a mut [T] {
+    type Slots = slice::IterMut<'a, T>;
+    fn slots(self) -> Self::Slots {
+        self.iter_mut()
+    }
+}
+
 impl<'a, T, const PAGE: usize> PageSlots for (usize, &'a [T; PAGE]) {
     type Slots = slice::Iter<'a, T>;
     fn slots(self) -> Self::Slots {
@@ -671,6 +803,191 @@ where
         // `remaining > 0`; zero it so `len` stays truthful.
         self.remaining = 0;
         None
+    }
+}
+
+/// The slot-index bounds of a key range.
+fn index_bounds<K: Key>(keys: &impl RangeBounds<K>) -> (Bound<usize>, Bound<usize>) {
+    (
+        keys.start_bound().map(|key| key.index()),
+        keys.end_bound().map(|key| key.index()),
+    )
+}
+
+/// A range of slot indices, resolved: the slots `first..=last`, the pages
+/// that hold them, and the most entries they can hold. An empty range has
+/// `first > last`, an empty page range and `most == 0`.
+struct Span {
+    first: usize,
+    last: usize,
+    pages: core::ops::RangeInclusive<usize>,
+    most: usize,
+}
+
+impl Span {
+    /// Resolves `indices` for a map of `len` entries.
+    fn new<const PAGE: usize>(indices: &impl RangeBounds<usize>, len: usize) -> Self {
+        let first = match indices.start_bound() {
+            Bound::Included(&index) => Some(index),
+            Bound::Excluded(&index) => index.checked_add(1),
+            Bound::Unbounded => Some(0),
+        };
+        let last = match indices.end_bound() {
+            Bound::Included(&index) => Some(index),
+            Bound::Excluded(&index) => index.checked_sub(1),
+            Bound::Unbounded => Some(usize::MAX),
+        };
+        match (first, last) {
+            (Some(first), Some(last)) if first <= last => Self {
+                first,
+                last,
+                pages: split::<PAGE>(first).0..=split::<PAGE>(last).0,
+                most: (last - first).saturating_add(1).min(len),
+            },
+            #[allow(clippy::reversed_empty_ranges)]
+            _ => Self {
+                first: 1,
+                last: 0,
+                pages: 1..=0,
+                most: 0,
+            },
+        }
+    }
+}
+
+/// Cuts a page from a page iterator down to its slots in `first..=last`.
+trait Cut<const PAGE: usize> {
+    type Part;
+    fn cut(self, first: usize, last: usize) -> Self::Part;
+}
+
+/// The offsets within page `number` of the slot indices `first..=last`.
+fn offsets<const PAGE: usize>(number: usize, first: usize, last: usize) -> core::ops::Range<usize> {
+    let base = number.saturating_mul(PAGE);
+    let end = match last.checked_sub(base) {
+        Some(offset) => offset.saturating_add(1).min(PAGE),
+        // Only a store that breaks the page contract yields a page past
+        // `last`.
+        None => 0,
+    };
+    first.saturating_sub(base).min(end)..end
+}
+
+impl<'a, T, const PAGE: usize> Cut<PAGE> for (usize, &'a [T; PAGE]) {
+    type Part = &'a [T];
+    fn cut(self, first: usize, last: usize) -> &'a [T] {
+        &self.1[offsets::<PAGE>(self.0, first, last)]
+    }
+}
+
+impl<'a, T, const PAGE: usize> Cut<PAGE> for (usize, &'a mut [T; PAGE]) {
+    type Part = &'a mut [T];
+    fn cut(self, first: usize, last: usize) -> &'a mut [T] {
+        &mut self.1[offsets::<PAGE>(self.0, first, last)]
+    }
+}
+
+/// A page iterator whose pages are cut down to the slots `first..=last`.
+#[derive(Clone)]
+struct Trim<P, const PAGE: usize> {
+    pages: P,
+    first: usize,
+    last: usize,
+}
+
+impl<P: Iterator, const PAGE: usize> Iterator for Trim<P, PAGE>
+where
+    P::Item: Cut<PAGE>,
+{
+    type Item = <P::Item as Cut<PAGE>>::Part;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let page = self.pages.next()?;
+        Some(page.cut(self.first, self.last))
+    }
+}
+
+impl<P: DoubleEndedIterator, const PAGE: usize> DoubleEndedIterator for Trim<P, PAGE>
+where
+    P::Item: Cut<PAGE>,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let page = self.pages.next_back()?;
+        Some(page.cut(self.first, self.last))
+    }
+}
+
+macro_rules! range_iterator {
+    (
+        $(#[$doc:meta])*
+        $name:ident, $pages:ident, $slots:ident, $item:ty
+    ) => {
+        $(#[$doc])*
+        pub struct $name<'a, K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat>(
+            Cursor<Trim<$pages<'a, K, V, PAGE, D>, PAGE>, slice::$slots<'a, Entry<K, V>>>,
+        )
+        where
+            K: 'a,
+            V: 'a,
+            D: 'a;
+
+        impl<'a, K, V, const PAGE: usize, D: Directory> Iterator for $name<'a, K, V, PAGE, D> {
+            type Item = $item;
+
+            #[inline]
+            fn next(&mut self) -> Option<Self::Item> {
+                self.0.next()
+            }
+
+            /// The upper bound is loose: the smaller of the map's length
+            /// and the number of slots in the range, less the entries
+            /// already yielded.
+            #[inline]
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (0, Some(self.0.remaining))
+            }
+        }
+
+        impl<'a, K, V, const PAGE: usize, D: Directory> DoubleEndedIterator
+            for $name<'a, K, V, PAGE, D>
+        {
+            #[inline]
+            fn next_back(&mut self) -> Option<Self::Item> {
+                self.0.next_back()
+            }
+        }
+
+        impl<'a, K, V, const PAGE: usize, D: Directory> FusedIterator
+            for $name<'a, K, V, PAGE, D>
+        {
+        }
+
+        impl<'a, K, V, const PAGE: usize, D: Directory> fmt::Debug for $name<'a, K, V, PAGE, D> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($name)).finish_non_exhaustive()
+            }
+        }
+    };
+}
+
+range_iterator!(
+    /// Iterator over the entries of a [`PagedDirectMap`] in a range of slot
+    /// indices, from [`range`](PagedDirectMap::range) or
+    /// [`slot_range`](PagedDirectMap::slot_range).
+    Range, Pages, Iter, (&'a K, &'a V)
+);
+
+range_iterator!(
+    /// Iterator over the entries of a [`PagedDirectMap`] in a range of slot
+    /// indices, with mutable values, from
+    /// [`range_mut`](PagedDirectMap::range_mut) or
+    /// [`slot_range_mut`](PagedDirectMap::slot_range_mut).
+    RangeMut, PagesMut, IterMut, (&'a K, &'a mut V)
+);
+
+impl<K, V, const PAGE: usize, D: Directory> Clone for Range<'_, K, V, PAGE, D> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
@@ -1008,6 +1325,93 @@ mod tests {
         assert_eq!(map.allocated_pages(), 2);
         map.reset();
         assert_eq!(map.allocated_pages(), 0);
+    }
+
+    fn ordered_queries<D: Directory>() {
+        let keys = [1_u32, 2, 9, 40, 41, 43];
+        let mut map: PagedDirectMap<u32, u32, 4, D> = keys.iter().map(|&k| (k, k * 10)).collect();
+        // Leave an allocated page with no entry in the middle.
+        map.insert(20, 0);
+        map.remove(20);
+        let range = |r: (Bound<u32>, Bound<u32>)| -> Vec<u32> {
+            let got: Vec<u32> = map.range(r).map(|(&k, _)| k).collect();
+            let mut back: Vec<u32> = map.range(r).rev().map(|(&k, _)| k).collect();
+            back.reverse();
+            assert_eq!(got, back);
+            got
+        };
+        use Bound::{Excluded as Ex, Included as In, Unbounded as Un};
+        assert_eq!(range((Un, Un)), keys);
+        assert_eq!(range((In(2), Ex(41))), [2, 9, 40]);
+        assert_eq!(range((Ex(2), In(41))), [9, 40, 41]);
+        assert_eq!(range((In(3), In(8))), [0_u32; 0]);
+        assert_eq!(range((In(9), In(9))), [9]);
+        assert_eq!(range((In(42), Un)), [43]);
+        assert_eq!(range((In(44), Un)), [0_u32; 0]);
+        assert_eq!(range((In(41), In(2))), [0_u32; 0]);
+        assert_eq!(range((Ex(u32::MAX), Un)), [0_u32; 0]);
+        assert_eq!(range((Un, Ex(0))), [0_u32; 0]);
+        assert_eq!(map.slot_range(..).count(), keys.len());
+        assert_eq!(map.slot_range((Ex(usize::MAX), Un)).next(), None);
+        assert_eq!(map.slot_range(usize::MAX..).next(), None);
+
+        // Both ends meet inside one page without repeating an entry.
+        {
+            let mut it = map.range(40..=43);
+            assert_eq!(it.size_hint(), (0, Some(4)));
+            assert_eq!(it.next(), Some((&40, &400)));
+            assert_eq!(it.next_back(), Some((&43, &430)));
+            assert_eq!(it.clone().next_back(), Some((&41, &410)));
+            assert_eq!(it.next(), Some((&41, &410)));
+            assert_eq!(it.next(), None);
+            assert_eq!(it.next_back(), None);
+        }
+
+        assert_eq!(map.next_occupant(0), Some((&1, &10)));
+        assert_eq!(map.next_occupant(9), Some((&9, &90)));
+        assert_eq!(map.next_occupant(10), Some((&40, &400)));
+        assert_eq!(map.next_occupant(44), None);
+        assert_eq!(map.prev_occupant(0), None);
+        assert_eq!(map.prev_occupant(39), Some((&9, &90)));
+        assert_eq!(map.prev_occupant(usize::MAX), Some((&43, &430)));
+        assert_eq!(map.first_key_value(), Some((&1, &10)));
+        assert_eq!(map.last_key_value(), Some((&43, &430)));
+
+        for (_, value) in map.range_mut(2..41) {
+            *value += 1;
+        }
+        assert_eq!(
+            entries(&map),
+            [(1, 10), (2, 21), (9, 91), (40, 401), (41, 410), (43, 430)]
+        );
+        assert_eq!(map.slot_range_mut(40..).next_back(), Some((&43, &mut 430)));
+
+        assert_eq!(map.pop_first(), Some((1, 10)));
+        assert_eq!(map.pop_last(), Some((43, 430)));
+        assert_eq!(map.len(), 4);
+        assert_eq!(map.first_key_value(), Some((&2, &21)));
+        map.clear();
+        assert_eq!(map.pop_first(), None);
+        assert_eq!(map.pop_last(), None);
+        assert_eq!(map.next_occupant(0), None);
+        assert_eq!(map.range(..).next(), None);
+    }
+
+    #[test]
+    fn ordered_queries_with_both_directories() {
+        ordered_queries::<Flat>();
+        ordered_queries::<Tree>();
+    }
+
+    #[test]
+    fn a_range_bounds_generational_keys_by_index() {
+        let mut map: PagedDirectMap<Gen, u8> = PagedDirectMap::new();
+        let held = Gen(3 | 2 << 16);
+        map.insert(held, 1);
+        map.insert(Gen(7), 2);
+        let other = Gen(3);
+        assert_eq!(map.range(other..=other).next(), Some((&held, &1)));
+        assert_eq!(map.range(Gen(4 | 9 << 16)..).next(), Some((&Gen(7), &2)));
     }
 
     #[cfg(feature = "std")]

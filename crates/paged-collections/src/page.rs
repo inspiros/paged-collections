@@ -20,7 +20,8 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, btree_map};
 use alloc::vec::Vec;
 use core::fmt;
-use core::iter::{Enumerate, FilterMap, Map};
+use core::iter::{Enumerate, FilterMap, Map, Zip};
+use core::ops::{Bound, Range, RangeInclusive};
 use core::slice;
 
 /// Default number of slots per page.
@@ -63,8 +64,11 @@ fn new_page<T: Default, const PAGE: usize>() -> Box<[T; PAGE]> {
 /// cannot cause undefined behaviour, only wrong results or panics.
 ///
 /// The page iterators ([`pages`](Self::pages), [`pages_mut`](Self::pages_mut),
-/// [`into_pages`](Self::into_pages)) must yield every allocated page exactly
-/// once, in ascending page-number order: ordered collections rely on it.
+/// [`pages_in`](Self::pages_in), [`pages_in_mut`](Self::pages_in_mut),
+/// [`into_pages`](Self::into_pages)) must yield every allocated page (for the
+/// `_in` ones, every allocated page numbered in the range, and no other)
+/// exactly once, in ascending page-number order: ordered collections rely on
+/// it.
 pub trait PageStore<T, const PAGE: usize>: Default {
     /// Iterator over `(page number, page)` from [`pages`](Self::pages).
     type Pages<'a>: DoubleEndedIterator<Item = (usize, &'a [T; PAGE])> + Clone
@@ -117,6 +121,17 @@ pub trait PageStore<T, const PAGE: usize>: Default {
 
     /// The allocated pages in ascending page-number order, mutably.
     fn pages_mut(&mut self) -> Self::PagesMut<'_>;
+
+    /// The allocated pages numbered in `numbers`, in ascending order. An
+    /// empty range (start above end) yields nothing.
+    ///
+    /// Reaching the first page costs O(1) for [`FlatPages`] and O(log pages)
+    /// for [`TreePages`]; [`FlatPages`] then steps over the unallocated
+    /// directory entries in the range.
+    fn pages_in(&self, numbers: RangeInclusive<usize>) -> Self::Pages<'_>;
+
+    /// Like [`pages_in`](Self::pages_in), mutably.
+    fn pages_in_mut(&mut self, numbers: RangeInclusive<usize>) -> Self::PagesMut<'_>;
 
     /// Consumes the store and returns its pages in ascending page-number
     /// order.
@@ -185,10 +200,18 @@ impl<T, const PAGE: usize> fmt::Debug for FlatPages<T, PAGE> {
 
 type FlatEntry<T, const PAGE: usize> = Option<Box<[T; PAGE]>>;
 
+impl<T, const PAGE: usize> FlatPages<T, PAGE> {
+    /// The directory positions of the page numbers in `numbers`.
+    fn span(&self, numbers: RangeInclusive<usize>) -> Range<usize> {
+        let end = numbers.end().saturating_add(1).min(self.pages.len());
+        (*numbers.start()).min(end)..end
+    }
+}
+
 impl<T, const PAGE: usize> PageStore<T, PAGE> for FlatPages<T, PAGE> {
     type Pages<'a>
         = FilterMap<
-        Enumerate<slice::Iter<'a, FlatEntry<T, PAGE>>>,
+        Zip<Range<usize>, slice::Iter<'a, FlatEntry<T, PAGE>>>,
         fn((usize, &'a FlatEntry<T, PAGE>)) -> Option<(usize, &'a [T; PAGE])>,
     >
     where
@@ -196,7 +219,7 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for FlatPages<T, PAGE> {
 
     type PagesMut<'a>
         = FilterMap<
-        Enumerate<slice::IterMut<'a, FlatEntry<T, PAGE>>>,
+        Zip<Range<usize>, slice::IterMut<'a, FlatEntry<T, PAGE>>>,
         fn((usize, &'a mut FlatEntry<T, PAGE>)) -> Option<(usize, &'a mut [T; PAGE])>,
     >
     where
@@ -265,16 +288,24 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for FlatPages<T, PAGE> {
     }
 
     fn pages(&self) -> Self::Pages<'_> {
-        self.pages
-            .iter()
-            .enumerate()
-            .filter_map(|(n, page)| Some((n, page.as_deref()?)))
+        self.pages_in(0..=usize::MAX)
     }
 
     fn pages_mut(&mut self) -> Self::PagesMut<'_> {
-        self.pages
-            .iter_mut()
-            .enumerate()
+        self.pages_in_mut(0..=usize::MAX)
+    }
+
+    fn pages_in(&self, numbers: RangeInclusive<usize>) -> Self::Pages<'_> {
+        let span = self.span(numbers);
+        span.clone()
+            .zip(self.pages[span].iter())
+            .filter_map(|(n, page)| Some((n, page.as_deref()?)))
+    }
+
+    fn pages_in_mut(&mut self, numbers: RangeInclusive<usize>) -> Self::PagesMut<'_> {
+        let span = self.span(numbers);
+        span.clone()
+            .zip(self.pages[span].iter_mut())
             .filter_map(|(n, page)| Some((n, page.as_deref_mut()?)))
     }
 
@@ -283,6 +314,19 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for FlatPages<T, PAGE> {
             .into_iter()
             .enumerate()
             .filter_map(|(n, page)| Some((n, page?)))
+    }
+}
+
+/// `numbers` as bounds `BTreeMap::range` accepts: it panics on a start above
+/// the end, so an empty range becomes `0..0`.
+fn nonempty(numbers: RangeInclusive<usize>) -> (Bound<usize>, Bound<usize>) {
+    if numbers.is_empty() {
+        (Bound::Included(0), Bound::Excluded(0))
+    } else {
+        (
+            Bound::Included(*numbers.start()),
+            Bound::Included(*numbers.end()),
+        )
     }
 }
 
@@ -319,7 +363,7 @@ impl<T, const PAGE: usize> fmt::Debug for TreePages<T, PAGE> {
 impl<T, const PAGE: usize> PageStore<T, PAGE> for TreePages<T, PAGE> {
     type Pages<'a>
         = Map<
-        btree_map::Iter<'a, usize, Box<[T; PAGE]>>,
+        btree_map::Range<'a, usize, Box<[T; PAGE]>>,
         fn((&'a usize, &'a Box<[T; PAGE]>)) -> (usize, &'a [T; PAGE]),
     >
     where
@@ -327,7 +371,7 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for TreePages<T, PAGE> {
 
     type PagesMut<'a>
         = Map<
-        btree_map::IterMut<'a, usize, Box<[T; PAGE]>>,
+        btree_map::RangeMut<'a, usize, Box<[T; PAGE]>>,
         fn((&'a usize, &'a mut Box<[T; PAGE]>)) -> (usize, &'a mut [T; PAGE]),
     >
     where
@@ -368,11 +412,23 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for TreePages<T, PAGE> {
     fn shrink_to_fit(&mut self) {}
 
     fn pages(&self) -> Self::Pages<'_> {
-        self.pages.iter().map(|(&n, page)| (n, &**page))
+        self.pages_in(0..=usize::MAX)
     }
 
     fn pages_mut(&mut self) -> Self::PagesMut<'_> {
-        self.pages.iter_mut().map(|(&n, page)| (n, &mut **page))
+        self.pages_in_mut(0..=usize::MAX)
+    }
+
+    fn pages_in(&self, numbers: RangeInclusive<usize>) -> Self::Pages<'_> {
+        self.pages
+            .range(nonempty(numbers))
+            .map(|(&n, page)| (n, &**page))
+    }
+
+    fn pages_in_mut(&mut self, numbers: RangeInclusive<usize>) -> Self::PagesMut<'_> {
+        self.pages
+            .range_mut(nonempty(numbers))
+            .map(|(&n, page)| (n, &mut **page))
     }
 
     fn into_pages(self) -> Self::IntoPages {
