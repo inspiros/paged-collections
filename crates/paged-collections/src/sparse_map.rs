@@ -44,6 +44,7 @@
 //! assert_eq!(map.value_slice(), &["nearer"]);
 //! ```
 
+use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt;
@@ -123,6 +124,14 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedSparseMap<K, V, PAGE, D> {
     pub fn reserve(&mut self, additional: usize) {
         self.keys.reserve(additional);
         self.values.reserve(additional);
+    }
+
+    /// Like [`reserve`](Self::reserve), but returns an error instead of
+    /// panicking or aborting when the capacity overflows or the allocation
+    /// fails. On error, one of the arrays may have grown.
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        self.keys.try_reserve(additional)?;
+        self.values.try_reserve(additional)
     }
 
     /// The keys as a set.

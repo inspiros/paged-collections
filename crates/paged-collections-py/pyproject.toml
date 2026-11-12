@@ -13,6 +13,7 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+dependencies = ["numpy>=1.24"]
 dynamic = ["version"]
 
 [dependency-groups]
@@ -22,6 +23,18 @@ dev = ["maturin>=1.16,<2", "pytest>=8"]
 python-source = "python"
 module-name = "paged_collections._core"
 features = ["pyo3/extension-module"]
+
+[tool.uv]
+# Rebuild the extension when the Rust sources change, not only pyproject.toml.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../paged-collections/Cargo.toml" },
+    { file = "../paged-collections/src/**/*.rs" },
+    { file = "../../Cargo.toml" },
+    { file = "../../Cargo.lock" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

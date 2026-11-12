@@ -30,6 +30,7 @@
 //! assert_eq!(set.as_slice(), &[3_000_000]);
 //! ```
 
+use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 use core::fmt;
 use core::num::NonZeroU32;
@@ -123,6 +124,13 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
     /// Reserves room in the dense array for at least `additional` more keys.
     pub fn reserve(&mut self, additional: usize) {
         self.dense.reserve(additional);
+    }
+
+    /// Like [`reserve`](Self::reserve), but returns an error instead of
+    /// panicking or aborting when the capacity overflows or the allocation
+    /// fails.
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        self.dense.try_reserve(additional)
     }
 
     /// Dense position of the key occupying slot `index`, if any.
