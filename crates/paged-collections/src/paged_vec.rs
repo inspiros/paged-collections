@@ -18,7 +18,13 @@
 //!
 //! The price is that the elements are not one contiguous slice: there is no
 //! `as_slice` or `Deref<Target = [T]>`. Use [`pages`](PagedVec::pages) for
-//! slice access one page at a time.
+//! slice access one page at a time, or
+//! [`with_contiguous_mut`](PagedVec::with_contiguous_mut) to run a slice
+//! algorithm on all elements at the cost of a temporary buffer.
+//!
+//! Sorting goes through that buffer, so it uses the standard library's slice
+//! sorts. Searching needs no buffer: a binary search over the pages finds the
+//! page, then the slice search runs inside it.
 //!
 //! | Operation | Cost |
 //! |---|---|
@@ -26,6 +32,8 @@
 //! | [`push`](PagedVec::push) | amortized O(1): a page allocation every `PAGE` pushes, rare directory growth |
 //! | [`insert`], [`remove`] | O(len − index): elements shift across pages |
 //! | [`truncate`](PagedVec::truncate), [`clear`](PagedVec::clear) | O(removed) drops; pages are kept |
+//! | [`binary_search`](PagedVec::binary_search), [`partition_point`](PagedVec::partition_point) | O(log n), no allocation |
+//! | [`sort`](PagedVec::sort) and variants | the slice sort's cost, plus moving all elements out and back and a temporary buffer of `len` elements |
 //!
 //! The name follows Rust's `Vec`; other languages may know it as a list.
 //!
@@ -477,6 +485,197 @@ impl<T, const PAGE: usize> PagedVec<T, PAGE> {
                 guard.write += 1;
             }
             guard.read += 1;
+        }
+    }
+
+    /// Runs `f` on all elements as one contiguous mutable slice, then puts
+    /// them back in their new order.
+    ///
+    /// The elements are moved into a temporary buffer of `len` elements and
+    /// back into the same pages, so the pages keep their addresses (as with
+    /// any reordering, an element's address follows its index, not the
+    /// element). The buffer costs `len * size_of::<T>()` bytes for the
+    /// duration of the call.
+    ///
+    /// If `f` panics, the elements are put back in whatever order `f` left
+    /// them, and the panic continues.
+    ///
+    /// ```
+    /// use paged_collections::paged_vec::PagedVec;
+    ///
+    /// let mut v: PagedVec<u32, 2> = [3, 1, 2, 5, 4].into();
+    /// v.with_contiguous_mut(|s| s.rotate_left(2));
+    /// assert!(v.iter().copied().eq([2, 5, 4, 3, 1]));
+    /// ```
+    pub fn with_contiguous_mut<R>(&mut self, f: impl FnOnce(&mut [T]) -> R) -> R {
+        /// Moves the buffer back into the pages, `PAGE` elements each, on
+        /// return and on unwind.
+        struct Refill<'a, T, const PAGE: usize> {
+            pages: &'a mut [Vec<T>],
+            buf: Vec<T>,
+        }
+
+        impl<T, const PAGE: usize> Drop for Refill<'_, T, PAGE> {
+            fn drop(&mut self) {
+                // One `push` at a time: `Vec` guarantees that `push` does
+                // not reallocate when the capacity suffices (bulk methods
+                // make no such promise), each page kept its capacity of at
+                // least `PAGE` (`Vec` never shrinks on its own), and each
+                // gets at most `PAGE` elements. So nothing here allocates or
+                // panics, and no page moves.
+                let mut rest = self.buf.drain(..);
+                for page in self.pages.iter_mut() {
+                    debug_assert!(page.is_empty() && page.capacity() >= PAGE);
+                    for value in rest.by_ref().take(PAGE) {
+                        page.push(value);
+                    }
+                }
+                debug_assert_eq!(rest.len(), 0);
+            }
+        }
+
+        // Allocate before moving anything, so a failed allocation changes
+        // nothing. The guard exists before the first move; gathering only
+        // pushes into `buf`, which has room for every element, so it cannot
+        // panic either.
+        let used = self.used_pages();
+        let mut refill = Refill::<T, PAGE> {
+            pages: &mut self.pages[..used],
+            buf: Vec::with_capacity(self.len),
+        };
+        for page in refill.pages.iter_mut() {
+            for value in page.drain(..) {
+                refill.buf.push(value);
+            }
+        }
+        f(&mut refill.buf)
+    }
+
+    /// Sorts stably, with the standard library's stable sort. See
+    /// [`with_contiguous_mut`](PagedVec::with_contiguous_mut) for the
+    /// temporary buffer and panic behaviour: if a comparison panics, the
+    /// vector holds the same elements in an unspecified order.
+    pub fn sort(&mut self)
+    where
+        T: Ord,
+    {
+        self.with_contiguous_mut(|s| s.sort());
+    }
+
+    /// Sorts stably with a comparator. See [`sort`](PagedVec::sort).
+    pub fn sort_by(&mut self, compare: impl FnMut(&T, &T) -> Ordering) {
+        self.with_contiguous_mut(|s| s.sort_by(compare));
+    }
+
+    /// Sorts stably by a key. See [`sort`](PagedVec::sort).
+    pub fn sort_by_key<K: Ord>(&mut self, key: impl FnMut(&T) -> K) {
+        self.with_contiguous_mut(|s| s.sort_by_key(key));
+    }
+
+    /// Sorts stably by a key computed at most once per element. See
+    /// [`sort`](PagedVec::sort).
+    pub fn sort_by_cached_key<K: Ord>(&mut self, key: impl FnMut(&T) -> K) {
+        self.with_contiguous_mut(|s| s.sort_by_cached_key(key));
+    }
+
+    /// Sorts without preserving the order of equal elements, with the
+    /// standard library's unstable sort. See [`sort`](PagedVec::sort).
+    pub fn sort_unstable(&mut self)
+    where
+        T: Ord,
+    {
+        self.with_contiguous_mut(|s| s.sort_unstable());
+    }
+
+    /// Unstable sort with a comparator. See [`sort`](PagedVec::sort).
+    pub fn sort_unstable_by(&mut self, compare: impl FnMut(&T, &T) -> Ordering) {
+        self.with_contiguous_mut(|s| s.sort_unstable_by(compare));
+    }
+
+    /// Unstable sort by a key. See [`sort`](PagedVec::sort).
+    pub fn sort_unstable_by_key<K: Ord>(&mut self, key: impl FnMut(&T) -> K) {
+        self.with_contiguous_mut(|s| s.sort_unstable_by_key(key));
+    }
+
+    /// Reverses the order of the elements in place, without a buffer.
+    pub fn reverse(&mut self) {
+        let n = self.len;
+        for i in 0..n / 2 {
+            self.swap(i, n - 1 - i);
+        }
+    }
+
+    /// Whether some element equals `x`. O(len).
+    pub fn contains(&self, x: &T) -> bool
+    where
+        T: PartialEq,
+    {
+        self.pages().any(|page| page.contains(x))
+    }
+
+    /// Binary search in a sorted vector, like
+    /// [`slice::binary_search`]: `Ok` with the index of a matching element
+    /// (any one, if several match), or `Err` with the index where `x` would
+    /// be inserted to keep the order.
+    pub fn binary_search(&self, x: &T) -> Result<usize, usize>
+    where
+        T: Ord,
+    {
+        self.binary_search_by(|y| y.cmp(x))
+    }
+
+    /// Binary search with a comparator that returns the order of the
+    /// element relative to the target, like [`slice::binary_search_by`].
+    /// The result is unspecified, but not undefined, if the vector is not
+    /// sorted consistently with `f`.
+    pub fn binary_search_by<'a>(
+        &'a self,
+        mut f: impl FnMut(&'a T) -> Ordering,
+    ) -> Result<usize, usize> {
+        let pages: &'a [Vec<T>] = &self.pages[..self.used_pages()];
+        // The first page whose last element is not less than the target is
+        // the only one that can hold the first match or the insertion point.
+        // Searched by hand: `partition_point`'s closure gets a reference
+        // too short-lived to pass to `f`.
+        let (mut lo, mut hi) = (0, pages.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let page: &'a Vec<T> = &pages[mid];
+            if page.last().is_some_and(|y| f(y) == Ordering::Less) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let p = lo;
+        let Some(page) = pages.get(p) else {
+            return Err(self.len);
+        };
+        let base = p * PAGE;
+        match page.binary_search_by(f) {
+            Ok(i) => Ok(base + i),
+            Err(i) => Err(base + i),
+        }
+    }
+
+    /// Binary search by a key, like [`slice::binary_search_by_key`].
+    pub fn binary_search_by_key<'a, K: Ord>(
+        &'a self,
+        key: &K,
+        mut f: impl FnMut(&'a T) -> K,
+    ) -> Result<usize, usize> {
+        self.binary_search_by(|y| f(y).cmp(key))
+    }
+
+    /// The index of the first element for which `pred` is false, given that
+    /// `pred` is true for a prefix and false for the rest, like
+    /// [`slice::partition_point`].
+    pub fn partition_point(&self, mut pred: impl FnMut(&T) -> bool) -> usize {
+        let pages = &self.pages[..self.used_pages()];
+        let p = pages.partition_point(|page| page.last().is_some_and(&mut pred));
+        match pages.get(p) {
+            Some(page) => p * PAGE + page.partition_point(pred),
+            None => self.len,
         }
     }
 
