@@ -8,7 +8,7 @@
 //! - **Paged storage.** Elements live in fixed-size pages that never move, so
 //!   references and pointers to elements stay valid while the collection grows.
 //!
-//! # Planned collections
+//! # Collections
 //!
 //! | Module | Type | Paging |
 //! |---|---|---|
@@ -16,7 +16,7 @@
 //! | [`sparse_map`] | `PagedSparseMap<K, V>` | index; storage optional |
 //! | [`direct_map`] | `PagedDirectMap<K, V>` | index (values in place, slot order) |
 //! | [`paged_vec`] | `PagedVec<T>` | storage (stable addresses) |
-//! | [`hive`] | `Hive<T>` | storage (stable addresses, generational handles) |
+//! | [`hive`] | `Hive<T>` | storage (stable addresses, reusable slots, generational ids) |
 //! | [`id_alloc`] | `IdAllocator`, `Id` | none (free list of generational ids) |
 //!
 //! Shared building blocks live in [`key`] (how a key maps to an index) and
@@ -36,6 +36,8 @@ extern crate alloc;
 extern crate std;
 
 pub mod direct_map;
+// Slot indices are `u32` and must convert to `usize` without loss.
+#[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
 pub mod hive;
 // Indices are `u32` and must convert to `usize` without loss.
 #[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]

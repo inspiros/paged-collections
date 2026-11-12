@@ -147,7 +147,7 @@ impl Key for Id {
 
 /// The generation that a live (odd) version holds.
 #[inline]
-fn generation_of(version: u32) -> NonZeroU32 {
+pub(crate) fn generation_of(version: u32) -> NonZeroU32 {
     debug_assert!(version % 2 == 1);
     NonZeroU32::MIN.saturating_add(version >> 1)
 }
@@ -155,7 +155,7 @@ fn generation_of(version: u32) -> NonZeroU32 {
 /// The version at which `generation` is live, or `None` above
 /// [`MAX_GENERATION`].
 #[inline]
-fn live_version(generation: NonZeroU32) -> Option<u32> {
+pub(crate) fn live_version(generation: NonZeroU32) -> Option<u32> {
     (generation.get() - 1).checked_mul(2).map(|v| v | 1)
 }
 
