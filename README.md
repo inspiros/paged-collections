@@ -63,6 +63,20 @@ assert_eq!(in_range, [10, 20]);
 
 ## Python
 
+`PagedList` stores objects in pages of 1024 elements; `paged_list(dtype)`
+selects a typed list. Slices are copies. Typed `page_view` arrays share
+storage and remain valid across appends; release them before removing or
+moving elements.
+
+```python
+from paged_collections import paged_list
+
+values = paged_list("float64", [1.0, 2.0, 3.0])
+page = values.page_view(0)
+page[0] = 4.0                   # updates values[0]
+values.append(5.0)              # page still covers the original three values
+```
+
 Keys are integers in `0 <= key < 2**32`. `SparseSet` holds keys,
 `SparseMap` maps keys to any objects, and `SparseMapF64`, `SparseMapI64` and
 the other typed maps (or `sparse_map(dtype)`) store numbers unboxed:

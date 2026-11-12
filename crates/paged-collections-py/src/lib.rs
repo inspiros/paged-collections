@@ -16,6 +16,7 @@ mod export;
 mod id_alloc;
 mod iter;
 mod object_map;
+mod paged_list;
 mod set;
 mod typed_map;
 
@@ -71,6 +72,20 @@ fn reduce<'py>(
         parts.extend([none(), items.into_any()]);
     }
     PyTuple::new(py, parts)
+}
+
+/// List-item form of `reduce`: create the empty list before restoring its
+/// elements, allowing pickle/deepcopy to memoize self-containing lists. Map
+/// reduce tuples keep their existing dictionary-item form.
+fn reduce_list<'py>(
+    obj: &Bound<'py, PyAny>,
+    base: &Bound<'py, PyType>,
+    items: Bound<'py, PyIterator>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let initial = reduce(obj, base, Vec::new(), None)?;
+    let mut parts: Vec<_> = initial.iter().collect();
+    parts.push(items.into_any());
+    PyTuple::new(obj.py(), parts)
 }
 
 /// The state of a subclass instance beyond its contents, or `None` if it
@@ -172,6 +187,13 @@ mod _core {
     };
     #[pymodule_export]
     use crate::object_map::{IdMap, IdMapIterator, SparseMap, SparseMapIterator};
+    #[pymodule_export]
+    use crate::paged_list::{
+        PagedList, PagedListBool, PagedListBoolIterator, PagedListF32, PagedListF32Iterator,
+        PagedListF64, PagedListF64Iterator, PagedListI32, PagedListI32Iterator, PagedListI64,
+        PagedListI64Iterator, PagedListIterator, PagedListU32, PagedListU32Iterator, PagedListU64,
+        PagedListU64Iterator,
+    };
     #[pymodule_export]
     use crate::set::{SparseSet, SparseSetIterator};
     #[pymodule_export]

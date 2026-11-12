@@ -305,7 +305,10 @@ impl<'py, K: PyKey> KeyBatch<'py, K> {
 }
 
 /// The elements of `array.astype(dtype)` as `T` (which must match `dtype`).
-fn cast_to<T: Element + Copy>(array: &Bound<'_, PyUntypedArray>, dtype: &str) -> PyResult<Vec<T>> {
+pub(crate) fn cast_to<T: Element + Copy>(
+    array: &Bound<'_, PyUntypedArray>,
+    dtype: &str,
+) -> PyResult<Vec<T>> {
     let cast = array
         .call_method1("astype", (dtype,))?
         .cast_into::<PyArrayDyn<T>>()?;

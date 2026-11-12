@@ -12,10 +12,12 @@
 //!
 //! While a collection's export count is non-zero:
 //!
-//! 1. Its dense `Vec`s are not reallocated, shrunk, grown or reordered, and
-//!    their lengths do not change. Every method that could do so calls
-//!    [`Exports::check`] first and raises `BufferError` instead, as
-//!    `bytearray` does while a `memoryview` of it exists.
+//! 1. Elements covered by a view are not moved, dropped or freed, and their
+//!    buffer is not reallocated. Methods that could do so call
+//!    [`Exports::check`] first and raise `BufferError`. Maps keep their dense
+//!    lengths fixed. PagedList pages may grow: each buffer has capacity at
+//!    least PAGE, never grows past PAGE, and push touches only the new last
+//!    element. Reserving pages moves only directory headers, not buffers.
 //! 2. Rust code creates no `&mut` reference into an exported `Vec`'s
 //!    elements. Exported key arrays are only read. Exported value arrays
 //!    hold [`ValueCell`]s (atomics), are exported from a shared
@@ -218,9 +220,13 @@ pub(crate) unsafe fn read_only_view<'py, T: Element>(
 ///
 /// # Safety
 ///
-/// As for [`read_only_view`], except that Rust code may also write the
-/// cells, through [`ValueCell::set`] only. If `writeable`, every bit pattern
-/// of `size_of::<T>()` bytes must be a valid `T::Atomic`: NumPy code can
+/// `data` must be the contents of a `Vec`, or a prefix of a page `Vec`,
+/// owned by `owner`.
+/// Elements in that prefix and their buffer must keep the [invariants](self)
+/// while exports are active; the page may append beyond the prefix without
+/// reallocating or creating mutable references into the prefix. Rust code may
+/// also write the cells, through [`ValueCell::set`] only. If `writeable`,
+/// every bit pattern of `size_of::<T>()` bytes must be a valid `T::Atomic`: NumPy code can
 /// reinterpret the view as another dtype (`view.view(np.uint8)`) and write
 /// any bytes. That holds for every [`TypedValue`].
 pub(crate) unsafe fn cell_view<'py, T: TypedValue>(

@@ -1,4 +1,4 @@
-"""Paged sets and maps, and generational id allocation, implemented in Rust.
+"""Paged lists, sets and maps, and generational id allocation, implemented in Rust.
 
 ``SparseSet``, ``SparseMap`` and ``DirectMap`` use integer keys in
 ``0 <= key < 2**32``. ``SparseSet`` holds keys only;
@@ -8,6 +8,10 @@ typed maps store numeric values unboxed and expose them as NumPy arrays.
 provide nearest-entry and range queries. ``IdMap`` and its typed variants
 map generational ids to values. ``sparse_map(dtype)``, ``direct_map(dtype)``
 and ``id_map(dtype)`` pick the map class for a dtype.
+
+``PagedList`` stores arbitrary objects in pages; typed variants store numbers
+unboxed and expose individual pages as NumPy views. ``paged_list(dtype)``
+picks the list class for a dtype.
 
 ``IdAllocator`` issues integer ids packed as ``generation << 32 | index``.
 Freed indices are reused last freed first with a new generation. ``id_index``,
@@ -43,6 +47,14 @@ from paged_collections._core import (
     IdMapI64,
     IdMapU32,
     IdMapU64,
+    PagedList,
+    PagedListBool,
+    PagedListF32,
+    PagedListF64,
+    PagedListI32,
+    PagedListI64,
+    PagedListU32,
+    PagedListU64,
     SparseMap,
     SparseMapBool,
     SparseMapF32,
@@ -99,6 +111,20 @@ _TYPED_ID_MAPS = {
 }
 
 
+_TYPED_LISTS = {
+    np.dtype(cls.dtype): cls
+    for cls in (
+        PagedListF64,
+        PagedListF32,
+        PagedListI64,
+        PagedListI32,
+        PagedListU64,
+        PagedListU32,
+        PagedListBool,
+    )
+}
+
+
 def _map_class(dtype: Any, object_class: Any, typed_maps: dict, kind: str) -> Any:
     """Resolve the value dtype shared by the map families."""
     if dtype is None or dtype is object:
@@ -110,6 +136,26 @@ def _map_class(dtype: Any, object_class: Any, typed_maps: dict, kind: str) -> An
         return typed_maps[resolved]
     supported = ", ".join(str(d) for d in typed_maps)
     raise TypeError(f"no {kind} map for dtype {resolved}; supported: object, {supported}")
+
+
+def paged_list(dtype: Any = None, values: Any = None) -> Any:
+    """Create a paged list of objects or values of the given NumPy dtype.
+
+    Supported typed dtypes are float64, float32, int64, int32, uint64,
+    uint32 and bool. Slices are copies; typed page views share storage.
+    """
+    if dtype is None or dtype is object:
+        cls = PagedList
+    else:
+        resolved = np.dtype(dtype)
+        if resolved == np.dtype(object):
+            cls = PagedList
+        elif resolved in _TYPED_LISTS:
+            cls = _TYPED_LISTS[resolved]
+        else:
+            supported = ", ".join(str(d) for d in _TYPED_LISTS)
+            raise TypeError(f"no paged list for dtype {resolved}; supported: object, {supported}")
+    return cls() if values is None else cls(values)
 
 
 def sparse_map(dtype: Any = None, keys: Any = None, values: Any = None) -> Any:
@@ -176,6 +222,14 @@ __all__ = [
     "IdMapI64",
     "IdMapU32",
     "IdMapU64",
+    "PagedList",
+    "PagedListBool",
+    "PagedListF32",
+    "PagedListF64",
+    "PagedListI32",
+    "PagedListI64",
+    "PagedListU32",
+    "PagedListU64",
     "SparseMap",
     "SparseMapBool",
     "SparseMapF32",
@@ -191,6 +245,7 @@ __all__ = [
     "id_indices",
     "id_map",
     "make_id",
+    "paged_list",
     "sparse_map",
     "direct_map",
 ]
