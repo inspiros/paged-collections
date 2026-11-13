@@ -1,0 +1,541 @@
+//! Sequential models, boundary cases and shared atomic updates.
+
+#![cfg(all(feature = "concurrent", not(loom)))]
+#![cfg(all(
+    any(target_pointer_width = "32", target_pointer_width = "64"),
+    target_has_atomic = "ptr",
+    target_has_atomic = "64"
+))]
+
+use std::collections::BTreeMap;
+use std::num::NonZeroU32;
+use std::ops::Bound;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Barrier};
+use std::thread;
+
+use paged_collections::concurrent::{AtomicDirectMap, AtomicIdMap};
+use paged_collections::direct_map::PagedDirectMap;
+use paged_collections::id_alloc::Id;
+use proptest::prelude::*;
+
+const MAX_VALUE: u64 = AtomicDirectMap::<4>::MAX_VALUE;
+
+fn id(index: u32, generation: u32) -> Id {
+    Id::new(index, NonZeroU32::new(generation).unwrap())
+}
+
+fn direct_value() -> impl Strategy<Value = u64> {
+    prop_oneof![Just(0), Just(MAX_VALUE), 0u64..4, 0u64..u64::MAX]
+}
+
+fn direct_update(old: Option<u64>, action: u8, value: u64) -> Option<Option<u64>> {
+    match action {
+        0 => None,
+        1 => Some(None),
+        2 => Some(Some(value)),
+        _ => old
+            .unwrap_or(0)
+            .checked_add(1)
+            .filter(|&v| v <= MAX_VALUE)
+            .map(Some),
+    }
+}
+
+fn id_update(old: Option<u32>, action: u8, value: u32) -> Option<Option<u32>> {
+    match action {
+        0 => None,
+        1 => Some(None),
+        2 => Some(Some(value)),
+        _ => Some(Some(old.unwrap_or(0).wrapping_add(1))),
+    }
+}
+
+proptest! {
+    #[test]
+    fn direct_sequential_model(
+        ops in prop::collection::vec(
+            (0u8..6, 0usize..40, direct_value(), 0u8..4, any::<bool>()),
+            0..200,
+        ),
+    ) {
+        let map = AtomicDirectMap::<4>::new();
+        let mut model = BTreeMap::new();
+        for (op, key, value, action, store) in ops {
+            let old = model.get(&key).copied();
+            match op {
+                0 => prop_assert_eq!(map.get(key), old),
+                1 => prop_assert_eq!(map.insert(key, value), model.insert(key, value)),
+                2 => {
+                    let expected = match old {
+                        Some(current) => Err(current),
+                        None => { model.insert(key, value); Ok(()) }
+                    };
+                    prop_assert_eq!(map.try_insert(key, value), expected);
+                }
+                3 => prop_assert_eq!(map.remove(key), model.remove(&key)),
+                4 => {
+                    let current = match action {
+                        0 => None,
+                        1 => Some(value),
+                        _ => old,
+                    };
+                    let new = store.then_some(value);
+                    let expected = if old == current {
+                        match new {
+                            Some(value) => { model.insert(key, value); }
+                            None => { model.remove(&key); }
+                        }
+                        Ok(old)
+                    } else {
+                        Err(old)
+                    };
+                    prop_assert_eq!(map.compare_exchange(key, current, new), expected);
+                }
+                _ => {
+                    let expected = match direct_update(old, action, value) {
+                        None => Err(old),
+                        Some(new) => {
+                            match new {
+                                Some(value) => { model.insert(key, value); }
+                                None => { model.remove(&key); }
+                            }
+                            Ok(old)
+                        }
+                    };
+                    prop_assert_eq!(map.fetch_update(key, |v| direct_update(v, action, value)), expected);
+                }
+            }
+            let expected: Vec<_> = model.iter().map(|(&k, &v)| (k, v)).collect();
+            prop_assert_eq!(map.iter().collect::<Vec<_>>(), expected);
+            prop_assert_eq!(map.len(), model.len());
+            prop_assert_eq!(map.is_empty(), model.is_empty());
+            prop_assert_eq!(map.contains_key(key), model.contains_key(&key));
+            let expected: Vec<_> = model.range(5..=25).map(|(&k, &v)| (k, v)).collect();
+            prop_assert_eq!(map.range(5..=25).collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test]
+    fn id_sequential_model(
+        ops in prop::collection::vec(
+            (0u8..9, 0u32..20, 1u32..=4, prop_oneof![Just(0), Just(u32::MAX), any::<u32>()], 0u8..4, any::<bool>()),
+            0..200,
+        ),
+    ) {
+        let map = AtomicIdMap::<4>::new();
+        let mut model = PagedDirectMap::<Id, u32, 4>::new();
+        for (op, index, generation, value, action, store) in ops {
+            let key = id(index, generation);
+            let old = model.get(key).copied();
+            match op {
+                0 => prop_assert_eq!(map.get(key), old),
+                1 => prop_assert_eq!(map.insert(key, value), model.insert(key, value)),
+                2 => {
+                    let expected = match model.occupant(index as usize) {
+                        Some((&held, &current)) => Err((held, current)),
+                        None => { model.insert(key, value); Ok(()) }
+                    };
+                    prop_assert_eq!(map.try_insert(key, value), expected);
+                }
+                3 => prop_assert_eq!(map.remove(key), model.remove(key)),
+                4 => {
+                    let current = match action {
+                        0 => None,
+                        1 => Some(value),
+                        _ => old,
+                    };
+                    let new = store.then_some(value);
+                    let expected = if old == current {
+                        match new {
+                            Some(value) => { model.insert(key, value); }
+                            None => { model.remove(key); }
+                        }
+                        Ok(old)
+                    } else {
+                        Err(old)
+                    };
+                    prop_assert_eq!(map.compare_exchange(key, current, new), expected);
+                }
+                5 => {
+                    let expected = match id_update(old, action, value) {
+                        None => Err(old),
+                        Some(new) => {
+                            match new {
+                                Some(value) => { model.insert(key, value); }
+                                None => { model.remove(key); }
+                            }
+                            Ok(old)
+                        }
+                    };
+                    prop_assert_eq!(map.fetch_update(key, |v| id_update(v, action, value)), expected);
+                }
+                6 => prop_assert_eq!(map.replace(key, value), model.replace(key, value)),
+                7 => prop_assert_eq!(map.remove_occupant(index), model.remove_occupant(index as usize)),
+                _ => prop_assert_eq!(map.occupant(index), model.occupant(index as usize).map(|(&k, &v)| (k, v))),
+            }
+            let expected: Vec<_> = model.iter().map(|(&k, &v)| (k, v)).collect();
+            prop_assert_eq!(map.iter().collect::<Vec<_>>(), expected);
+            prop_assert_eq!(map.len(), model.len());
+            prop_assert_eq!(map.is_empty(), model.is_empty());
+            prop_assert_eq!(map.contains_key(key), model.contains_key(key));
+            let expected: Vec<_> = model.slot_range(5..=15).map(|(&k, &v)| (k, v)).collect();
+            prop_assert_eq!(map.range(5..=15).collect::<Vec<_>>(), expected);
+        }
+    }
+}
+
+#[test]
+fn send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<AtomicDirectMap>();
+    assert_send_sync::<AtomicIdMap>();
+}
+
+#[test]
+fn direct_rejects_unstorable_values() {
+    let map = AtomicDirectMap::<4>::new();
+    map.insert(1, 7);
+    for operation in 0..4 {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| match operation {
+                0 => {
+                    map.insert(1, u64::MAX);
+                }
+                1 => {
+                    let _ = map.try_insert(1, u64::MAX);
+                }
+                2 => {
+                    let _ = map.compare_exchange(1, None, Some(u64::MAX));
+                }
+                _ => {
+                    let _ = map.fetch_update(1, |_| Some(Some(u64::MAX)));
+                }
+            }))
+            .is_err()
+        );
+        assert_eq!(map.get(1), Some(7));
+        assert_eq!(map.len(), 1);
+    }
+    assert_eq!(map.compare_exchange(1, Some(u64::MAX), None), Err(Some(7)));
+}
+
+#[test]
+fn absent_updates_do_not_install_pages_and_wide_lookups_are_absent() {
+    let direct = AtomicDirectMap::<4>::new();
+    for key in [0, 7, usize::MAX] {
+        assert_eq!(direct.get(key), None);
+        assert!(!direct.contains_key(key));
+        assert_eq!(direct.remove(key), None);
+        assert_eq!(direct.compare_exchange(key, None, None), Ok(None));
+        assert_eq!(direct.compare_exchange(key, Some(1), None), Err(None));
+        assert_eq!(direct.fetch_update(key, |_| Some(None)), Ok(None));
+        assert_eq!(direct.fetch_update(key, |_| None), Err(None));
+    }
+    assert_eq!(direct.allocated_pages(), 0);
+    let generational = AtomicIdMap::<1>::new();
+    for index in [0, 7, u32::MAX] {
+        let key = id(index, 1);
+        assert_eq!(generational.get(key), None);
+        assert!(!generational.contains_key(key));
+        assert_eq!(generational.occupant(index), None);
+        assert_eq!(generational.remove(key), None);
+        assert_eq!(generational.remove_occupant(index), None);
+        assert_eq!(generational.compare_exchange(key, None, None), Ok(None));
+        assert_eq!(generational.fetch_update(key, |_| Some(None)), Ok(None));
+    }
+    assert_eq!(generational.allocated_pages(), 0);
+}
+
+#[test]
+#[should_panic(expected = "key index exceeds direct spine range")]
+fn out_of_range_insert_panics() {
+    AtomicDirectMap::<4>::new().insert(usize::MAX, 0);
+}
+
+#[test]
+fn conditional_generation_semantics_and_length() {
+    let map = AtomicIdMap::<4>::new();
+    let old = id(1, 1);
+    let new = id(1, 2);
+    map.insert(old, 0);
+    assert_eq!(map.compare_exchange(new, Some(0), Some(10)), Err(None));
+    assert_eq!(map.compare_exchange(new, None, None), Ok(None));
+    assert_eq!(map.fetch_update(new, |_| Some(None)), Ok(None));
+    assert_eq!(map.occupant(1), Some((old, 0)));
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.compare_exchange(new, None, Some(u32::MAX)), Ok(None));
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.remove(old), None);
+    assert_eq!(map.fetch_update(old, |_| Some(None)), Ok(None));
+    assert_eq!(map.occupant(1), Some((new, u32::MAX)));
+    assert_eq!(map.fetch_update(old, |_| Some(Some(5))), Ok(None));
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.compare_exchange(old, Some(5), None), Ok(Some(5)));
+    assert_eq!(map.len(), 0);
+    assert_eq!(map.fetch_update(new, |_| Some(Some(0))), Ok(None));
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.remove_occupant(1), Some((new, 0)));
+    assert_eq!(map.len(), 0);
+    // Id::new accepts every nonzero u32 generation, not just allocator ids.
+    let highest = id(1, u32::MAX);
+    assert_eq!(map.insert(highest, u32::MAX), None);
+    assert_eq!(map.iter().collect::<Vec<_>>(), [(highest, u32::MAX)]);
+}
+
+#[test]
+fn callbacks_retry_after_reentrant_changes() {
+    // This also covers page installation by a callback after an absent-page
+    // observation, including a request that would otherwise be a no-op.
+    let map = AtomicDirectMap::<4>::new();
+    let mut calls = 0;
+    assert_eq!(
+        map.fetch_update(1, |old| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(old, None);
+                map.insert(1, 7);
+            } else {
+                assert_eq!(old, Some(7));
+            }
+            Some(None)
+        }),
+        Ok(Some(7))
+    );
+    assert_eq!(calls, 2);
+    assert_eq!(map.len(), 0);
+    let map = AtomicIdMap::<4>::new();
+    let key = id(1, 1);
+    let other = id(1, 2);
+    map.insert(key, 1);
+    let mut calls = 0;
+    assert_eq!(
+        map.fetch_update(key, |old| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(old, Some(1));
+                map.insert(other, 2);
+            } else {
+                assert_eq!(old, None);
+            }
+            Some(None)
+        }),
+        Ok(None)
+    );
+    assert_eq!(calls, 2);
+    assert_eq!(map.occupant(1), Some((other, 2)));
+    assert_eq!(map.len(), 1);
+}
+
+#[test]
+fn traversal_bounds_clear_reset_and_collection_traits() {
+    let mut direct: AtomicDirectMap<4> = [(9, MAX_VALUE), (0, 0), (4, 4)].into_iter().collect();
+    direct.extend([(7, 7), (4, 5)]);
+    assert_eq!(
+        format!("{direct:?}"),
+        format!("{{0: 0, 4: 5, 7: 7, 9: {MAX_VALUE}}}")
+    );
+    assert_eq!(direct.range(4..=7).collect::<Vec<_>>(), [(4, 5), (7, 7)]);
+    assert_eq!(
+        direct
+            .range((Bound::Excluded(4), Bound::Included(9)))
+            .collect::<Vec<_>>(),
+        [(7, 7), (9, MAX_VALUE)]
+    );
+    for bounds in [
+        (Bound::Excluded(usize::MAX), Bound::Unbounded),
+        (Bound::Unbounded, Bound::Excluded(0)),
+        (Bound::Included(9), Bound::Included(4)),
+        (Bound::Included(usize::MAX), Bound::Unbounded),
+    ] {
+        assert_eq!(direct.range(bounds).next(), None);
+    }
+    let pages = direct.allocated_pages();
+    assert_eq!(pages, 3);
+    direct.clear();
+    assert!(direct.is_empty());
+    assert_eq!(direct.iter().next(), None);
+    assert_eq!(direct.allocated_pages(), pages);
+    direct.insert(4, 0);
+    assert_eq!(direct.len(), 1);
+    direct.reset();
+    assert_eq!(direct.allocated_pages(), 0);
+    assert!(direct.is_empty());
+    direct.insert(4, MAX_VALUE);
+    assert_eq!(direct.get(4), Some(MAX_VALUE));
+
+    let mut generational: AtomicIdMap<4> = [(id(9, 1), 9), (id(0, 1), 0), (id(4, 1), 4)]
+        .into_iter()
+        .collect();
+    generational.extend([(id(7, 1), 7), (id(4, 2), u32::MAX)]);
+    assert_eq!(
+        format!("{generational:?}"),
+        format!(
+            "{{Id(0v1): 0, Id(4v2): {}, Id(7v1): 7, Id(9v1): 9}}",
+            u32::MAX
+        )
+    );
+    assert_eq!(
+        generational.range(4..=7).collect::<Vec<_>>(),
+        [(id(4, 2), u32::MAX), (id(7, 1), 7)]
+    );
+    assert_eq!(
+        generational
+            .range((Bound::Excluded(4), Bound::Excluded(9)))
+            .collect::<Vec<_>>(),
+        [(id(7, 1), 7)]
+    );
+    for bounds in [
+        (Bound::Excluded(u32::MAX), Bound::Unbounded),
+        (Bound::Unbounded, Bound::Excluded(0)),
+        (Bound::Included(9), Bound::Included(4)),
+        (Bound::Included(u32::MAX), Bound::Unbounded),
+    ] {
+        assert_eq!(generational.range(bounds).next(), None);
+    }
+    generational.clear();
+    assert!(generational.is_empty());
+    assert_eq!(generational.iter().next(), None);
+    assert_eq!(generational.allocated_pages(), 3);
+    generational.insert(id(4, 3), 0);
+    assert_eq!(generational.len(), 1);
+    generational.reset();
+    assert!(generational.is_empty());
+    assert_eq!(generational.allocated_pages(), 0);
+    generational.insert(id(4, 1), 4);
+    assert_eq!(generational.get(id(4, 1)), Some(4));
+
+    assert!(AtomicDirectMap::<4>::default().is_empty());
+    assert!(AtomicIdMap::<4>::default().is_empty());
+}
+
+#[test]
+fn invalid_page_capacities_panic() {
+    assert!(catch_unwind(AtomicDirectMap::<0>::new).is_err());
+    assert!(catch_unwind(AtomicIdMap::<0>::new).is_err());
+    assert!(catch_unwind(AtomicDirectMap::<{ usize::MAX }>::new).is_err());
+    assert!(catch_unwind(AtomicIdMap::<{ usize::MAX }>::new).is_err());
+}
+
+#[test]
+fn eight_threads_increment_shared_counters() {
+    let direct = Arc::new(AtomicDirectMap::<4>::new());
+    let generational = Arc::new(AtomicIdMap::<4>::new());
+    let start = Arc::new(Barrier::new(8));
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let direct = direct.clone();
+            let generational = generational.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for step in 0..1000 {
+                    let key = step % 4;
+                    direct
+                        .fetch_update(key, |old| Some(Some(old.unwrap_or(0) + 1)))
+                        .unwrap();
+                    generational
+                        .fetch_update(id(key as u32, 1), |old| Some(Some(old.unwrap_or(0) + 1)))
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    for key in 0..4 {
+        assert_eq!(direct.get(key), Some(2000));
+        assert_eq!(generational.get(id(key as u32, 1)), Some(2000));
+    }
+    assert_eq!(direct.len(), 4);
+    assert_eq!(generational.len(), 4);
+}
+
+#[test]
+fn disjoint_inserts_and_removes_have_exact_length() {
+    let direct = Arc::new(AtomicDirectMap::<4>::new());
+    let generational = Arc::new(AtomicIdMap::<4>::new());
+    let workers: Vec<_> = (0..8)
+        .map(|worker| {
+            let direct = direct.clone();
+            let generational = generational.clone();
+            thread::spawn(move || {
+                for offset in 0..1000 {
+                    let key = worker * 1000 + offset;
+                    assert_eq!(direct.insert(key, key as u64), None);
+                    assert_eq!(generational.insert(id(key as u32, 1), key as u32), None);
+                    if offset % 2 == 0 {
+                        assert_eq!(direct.remove(key), Some(key as u64));
+                        assert_eq!(generational.remove(id(key as u32, 1)), Some(key as u32));
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(direct.len(), 4000);
+    assert_eq!(generational.len(), 4000);
+    assert_eq!(direct.iter().count(), direct.len());
+    assert_eq!(generational.iter().count(), generational.len());
+    assert!(
+        direct
+            .iter()
+            .all(|(key, value)| key % 2 == 1 && value == key as u64)
+    );
+    assert!(
+        generational
+            .iter()
+            .all(|(key, value)| key.index() % 2 == 1 && value == key.index())
+    );
+}
+
+#[test]
+fn pending_update_succeeds_across_a_full_word_aba() {
+    // The CAS compares encoded words, so A -> empty -> A and
+    // A -> other generation -> A during a pending update are invisible to
+    // it: the update commits once, against the restored word, and every
+    // intermediate transition keeps its own length delta.
+    let map = AtomicDirectMap::<4>::new();
+    map.insert(1, 5);
+    let mut calls = 0;
+    assert_eq!(
+        map.fetch_update(1, |old| {
+            calls += 1;
+            assert_eq!(old, Some(5));
+            if calls == 1 {
+                assert_eq!(map.remove(1), Some(5));
+                assert_eq!(map.len(), 0);
+                assert_eq!(map.insert(1, 5), None);
+            }
+            Some(Some(6))
+        }),
+        Ok(Some(5))
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(map.get(1), Some(6));
+    assert_eq!(map.len(), 1);
+
+    let map = AtomicIdMap::<4>::new();
+    let key = id(1, 1);
+    let other = id(1, 2);
+    map.insert(key, 5);
+    let mut calls = 0;
+    assert_eq!(
+        map.fetch_update(key, |old| {
+            calls += 1;
+            assert_eq!(old, Some(5));
+            if calls == 1 {
+                assert_eq!(map.replace(other, 9), Some((key, 5)));
+                assert_eq!(map.replace(key, 5), Some((other, 9)));
+            }
+            Some(Some(6))
+        }),
+        Ok(Some(5))
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(map.get(key), Some(6));
+    assert_eq!(map.len(), 1);
+}

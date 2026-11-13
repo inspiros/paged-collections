@@ -31,9 +31,15 @@
 //! reader-writer lock per page. Neighbouring keys contend; guards and entries
 //! must be released before locking the same page again. Ordered traversals
 //! are consistent per page only. Pages are freed only with exclusive access.
+//!
+//! [`AtomicDirectMap`] and [`AtomicIdMap`] provide lock-free shared updates
+//! of one-word values. Prefer them over [`ConcurrentDirectMap`] when values
+//! fit their encodings: `usize` keys with `u64` values below `u64::MAX`, or
+//! generational ids with any `u32` value. Traversals copy values in index order.
 
 mod append;
 mod atomic;
+mod atomic_map;
 mod direct;
 mod free_stack;
 mod hive;
@@ -44,6 +50,7 @@ mod sparse;
 mod spine;
 mod vec;
 
+pub use atomic_map::{AtomicDirectMap, AtomicIdMap};
 pub use direct::{
     ConcurrentDirectMap, DirectMapRef, DirectMapRefMut, Entry, OccupiedEntry, VacantEntry,
 };
@@ -54,6 +61,9 @@ pub use vec::ConcurrentPagedVec;
 
 #[cfg(all(test, loom))]
 mod loom_append;
+
+#[cfg(all(test, loom))]
+mod loom_atomic_map;
 
 #[cfg(all(test, loom))]
 mod loom_direct;
