@@ -6,8 +6,8 @@ use core::iter::FusedIterator;
 
 use super::append::AppendLog;
 use super::atomic::{AtomicU32, Ordering};
-use super::index::{INDEX_CHUNKS, page_number, retry};
-use super::spine::Spine;
+use super::directory::{SharedDirectory, SharedPages};
+use super::index::retry;
 use crate::key::Key;
 use crate::page::{DEFAULT_PAGE, Flat};
 use crate::sparse_map::PagedSparseMap;
@@ -21,8 +21,8 @@ struct IndexPage {
     slots: Box<[AtomicU32]>,
 }
 
-struct Index<const PAGE: usize> {
-    pages: Spine<IndexPage, INDEX_CHUNKS>,
+struct Index<const PAGE: usize, D: SharedDirectory = Flat> {
+    pages: D::Pages<IndexPage>,
 }
 
 /// Only a successful 0 -> RESERVED CAS creates this guard. It restores 0 on
@@ -51,19 +51,19 @@ impl Drop for Reservation<'_> {
     }
 }
 
-impl<const PAGE: usize> Index<PAGE> {
+impl<const PAGE: usize, D: SharedDirectory> Index<PAGE, D> {
     fn new() -> Self {
         assert!(
             PAGE > 0 && PAGE <= isize::MAX as usize / core::mem::size_of::<AtomicU32>(),
             "ConcurrentSparse: invalid page capacity"
         );
         Self {
-            pages: Spine::new(),
+            pages: D::Pages::<IndexPage>::new(),
         }
     }
 
     fn page_number(index: usize) -> usize {
-        page_number::<IndexPage, PAGE>(index)
+        D::Pages::<IndexPage>::page_number::<PAGE>(index)
             .expect("ConcurrentSparse: key index exceeds sparse spine range")
     }
 
@@ -129,22 +129,41 @@ impl<const PAGE: usize> Index<PAGE> {
 /// lookups see every completed insertion. With no insertion in flight the
 /// prefix contains every entry.
 ///
-/// The sparse directory is like [`Flat`]: memory follows the highest page
-/// index, and indices outside its finite spine range panic. At most
+/// The default [`Flat`] directory has O(1) page lookups and memory following
+/// the highest page; indices outside its finite spine range panic.
+/// [`Radix`](crate::page::Radix) accepts any `usize` index, uses directory
+/// memory proportional to installed pages, and looks up pages in O(depth). At most
 /// `u32::MAX - 1` entries fit because one encoding is reserved for writers.
 /// Pages are retained until destruction. Uses only `core` and `alloc`.
-pub struct ConcurrentSparseSet<K: Key, const PAGE: usize = DEFAULT_PAGE> {
-    index: Index<PAGE>,
+///
+/// ```
+/// # #[cfg(feature = "concurrent")] {
+/// use paged_collections::{concurrent::ConcurrentSparseSet, page::Radix};
+/// let set = ConcurrentSparseSet::<usize, 4, Radix>::new();
+/// assert!(set.insert(usize::MAX - 1));
+/// assert!(set.contains(usize::MAX - 1));
+/// # }
+/// ```
+pub struct ConcurrentSparseSet<K: Key, const PAGE: usize = DEFAULT_PAGE, D: SharedDirectory = Flat>
+{
+    index: Index<PAGE, D>,
+    // AppendLog stores keys in UnsafeCell, keeping K invariant.
     dense: AppendLog<K, PAGE>,
 }
 
 // SAFETY: moving the set transfers owned keys; no reference outlives its borrow.
-unsafe impl<K: Key + Send, const PAGE: usize> Send for ConcurrentSparseSet<K, PAGE> {}
+unsafe impl<K: Key + Send, const PAGE: usize, D: SharedDirectory> Send
+    for ConcurrentSparseSet<K, PAGE, D>
+{
+}
 // SAFETY: RESERVED gives each slot one writer, the append log owns distinct
 // writes, and shared lookups acquire publication and expose only shared keys.
-unsafe impl<K: Key + Send + Sync, const PAGE: usize> Sync for ConcurrentSparseSet<K, PAGE> {}
+unsafe impl<K: Key + Send + Sync, const PAGE: usize, D: SharedDirectory> Sync
+    for ConcurrentSparseSet<K, PAGE, D>
+{
+}
 
-impl<K: Key, const PAGE: usize> ConcurrentSparseSet<K, PAGE> {
+impl<K: Key, const PAGE: usize, D: SharedDirectory> ConcurrentSparseSet<K, PAGE, D> {
     /// Number of slots per sparse page and keys per dense page.
     pub const PAGE_SIZE: usize = PAGE;
 
@@ -165,7 +184,7 @@ impl<K: Key, const PAGE: usize> ConcurrentSparseSet<K, PAGE> {
     ///
     /// # Panics
     ///
-    /// Panics at `u32::MAX - 1` entries, for indices outside the sparse spine
+    /// Panics at `u32::MAX - 1` entries, for indices outside the `Flat` spine
     /// range, or on allocation capacity overflow. Allocation can also fail.
     pub fn insert(&self, key: K) -> bool {
         let Ok(owner) = self.index.claim(key.index()) else {
@@ -183,7 +202,7 @@ impl<K: Key, const PAGE: usize> ConcurrentSparseSet<K, PAGE> {
 
     /// Dense position of this key, including a completed insertion beyond
     /// the committed prefix. Positions can change under exclusive removal.
-    /// Panics if the key index exceeds the sparse spine range.
+    /// With `Flat`, panics if the key index exceeds the sparse spine range.
     pub fn position(&self, key: K) -> Option<usize> {
         let pos = self.index.position(key.index())?;
         // The acquired sparse position follows the write and ready bit. get
@@ -195,7 +214,7 @@ impl<K: Key, const PAGE: usize> ConcurrentSparseSet<K, PAGE> {
     }
 
     /// Whether this key is present. Does not wait for an in-flight insertion.
-    /// Panics if the key index exceeds the sparse spine range.
+    /// With `Flat`, panics if the key index exceeds the sparse spine range.
     pub fn contains(&self, key: K) -> bool {
         self.position(key).is_some()
     }
@@ -224,7 +243,7 @@ impl<K: Key, const PAGE: usize> ConcurrentSparseSet<K, PAGE> {
     }
 
     /// Removes a matching key, moving the last key into its position.
-    /// Requires exclusive access. Panics for an out-of-range key index.
+    /// Requires exclusive access. With `Flat`, panics for an out-of-range key index.
     pub fn remove(&mut self, key: K) -> bool {
         let Some(pos) = self.position(key) else {
             return false;
@@ -269,25 +288,29 @@ impl<K: Key, const PAGE: usize> ConcurrentSparseSet<K, PAGE> {
         }
     }
 
-    /// Moves keys into the plain Flat set in dense order, in O(len).
-    pub fn into_inner(self) -> PagedSparseSet<K, PAGE, Flat> {
+    /// Moves keys into the plain set with the same directory in dense order, in O(len).
+    pub fn into_inner(self) -> PagedSparseSet<K, PAGE, D> {
         self.dense.into_inner().into_iter().collect()
     }
 }
 
-impl<K: Key, const PAGE: usize> Default for ConcurrentSparseSet<K, PAGE> {
+impl<K: Key, const PAGE: usize, D: SharedDirectory> Default for ConcurrentSparseSet<K, PAGE, D> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Key + fmt::Debug, const PAGE: usize> fmt::Debug for ConcurrentSparseSet<K, PAGE> {
+impl<K: Key + fmt::Debug, const PAGE: usize, D: SharedDirectory> fmt::Debug
+    for ConcurrentSparseSet<K, PAGE, D>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_set().entries(self.iter()).finish()
     }
 }
 
-impl<K: Key, const PAGE: usize> FromIterator<K> for ConcurrentSparseSet<K, PAGE> {
+impl<K: Key, const PAGE: usize, D: SharedDirectory> FromIterator<K>
+    for ConcurrentSparseSet<K, PAGE, D>
+{
     fn from_iter<I: IntoIterator<Item = K>>(iter: I) -> Self {
         let result = Self::new();
         for key in iter {
@@ -297,17 +320,17 @@ impl<K: Key, const PAGE: usize> FromIterator<K> for ConcurrentSparseSet<K, PAGE>
     }
 }
 
-impl<K: Key, const PAGE: usize> From<PagedSparseSet<K, PAGE, Flat>>
-    for ConcurrentSparseSet<K, PAGE>
+impl<K: Key, const PAGE: usize, D: SharedDirectory> From<PagedSparseSet<K, PAGE, D>>
+    for ConcurrentSparseSet<K, PAGE, D>
 {
-    fn from(inner: PagedSparseSet<K, PAGE, Flat>) -> Self {
+    fn from(inner: PagedSparseSet<K, PAGE, D>) -> Self {
         inner.into_iter().collect()
     }
 }
 
 /// A paged sparse map with insert-only shared access and exclusive editing.
 ///
-/// Slots, prefix snapshots and finite Flat-like indexing follow
+/// Slots, prefix snapshots and directory selection follow
 /// [`ConcurrentSparseSet`]. An occupied slot refuses a new entry, including
 /// another generation. Existing values are never replaced while shared, so
 /// lookups return stable `&V` references without guards. Shared insertion can
@@ -316,22 +339,45 @@ impl<K: Key, const PAGE: usize> From<PagedSparseSet<K, PAGE, Flat>>
 /// Same-slot insertions wait for the winning writer, including its factory.
 /// Factories must not recursively insert into their own reserved slot. `Sync`
 /// requires both `K` and `V` to be `Send + Sync`. Uses `core` and `alloc` only.
-pub struct ConcurrentSparseMap<K: Key, V, const PAGE: usize = DEFAULT_PAGE> {
-    index: Index<PAGE>,
+///
+/// With [`Flat`], memory follows the highest page and lookups cost O(1);
+/// its finite index range can panic. [`Radix`](crate::page::Radix) accepts any
+/// `usize` index, uses directory memory proportional to installed pages, and
+/// looks up pages in O(depth).
+///
+/// ```
+/// # #[cfg(feature = "concurrent")] {
+/// use paged_collections::{concurrent::ConcurrentSparseMap, page::Radix};
+/// let map = ConcurrentSparseMap::<usize, _, 4, Radix>::new();
+/// assert_eq!(map.try_insert(usize::MAX - 1, "wide"), Ok(&"wide"));
+/// assert_eq!(map.get(&(usize::MAX - 1)), Some(&"wide"));
+/// # }
+/// ```
+pub struct ConcurrentSparseMap<
+    K: Key,
+    V,
+    const PAGE: usize = DEFAULT_PAGE,
+    D: SharedDirectory = Flat,
+> {
+    index: Index<PAGE, D>,
+    // AppendLog stores entries in UnsafeCell, keeping K and V invariant.
     dense: AppendLog<(K, V), PAGE>,
 }
 
 // SAFETY: moving the map transfers all owned keys/values and their drops;
 // no reference can outlive the borrow from which it was obtained.
-unsafe impl<K: Key + Send, V: Send, const PAGE: usize> Send for ConcurrentSparseMap<K, V, PAGE> {}
+unsafe impl<K: Key + Send, V: Send, const PAGE: usize, D: SharedDirectory> Send
+    for ConcurrentSparseMap<K, V, PAGE, D>
+{
+}
 // SAFETY: RESERVED uniquely owns each insertion; acquiring sparse publication
 // exposes initialized immutable entries, and removal/mutation is exclusive.
-unsafe impl<K: Key + Send + Sync, V: Send + Sync, const PAGE: usize> Sync
-    for ConcurrentSparseMap<K, V, PAGE>
+unsafe impl<K: Key + Send + Sync, V: Send + Sync, const PAGE: usize, D: SharedDirectory> Sync
+    for ConcurrentSparseMap<K, V, PAGE, D>
 {
 }
 
-impl<K: Key, V, const PAGE: usize> ConcurrentSparseMap<K, V, PAGE> {
+impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentSparseMap<K, V, PAGE, D> {
     /// Number of slots per sparse page and entries per dense page.
     pub const PAGE_SIZE: usize = PAGE;
 
@@ -374,7 +420,7 @@ impl<K: Key, V, const PAGE: usize> ConcurrentSparseMap<K, V, PAGE> {
     ///
     /// # Panics
     ///
-    /// Panics at `u32::MAX - 1` entries, for indices outside the sparse spine
+    /// Panics at `u32::MAX - 1` entries, for indices outside the `Flat` spine
     /// range, or on allocation capacity overflow. Allocation can also fail.
     pub fn try_insert(&self, key: K, value: V) -> Result<&V, (K, V)> {
         match self.index.claim(key.index()) {
@@ -384,14 +430,14 @@ impl<K: Key, V, const PAGE: usize> ConcurrentSparseMap<K, V, PAGE> {
     }
 
     /// The value for this key, including completed appends beyond `len`.
-    /// Does not wait for in-flight insertions. Panics for an out-of-range index.
+    /// Does not wait for in-flight insertions. With `Flat`, panics for an out-of-range index.
     pub fn get(&self, key: &K) -> Option<&V> {
         self.position(key)
             .map(|pos| &self.dense.get(pos).expect("published entry is ready").1)
     }
 
     /// Whether this exact key is present, without waiting for insertions.
-    /// Panics for an out-of-range key index.
+    /// With `Flat`, panics for an out-of-range key index.
     pub fn contains_key(&self, key: &K) -> bool {
         self.position(key).is_some()
     }
@@ -438,14 +484,14 @@ impl<K: Key, V, const PAGE: usize> ConcurrentSparseMap<K, V, PAGE> {
     }
 
     /// Mutable access to a matching key's value under exclusive access.
-    /// Panics for an out-of-range key index.
+    /// With `Flat`, panics for an out-of-range key index.
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         let pos = self.position(key)?;
         self.dense.get_mut(pos).map(|(_, value)| value)
     }
 
     /// Removes a matching entry and returns its value, moving the last entry
-    /// into its position. Panics for an out-of-range key index.
+    /// into its position. With `Flat`, panics for an out-of-range key index.
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let pos = self.position(key)?;
         let last = self.dense.len() - 1;
@@ -495,31 +541,33 @@ impl<K: Key, V, const PAGE: usize> ConcurrentSparseMap<K, V, PAGE> {
         }
     }
 
-    /// Moves entries into a plain Flat map in dense order, in O(len).
+    /// Moves entries into a plain map with the same directory in dense order, in O(len).
     /// Values move without cloning; their addresses can change.
-    pub fn into_inner(self) -> PagedSparseMap<K, V, PAGE, Flat> {
+    pub fn into_inner(self) -> PagedSparseMap<K, V, PAGE, D> {
         self.dense.into_inner().into_iter().collect()
     }
 }
 
-impl<K: Key, V, const PAGE: usize> Default for ConcurrentSparseMap<K, V, PAGE> {
+impl<K: Key, V, const PAGE: usize, D: SharedDirectory> Default
+    for ConcurrentSparseMap<K, V, PAGE, D>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize> fmt::Debug
-    for ConcurrentSparseMap<K, V, PAGE>
+impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: SharedDirectory> fmt::Debug
+    for ConcurrentSparseMap<K, V, PAGE, D>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<K: Key, V, const PAGE: usize> From<PagedSparseMap<K, V, PAGE, Flat>>
-    for ConcurrentSparseMap<K, V, PAGE>
+impl<K: Key, V, const PAGE: usize, D: SharedDirectory> From<PagedSparseMap<K, V, PAGE, D>>
+    for ConcurrentSparseMap<K, V, PAGE, D>
 {
-    fn from(inner: PagedSparseMap<K, V, PAGE, Flat>) -> Self {
+    fn from(inner: PagedSparseMap<K, V, PAGE, D>) -> Self {
         let result = Self::new();
         for (key, value) in inner {
             let _ = result.try_insert(key, value);

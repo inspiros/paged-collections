@@ -12,40 +12,47 @@ use core::num::NonZeroU32;
 use core::ops::{Bound, RangeBounds};
 
 use super::atomic::{AtomicU64, AtomicUsize, Ordering};
-use super::index::{INDEX_CHUNKS, page_number};
-use super::spine::Spine;
+use super::directory::{SharedDirectory, SharedPages};
+use crate::direct_map::PagedDirectMap;
 use crate::id_alloc::Id;
-use crate::page::DEFAULT_PAGE;
+use crate::page::{DEFAULT_PAGE, Flat};
 
 struct Page {
     slots: Box<[AtomicU64]>,
 }
 
-struct Words<const PAGE: usize> {
-    pages: Spine<Page, INDEX_CHUNKS>,
+struct Words<const PAGE: usize, D: SharedDirectory> {
+    pages: D::Pages<Page>,
     len: AtomicUsize,
 }
 
-impl<const PAGE: usize> Words<PAGE> {
+// SAFETY: both sealed directories own their pages, which contain only atomic
+// slots; moving Words transfers ownership and its counter is also atomic.
+unsafe impl<const PAGE: usize, D: SharedDirectory> Send for Words<PAGE, D> {}
+// SAFETY: both sealed directories synchronize page publication; all shared
+// slot and counter accesses are atomic, and page reclamation is exclusive.
+unsafe impl<const PAGE: usize, D: SharedDirectory> Sync for Words<PAGE, D> {}
+
+impl<const PAGE: usize, D: SharedDirectory> Words<PAGE, D> {
     fn new(name: &str) -> Self {
         assert!(
             PAGE > 0 && PAGE <= isize::MAX as usize / mem::size_of::<AtomicU64>(),
             "{name}: invalid page capacity"
         );
         Self {
-            pages: Spine::new(),
+            pages: D::Pages::<Page>::new(),
             len: AtomicUsize::new(0),
         }
     }
 
     fn slot(&self, index: usize) -> Option<&AtomicU64> {
         self.pages
-            .get(page_number::<Page, PAGE>(index)?)
+            .get(D::Pages::<Page>::page_number::<PAGE>(index)?)
             .map(|page| &page.slots[index % PAGE])
     }
 
     fn ensure_slot(&self, index: usize, name: &str) -> &AtomicU64 {
-        let number = page_number::<Page, PAGE>(index)
+        let number = D::Pages::<Page>::page_number::<PAGE>(index)
             .unwrap_or_else(|| panic!("{name}: key index exceeds direct spine range"));
         let page = self.pages.get_or_insert_with(number, || {
             Box::new(Page {
@@ -228,10 +235,13 @@ fn decode_direct(word: u64) -> Option<u64> {
 /// Slot loads use acquire ordering, successful read-modify-write operations
 /// use acquire-release, and failed compare-exchanges use acquire. Values may
 /// publish other data indexed by them. Slot operations are lock-free; page
-/// installation can allocate. The finite, Flat-like spine retains pages until
-/// [`reset`](Self::reset) or destruction. Out-of-range lookups and removals
-/// return absent; inserting outside the spine range panics. `PAGE` must be
-/// nonzero and its atomic slot storage must fit in `isize::MAX` bytes.
+/// installation can allocate. Pages remain until [`reset`](Self::reset) or
+/// destruction. The default [`Flat`] directory has O(1) page lookups and
+/// memory following the highest page; its finite range rejects out-of-range
+/// inserts with a panic and makes lookups/removals return absent.
+/// [`Radix`](crate::page::Radix) accepts any `usize` index, uses directory memory
+/// proportional to installed pages, and looks up pages in O(depth). `PAGE`
+/// must be nonzero and its atomic storage must fit in `isize::MAX` bytes.
 ///
 /// Length uses a wrapping counter updated after each occupancy change. A
 /// removal can be counted before the insertion it undoes; [`len`](Self::len)
@@ -249,11 +259,20 @@ fn decode_direct(word: u64) -> Option<u64> {
 /// assert_eq!(counters.get(7), Some(2));
 /// # }
 /// ```
-pub struct AtomicDirectMap<const PAGE: usize = DEFAULT_PAGE> {
-    words: Words<PAGE>,
+///
+/// ```
+/// # #[cfg(feature = "concurrent")] {
+/// use paged_collections::{concurrent::AtomicDirectMap, page::Radix};
+/// let map = AtomicDirectMap::<4, Radix>::new();
+/// assert_eq!(map.insert(usize::MAX - 1, 42), None);
+/// assert_eq!(map.get(usize::MAX - 1), Some(42));
+/// # }
+/// ```
+pub struct AtomicDirectMap<const PAGE: usize = DEFAULT_PAGE, D: SharedDirectory = Flat> {
+    words: Words<PAGE, D>,
 }
 
-impl<const PAGE: usize> AtomicDirectMap<PAGE> {
+impl<const PAGE: usize, D: SharedDirectory> AtomicDirectMap<PAGE, D> {
     /// Number of atomic slots per page.
     pub const PAGE_SIZE: usize = PAGE;
 
@@ -296,7 +315,7 @@ impl<const PAGE: usize> AtomicDirectMap<PAGE> {
     }
 
     /// Swaps in `value`, returning the previous value.
-    /// Panics if `value == u64::MAX` or the key exceeds the spine range.
+    /// Panics if `value == u64::MAX` or a `Flat` key exceeds the spine range.
     pub fn insert(&self, key: usize, value: u64) -> Option<u64> {
         decode_direct(
             self.words
@@ -305,7 +324,7 @@ impl<const PAGE: usize> AtomicDirectMap<PAGE> {
     }
 
     /// Inserts into an empty slot, or returns `Err(current)`.
-    /// Panics if `value == u64::MAX` or the key exceeds the spine range.
+    /// Panics if `value == u64::MAX` or a `Flat` key exceeds the spine range.
     pub fn try_insert(&self, key: usize, value: u64) -> Result<(), u64> {
         self.words
             .try_insert(key, encode_direct(value), "AtomicDirectMap")
@@ -321,7 +340,7 @@ impl<const PAGE: usize> AtomicDirectMap<PAGE> {
     /// Stores `new` only if the current value equals `current`, without
     /// spurious failure. `None` means empty. Returns `Ok(previous)` on success
     /// or `Err(actual)` on mismatch. A `None` write never allocates a page.
-    /// Panics if `new == Some(u64::MAX)` or an inserting key exceeds the spine
+    /// Panics if `new == Some(u64::MAX)` or an inserting `Flat` key exceeds the spine
     /// range. A nonempty write installs its page before checking `current`.
     pub fn compare_exchange(
         &self,
@@ -343,7 +362,7 @@ impl<const PAGE: usize> AtomicDirectMap<PAGE> {
     /// `Some(None)` removes the entry. Returning `None` stops with `Err(current)`.
     /// The callback may run several times, but only one change is committed.
     /// Removing from an absent page does not allocate it.
-    /// Panics if `f` requests storing `u64::MAX`, or an insertion exceeds the
+    /// Panics if `f` requests storing `u64::MAX`, or a `Flat` insertion exceeds the
     /// spine range. A panicking callback leaves the slot unchanged by this call.
     pub fn fetch_update(
         &self,
@@ -377,6 +396,11 @@ impl<const PAGE: usize> AtomicDirectMap<PAGE> {
     /// Empties the map, retaining pages for reuse. Requires exclusive access.
     pub fn clear(&mut self) {
         self.words.clear();
+    }
+
+    /// Moves entries into a plain map with the same directory in slot order.
+    pub fn into_inner(self) -> PagedDirectMap<usize, u64, PAGE, D> {
+        self.iter().collect()
     }
 
     /// Frees all pages and directory chunks, leaving an empty map.
@@ -448,7 +472,7 @@ fn id_update(id: Id, old: u64, new: Option<u32>) -> u64 {
 /// # }
 /// ```
 pub struct AtomicIdMap<const PAGE: usize = DEFAULT_PAGE> {
-    words: Words<PAGE>,
+    words: Words<PAGE, Flat>,
 }
 
 impl<const PAGE: usize> AtomicIdMap<PAGE> {
@@ -612,21 +636,23 @@ impl<const PAGE: usize> AtomicIdMap<PAGE> {
     }
 }
 
-impl<const PAGE: usize> Default for AtomicDirectMap<PAGE> {
+impl<const PAGE: usize, D: SharedDirectory> Default for AtomicDirectMap<PAGE, D> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const PAGE: usize> fmt::Debug for AtomicDirectMap<PAGE> {
+impl<const PAGE: usize, D: SharedDirectory> fmt::Debug for AtomicDirectMap<PAGE, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<const PAGE: usize> FromIterator<(usize, u64)> for AtomicDirectMap<PAGE> {
-    /// Collects entries, panicking if a value is `u64::MAX` or a key exceeds
-    /// the spine range. Later entries replace earlier values at the same key.
+impl<const PAGE: usize, D: SharedDirectory> FromIterator<(usize, u64)>
+    for AtomicDirectMap<PAGE, D>
+{
+    /// Collects entries, panicking if a value is `u64::MAX` or a `Flat` key
+    /// exceeds the spine range. Later entries replace earlier values at the same key.
     fn from_iter<T: IntoIterator<Item = (usize, u64)>>(iter: T) -> Self {
         let mut map = Self::new();
         map.extend(iter);
@@ -634,13 +660,22 @@ impl<const PAGE: usize> FromIterator<(usize, u64)> for AtomicDirectMap<PAGE> {
     }
 }
 
-impl<const PAGE: usize> Extend<(usize, u64)> for AtomicDirectMap<PAGE> {
-    /// Inserts entries, panicking if a value is `u64::MAX` or a key exceeds
-    /// the spine range. Entries inserted before a panic remain in the map.
+impl<const PAGE: usize, D: SharedDirectory> Extend<(usize, u64)> for AtomicDirectMap<PAGE, D> {
+    /// Inserts entries, panicking if a value is `u64::MAX` or a `Flat` key
+    /// exceeds the spine range. Entries inserted before a panic remain in the map.
     fn extend<T: IntoIterator<Item = (usize, u64)>>(&mut self, iter: T) {
         for (key, value) in iter {
             self.insert(key, value);
         }
+    }
+}
+
+impl<const PAGE: usize, D: SharedDirectory> From<PagedDirectMap<usize, u64, PAGE, D>>
+    for AtomicDirectMap<PAGE, D>
+{
+    /// Panics if a value is `u64::MAX` or a `Flat` index exceeds the spine range.
+    fn from(map: PagedDirectMap<usize, u64, PAGE, D>) -> Self {
+        map.into_iter().collect()
     }
 }
 

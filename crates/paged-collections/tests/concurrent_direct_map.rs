@@ -13,143 +13,192 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use paged_collections::concurrent::{ConcurrentDirectMap, Entry};
+use paged_collections::concurrent::{ConcurrentDirectMap, Entry, SharedDirectory};
 use paged_collections::direct_map::{Entry as PlainEntry, PagedDirectMap};
 use paged_collections::key::Key;
+use paged_collections::page::{Flat, Radix};
 use proptest::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Gen {
-    index: u8,
+    index: usize,
     generation: u8,
 }
 
 impl Key for Gen {
     fn index(self) -> usize {
-        usize::from(self.index)
+        self.index
     }
 }
 
-fn contents<K: Key, V: Clone, const PAGE: usize>(
-    map: &ConcurrentDirectMap<K, V, PAGE>,
+fn contents<K: Key, V: Clone, const PAGE: usize, D: SharedDirectory>(
+    map: &ConcurrentDirectMap<K, V, PAGE, D>,
 ) -> Vec<(K, V)> {
     let mut entries = Vec::new();
     map.for_each(|&key, value| entries.push((key, value.clone())));
     entries
 }
 
+fn sequential_model_for<D: SharedDirectory>(
+    ops: Vec<(u8, usize, u8, i16)>,
+) -> Result<(), TestCaseError> {
+    let mut map = ConcurrentDirectMap::<Gen, i16, 4, D>::new();
+    let mut plain = PagedDirectMap::<Gen, i16, 4, D>::new();
+    for (op, index, generation, value) in ops {
+        let key = Gen { index, generation };
+        match op {
+            0 => prop_assert_eq!(map.insert(key, value), plain.insert(key, value)),
+            1 => prop_assert_eq!(map.replace(key, value), plain.replace(key, value)),
+            2 => prop_assert_eq!(
+                map.try_insert(key, value),
+                plain.try_insert(key, value).map(|_| ())
+            ),
+            3 => prop_assert_eq!(map.remove(key), plain.remove(key)),
+            4 => prop_assert_eq!(
+                map.remove_occupant(key.index()),
+                plain.remove_occupant(key.index())
+            ),
+            5 => {
+                let mut actual = map.get_or_insert_with(key, || value);
+                let expected = plain.get_or_insert_with(key, || value);
+                *actual = actual.wrapping_add(1);
+                *expected = expected.wrapping_add(1);
+                prop_assert_eq!(*actual, *expected);
+                prop_assert_eq!(*actual.key(), key);
+            }
+            6 => prop_assert_eq!(
+                *map.entry(key).or_insert(value),
+                *plain.entry(key).or_insert(value)
+            ),
+            7 => {
+                let mut actual = map
+                    .entry(key)
+                    .and_modify(|v| *v = v.wrapping_add(1))
+                    .or_insert_with_key(|k| k.index as i16);
+                let expected = plain
+                    .entry(key)
+                    .and_modify(|v| *v = v.wrapping_add(1))
+                    .or_insert_with_key(|k| k.index as i16);
+                *actual = actual.wrapping_sub(1);
+                *expected = expected.wrapping_sub(1);
+                prop_assert_eq!(*actual, *expected);
+            }
+            8 => match (map.entry(key), plain.entry(key)) {
+                (Entry::Occupied(mut a), PlainEntry::Occupied(mut b)) => {
+                    prop_assert_eq!(a.key(), b.key());
+                    prop_assert_eq!(a.get(), b.get());
+                    *a.get_mut() = a.get().wrapping_add(1);
+                    *b.get_mut() = b.get().wrapping_add(1);
+                    prop_assert_eq!(a.insert(value), b.insert(value));
+                    if value % 2 == 0 {
+                        prop_assert_eq!(a.remove_entry(), b.remove_entry());
+                    } else {
+                        prop_assert_eq!(a.remove(), b.remove());
+                    }
+                }
+                (Entry::Vacant(a), PlainEntry::Vacant(b)) => {
+                    prop_assert_eq!(a.key(), b.key());
+                    prop_assert_eq!(a.occupant(), b.occupant());
+                    prop_assert_eq!(*a.insert(value), *b.insert(value));
+                }
+                _ => prop_assert!(false, "entry occupancy differs"),
+            },
+            9 => match (map.entry(key), plain.entry(key)) {
+                (Entry::Occupied(a), PlainEntry::Occupied(b)) => {
+                    prop_assert_eq!(*a.into_ref(), *b.into_mut());
+                }
+                (Entry::Vacant(a), PlainEntry::Vacant(b)) => {
+                    prop_assert_eq!(a.occupant(), b.occupant());
+                    prop_assert_eq!(a.into_key(), b.into_key());
+                }
+                _ => prop_assert!(false, "entry occupancy differs"),
+            },
+            10 => {
+                let keep = |k: &Gen, v: &mut i16| {
+                    *v = v.wrapping_add(value);
+                    k.index % 3 != index % 3
+                };
+                map.retain(keep);
+                plain.retain(keep);
+            }
+            11 => {
+                if let Some(mut v) = map.get_mut(key) {
+                    *v = v.wrapping_add(value);
+                }
+                if let Some(v) = plain.get_mut(key) {
+                    *v = v.wrapping_add(value);
+                }
+            }
+            12 => prop_assert_eq!(map.remove_entry(key), plain.remove_entry(key)),
+            13 => prop_assert_eq!(*map.entry(key).or_default(), *plain.entry(key).or_default()),
+            14 => prop_assert_eq!(
+                *map.entry(key).or_insert_with(|| value),
+                *plain.entry(key).or_insert_with(|| value)
+            ),
+            15 => {
+                let actual = map.entry(key);
+                let expected = plain.entry(key);
+                prop_assert_eq!(actual.key(), expected.key());
+            }
+            16 => {
+                for (_, v) in map.iter_mut() {
+                    *v = v.wrapping_add(value);
+                }
+                for (_, v) in plain.iter_mut() {
+                    *v = v.wrapping_add(value);
+                }
+            }
+            17 => prop_assert_eq!(map.with(key, |v| *v), plain.get(key).copied()),
+            18 => {
+                map.clear();
+                plain.clear();
+            }
+            _ => {
+                map.reset();
+                plain.reset();
+            }
+        }
+        let expected: Vec<_> = plain.iter().map(|(&k, &v)| (k, v)).collect();
+        prop_assert_eq!(contents(&map), expected);
+        prop_assert_eq!(map.len(), plain.len());
+        prop_assert_eq!(map.is_empty(), plain.is_empty());
+        prop_assert_eq!(map.contains_key(key), plain.contains_key(key));
+        prop_assert_eq!(map.get_cloned(key), plain.get(key).copied());
+        let mut actual_range = Vec::new();
+        let bounds = (
+            Bound::Excluded(key),
+            Bound::Included(Gen {
+                index: 20,
+                generation: 0,
+            }),
+        );
+        map.range_for_each(bounds, |&k, &v| actual_range.push((k, v)));
+        let expected_range: Vec<_> = plain.range(bounds).map(|(&k, &v)| (k, v)).collect();
+        prop_assert_eq!(actual_range, expected_range);
+    }
+    let expected: Vec<_> = plain.into_iter().collect();
+    let plain = map.into_inner();
+    prop_assert_eq!(
+        &plain.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
+        &expected
+    );
+    let map = ConcurrentDirectMap::from(plain);
+    prop_assert_eq!(contents(&map), expected);
+    Ok(())
+}
+
 proptest! {
     #[test]
     fn sequential_model(ops in prop::collection::vec((0u8..20, 0u8..24, 0u8..3, any::<i16>()), 0..100)) {
-        let mut map = ConcurrentDirectMap::<Gen, i16, 4>::new();
-        let mut plain = PagedDirectMap::<Gen, i16, 4>::new();
-        for (op, index, generation, value) in ops {
-            let key = Gen { index, generation };
-            match op {
-                0 => prop_assert_eq!(map.insert(key, value), plain.insert(key, value)),
-                1 => prop_assert_eq!(map.replace(key, value), plain.replace(key, value)),
-                2 => prop_assert_eq!(map.try_insert(key, value), plain.try_insert(key, value).map(|_| ())),
-                3 => prop_assert_eq!(map.remove(key), plain.remove(key)),
-                4 => prop_assert_eq!(map.remove_occupant(key.index()), plain.remove_occupant(key.index())),
-                5 => {
-                    let mut actual = map.get_or_insert_with(key, || value);
-                    let expected = plain.get_or_insert_with(key, || value);
-                    *actual = actual.wrapping_add(1);
-                    *expected = expected.wrapping_add(1);
-                    prop_assert_eq!(*actual, *expected);
-                    prop_assert_eq!(*actual.key(), key);
-                }
-                6 => prop_assert_eq!(*map.entry(key).or_insert(value), *plain.entry(key).or_insert(value)),
-                7 => {
-                    let mut actual = map.entry(key)
-                        .and_modify(|v| *v = v.wrapping_add(1))
-                        .or_insert_with_key(|k| i16::from(k.index));
-                    let expected = plain.entry(key)
-                        .and_modify(|v| *v = v.wrapping_add(1))
-                        .or_insert_with_key(|k| i16::from(k.index));
-                    *actual = actual.wrapping_sub(1);
-                    *expected = expected.wrapping_sub(1);
-                    prop_assert_eq!(*actual, *expected);
-                }
-                8 => match (map.entry(key), plain.entry(key)) {
-                    (Entry::Occupied(mut a), PlainEntry::Occupied(mut b)) => {
-                        prop_assert_eq!(a.key(), b.key());
-                        prop_assert_eq!(a.get(), b.get());
-                        *a.get_mut() = a.get().wrapping_add(1);
-                        *b.get_mut() = b.get().wrapping_add(1);
-                        prop_assert_eq!(a.insert(value), b.insert(value));
-                        if value % 2 == 0 {
-                            prop_assert_eq!(a.remove_entry(), b.remove_entry());
-                        } else {
-                            prop_assert_eq!(a.remove(), b.remove());
-                        }
-                    }
-                    (Entry::Vacant(a), PlainEntry::Vacant(b)) => {
-                        prop_assert_eq!(a.key(), b.key());
-                        prop_assert_eq!(a.occupant(), b.occupant());
-                        prop_assert_eq!(*a.insert(value), *b.insert(value));
-                    }
-                    _ => prop_assert!(false, "entry occupancy differs"),
-                },
-                9 => match (map.entry(key), plain.entry(key)) {
-                    (Entry::Occupied(a), PlainEntry::Occupied(b)) => {
-                        prop_assert_eq!(*a.into_ref(), *b.into_mut());
-                    }
-                    (Entry::Vacant(a), PlainEntry::Vacant(b)) => {
-                        prop_assert_eq!(a.occupant(), b.occupant());
-                        prop_assert_eq!(a.into_key(), b.into_key());
-                    }
-                    _ => prop_assert!(false, "entry occupancy differs"),
-                },
-                10 => {
-                    let keep = |k: &Gen, v: &mut i16| {
-                        *v = v.wrapping_add(value);
-                        k.index % 3 != index % 3
-                    };
-                    map.retain(keep);
-                    plain.retain(keep);
-                }
-                11 => {
-                    if let Some(mut v) = map.get_mut(key) {
-                        *v = v.wrapping_add(value);
-                    }
-                    if let Some(v) = plain.get_mut(key) {
-                        *v = v.wrapping_add(value);
-                    }
-                }
-                12 => prop_assert_eq!(map.remove_entry(key), plain.remove_entry(key)),
-                13 => prop_assert_eq!(*map.entry(key).or_default(), *plain.entry(key).or_default()),
-                14 => prop_assert_eq!(*map.entry(key).or_insert_with(|| value), *plain.entry(key).or_insert_with(|| value)),
-                15 => {
-                    let actual = map.entry(key);
-                    let expected = plain.entry(key);
-                    prop_assert_eq!(actual.key(), expected.key());
-                }
-                16 => {
-                    for (_, v) in map.iter_mut() { *v = v.wrapping_add(value); }
-                    for (_, v) in plain.iter_mut() { *v = v.wrapping_add(value); }
-                }
-                17 => prop_assert_eq!(map.with(key, |v| *v), plain.get(key).copied()),
-                18 => { map.clear(); plain.clear(); }
-                _ => { map.reset(); plain.reset(); }
-            }
-            let expected: Vec<_> = plain.iter().map(|(&k, &v)| (k, v)).collect();
-            prop_assert_eq!(contents(&map), expected);
-            prop_assert_eq!(map.len(), plain.len());
-            prop_assert_eq!(map.is_empty(), plain.is_empty());
-            prop_assert_eq!(map.contains_key(key), plain.contains_key(key));
-            prop_assert_eq!(map.get_cloned(key), plain.get(key).copied());
-            let mut actual_range = Vec::new();
-            let bounds = (Bound::Excluded(key), Bound::Included(Gen { index: 20, generation: 0 }));
-            map.range_for_each(bounds, |&k, &v| actual_range.push((k, v)));
-            let expected_range: Vec<_> = plain.range(bounds).map(|(&k, &v)| (k, v)).collect();
-            prop_assert_eq!(actual_range, expected_range);
-        }
-        let expected: Vec<_> = plain.into_iter().collect();
-        let plain = map.into_inner();
-        prop_assert_eq!(&plain.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(), &expected);
-        let map = ConcurrentDirectMap::from(plain);
-        prop_assert_eq!(contents(&map), expected);
+        sequential_model_for::<Flat>(ops.into_iter().map(|(op, i, g, v)| (op, usize::from(i), g, v)).collect())?;
+    }
+
+    #[test]
+    fn radix_sequential_model(ops in prop::collection::vec(
+        (0u8..20, prop_oneof![0usize..24, (0usize..24).prop_map(|n| usize::MAX - n), any::<usize>()], 0u8..3, any::<i16>()),
+        0..100,
+    )) {
+        sequential_model_for::<Radix>(ops)?;
     }
 }
 
@@ -463,4 +512,72 @@ fn holding_one_page_does_not_lock_another() {
     *first = 1;
     assert_eq!(*second, 4);
     assert_eq!(*first, 1);
+}
+
+#[test]
+fn flat_rejects_wide_indices_while_radix_accepts_them() {
+    let flat = ConcurrentDirectMap::<usize, usize, 3>::new();
+    assert_eq!(flat.get_cloned(usize::MAX), None);
+    assert_eq!(flat.remove(usize::MAX), None);
+    assert!(catch_unwind(AssertUnwindSafe(|| flat.insert(usize::MAX, 42))).is_err());
+    let map = ConcurrentDirectMap::<usize, usize, 3, Radix>::new();
+    assert_eq!(map.insert(usize::MAX, 42), None);
+    assert_eq!(map.get_cloned(usize::MAX), Some(42));
+    let mut seen = Vec::new();
+    map.range_for_each(usize::MAX..=usize::MAX, |&k, &v| seen.push((k, v)));
+    assert_eq!(seen, [(usize::MAX, 42)]);
+    let plain: PagedDirectMap<usize, usize, 3, Radix> = map.into_inner();
+    let mut map = ConcurrentDirectMap::from(plain);
+    assert_eq!(map.remove(usize::MAX), Some(42));
+    map.reset();
+    assert_eq!(map.allocated_pages(), 0);
+}
+
+#[test]
+fn radix_scoped_insertions_span_the_index_space() {
+    let map = ConcurrentDirectMap::<usize, usize, 3, Radix>::new();
+    let keys: Vec<_> = (0..usize::BITS)
+        .map(|bit| 1usize << bit)
+        .chain([0, usize::MAX - 1, usize::MAX])
+        .collect();
+    thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for &key in &keys {
+                    map.insert(key, key);
+                    assert_eq!(map.get_cloned(key), Some(key));
+                }
+            });
+        }
+    });
+    assert_eq!(map.len(), keys.len());
+    let map = ConcurrentDirectMap::from(map.into_inner());
+    for key in keys {
+        assert_eq!(map.get_cloned(key), Some(key));
+    }
+}
+
+#[test]
+fn auto_traits_need_only_shared_directory() {
+    fn check<D: SharedDirectory>() {
+        fn send<T: Send>() {}
+        fn sync<T: Sync>() {}
+        send::<ConcurrentDirectMap<usize, std::cell::Cell<u8>, 2, D>>();
+        sync::<ConcurrentDirectMap<usize, u8, 2, D>>();
+        trait AmbiguousSend<A> {
+            fn check() {}
+        }
+        impl<T> AmbiguousSend<()> for T {}
+        impl<T: Send> AmbiguousSend<u8> for T {}
+        let _ = <ConcurrentDirectMap<usize, std::rc::Rc<u8>, 2, D> as AmbiguousSend<_>>::check;
+        trait AmbiguousSync<A> {
+            fn check() {}
+        }
+        impl<T> AmbiguousSync<()> for T {}
+        impl<T: Sync> AmbiguousSync<u8> for T {}
+        let _ = <ConcurrentDirectMap<usize, std::cell::Cell<u8>, 2, D> as AmbiguousSync<_>>::check;
+        let _ = <ConcurrentDirectMap<usize, std::sync::MutexGuard<'static, ()>, 2, D> as AmbiguousSync<_>>::check;
+    }
+    check::<Flat>();
+    check::<Radix>();
 }

@@ -14,9 +14,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use paged_collections::concurrent::{AtomicDirectMap, AtomicIdMap};
+use paged_collections::concurrent::{AtomicDirectMap, AtomicIdMap, SharedDirectory};
 use paged_collections::direct_map::PagedDirectMap;
 use paged_collections::id_alloc::Id;
+use paged_collections::page::{Flat, Radix};
 use proptest::prelude::*;
 
 const MAX_VALUE: u64 = AtomicDirectMap::<4>::MAX_VALUE;
@@ -51,6 +52,91 @@ fn id_update(old: Option<u32>, action: u8, value: u32) -> Option<Option<u32>> {
     }
 }
 
+fn direct_model<D: SharedDirectory>(
+    ops: Vec<(u8, usize, u64, u8, bool)>,
+) -> Result<(), TestCaseError> {
+    let map = AtomicDirectMap::<4, D>::new();
+    let mut model = BTreeMap::new();
+    for (op, key, value, action, store) in ops {
+        let old = model.get(&key).copied();
+        match op {
+            0 => prop_assert_eq!(map.get(key), old),
+            1 => prop_assert_eq!(map.insert(key, value), model.insert(key, value)),
+            2 => {
+                let expected = match old {
+                    Some(current) => Err(current),
+                    None => {
+                        model.insert(key, value);
+                        Ok(())
+                    }
+                };
+                prop_assert_eq!(map.try_insert(key, value), expected);
+            }
+            3 => prop_assert_eq!(map.remove(key), model.remove(&key)),
+            4 => {
+                let current = match action {
+                    0 => None,
+                    1 => Some(value),
+                    _ => old,
+                };
+                let new = store.then_some(value);
+                let expected = if old == current {
+                    match new {
+                        Some(value) => {
+                            model.insert(key, value);
+                        }
+                        None => {
+                            model.remove(&key);
+                        }
+                    }
+                    Ok(old)
+                } else {
+                    Err(old)
+                };
+                prop_assert_eq!(map.compare_exchange(key, current, new), expected);
+            }
+            _ => {
+                let expected = match direct_update(old, action, value) {
+                    None => Err(old),
+                    Some(new) => {
+                        match new {
+                            Some(value) => {
+                                model.insert(key, value);
+                            }
+                            None => {
+                                model.remove(&key);
+                            }
+                        }
+                        Ok(old)
+                    }
+                };
+                prop_assert_eq!(
+                    map.fetch_update(key, |v| direct_update(v, action, value)),
+                    expected
+                );
+            }
+        }
+        let expected: Vec<_> = model.iter().map(|(&k, &v)| (k, v)).collect();
+        prop_assert_eq!(map.iter().collect::<Vec<_>>(), expected);
+        prop_assert_eq!(map.len(), model.len());
+        prop_assert_eq!(map.is_empty(), model.is_empty());
+        prop_assert_eq!(map.contains_key(key), model.contains_key(&key));
+        let expected: Vec<_> = model.range(5..=25).map(|(&k, &v)| (k, v)).collect();
+        prop_assert_eq!(map.range(5..=25).collect::<Vec<_>>(), expected);
+    }
+    let expected: Vec<_> = model.into_iter().collect();
+    let plain: PagedDirectMap<usize, u64, 4, D> = map.into_inner();
+    prop_assert!(
+        plain
+            .iter()
+            .map(|(&k, &v)| (k, v))
+            .eq(expected.iter().copied())
+    );
+    let map = AtomicDirectMap::from(plain);
+    prop_assert_eq!(map.iter().collect::<Vec<_>>(), expected);
+    Ok(())
+}
+
 proptest! {
     #[test]
     fn direct_sequential_model(
@@ -59,61 +145,17 @@ proptest! {
             0..200,
         ),
     ) {
-        let map = AtomicDirectMap::<4>::new();
-        let mut model = BTreeMap::new();
-        for (op, key, value, action, store) in ops {
-            let old = model.get(&key).copied();
-            match op {
-                0 => prop_assert_eq!(map.get(key), old),
-                1 => prop_assert_eq!(map.insert(key, value), model.insert(key, value)),
-                2 => {
-                    let expected = match old {
-                        Some(current) => Err(current),
-                        None => { model.insert(key, value); Ok(()) }
-                    };
-                    prop_assert_eq!(map.try_insert(key, value), expected);
-                }
-                3 => prop_assert_eq!(map.remove(key), model.remove(&key)),
-                4 => {
-                    let current = match action {
-                        0 => None,
-                        1 => Some(value),
-                        _ => old,
-                    };
-                    let new = store.then_some(value);
-                    let expected = if old == current {
-                        match new {
-                            Some(value) => { model.insert(key, value); }
-                            None => { model.remove(&key); }
-                        }
-                        Ok(old)
-                    } else {
-                        Err(old)
-                    };
-                    prop_assert_eq!(map.compare_exchange(key, current, new), expected);
-                }
-                _ => {
-                    let expected = match direct_update(old, action, value) {
-                        None => Err(old),
-                        Some(new) => {
-                            match new {
-                                Some(value) => { model.insert(key, value); }
-                                None => { model.remove(&key); }
-                            }
-                            Ok(old)
-                        }
-                    };
-                    prop_assert_eq!(map.fetch_update(key, |v| direct_update(v, action, value)), expected);
-                }
-            }
-            let expected: Vec<_> = model.iter().map(|(&k, &v)| (k, v)).collect();
-            prop_assert_eq!(map.iter().collect::<Vec<_>>(), expected);
-            prop_assert_eq!(map.len(), model.len());
-            prop_assert_eq!(map.is_empty(), model.is_empty());
-            prop_assert_eq!(map.contains_key(key), model.contains_key(&key));
-            let expected: Vec<_> = model.range(5..=25).map(|(&k, &v)| (k, v)).collect();
-            prop_assert_eq!(map.range(5..=25).collect::<Vec<_>>(), expected);
-        }
+        direct_model::<Flat>(ops)?;
+    }
+
+    #[test]
+    fn radix_direct_sequential_model(
+        ops in prop::collection::vec(
+            (0u8..6, prop_oneof![0usize..40, (0usize..40).prop_map(|n| usize::MAX - n), any::<usize>()], direct_value(), 0u8..4, any::<bool>()),
+            0..200,
+        ),
+    ) {
+        direct_model::<Radix>(ops)?;
     }
 
     #[test]
@@ -188,6 +230,11 @@ proptest! {
 #[test]
 fn send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
+    fn directories<D: SharedDirectory>() {
+        assert_send_sync::<AtomicDirectMap<3, D>>();
+    }
+    directories::<Flat>();
+    directories::<Radix>();
     assert_send_sync::<AtomicDirectMap>();
     assert_send_sync::<AtomicIdMap>();
 }
@@ -538,4 +585,62 @@ fn pending_update_succeeds_across_a_full_word_aba() {
     assert_eq!(calls, 1);
     assert_eq!(map.get(key), Some(6));
     assert_eq!(map.len(), 1);
+}
+
+#[test]
+fn flat_rejects_wide_indices_while_radix_accepts_them() {
+    let flat = AtomicDirectMap::<3>::new();
+    assert_eq!(flat.get(usize::MAX), None);
+    assert_eq!(flat.remove(usize::MAX), None);
+    assert!(catch_unwind(AssertUnwindSafe(|| flat.insert(usize::MAX, 42))).is_err());
+    let mut map = AtomicDirectMap::<3, Radix>::new();
+    assert_eq!(map.insert(usize::MAX, 42), None);
+    assert_eq!(map.get(usize::MAX), Some(42));
+    assert_eq!(
+        map.range(usize::MAX..=usize::MAX).collect::<Vec<_>>(),
+        [(usize::MAX, 42)]
+    );
+    assert_eq!(
+        map.range((Bound::Excluded(usize::MAX), Bound::Unbounded))
+            .next(),
+        None
+    );
+    assert_eq!(
+        map.compare_exchange(usize::MAX, Some(42), Some(43)),
+        Ok(Some(42))
+    );
+    let plain: PagedDirectMap<usize, u64, 3, Radix> = map.into_inner();
+    map = AtomicDirectMap::from(plain);
+    assert_eq!(map.remove(usize::MAX), Some(43));
+    map.insert(usize::MAX - 1, 7);
+    map.clear();
+    assert!(map.is_empty());
+    assert_eq!(map.iter().next(), None);
+    map.reset();
+    assert_eq!(map.allocated_pages(), 0);
+}
+
+#[test]
+fn radix_scoped_insertions_span_the_index_space() {
+    let map = AtomicDirectMap::<3, Radix>::new();
+    let keys: Vec<_> = (0..usize::BITS)
+        .map(|bit| 1usize << bit)
+        .chain([0, usize::MAX - 1, usize::MAX])
+        .collect();
+    thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for &key in &keys {
+                    let value = (key as u64) >> 1;
+                    map.insert(key, value);
+                    assert_eq!(map.get(key), Some(value));
+                }
+            });
+        }
+    });
+    assert_eq!(map.len(), keys.len());
+    let map = AtomicDirectMap::from(map.into_inner());
+    for key in keys {
+        assert_eq!(map.get(key), Some((key as u64) >> 1));
+    }
 }

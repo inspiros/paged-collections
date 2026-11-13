@@ -198,3 +198,35 @@ fn reader_guard_excludes_page_writer() {
         assert_eq!(map.len(), 2);
     });
 }
+
+#[test]
+fn radix_split_races_install_and_reader() {
+    // With loom DIGIT = 2, pages 0 and 16 seed a root at shift 4.
+    // Pages 1 and 2 both reach leaf 0: one splits it while the other may
+    // still be preparing its install. Failed CAS must descend the new branch.
+    // The main-thread yield lets loom schedule those splits before/during reads.
+    model(|| {
+        let map = Arc::new(ConcurrentDirectMap::<usize, usize, 1, crate::page::Radix>::new());
+        map.insert(0, 100);
+        map.insert(16, 116);
+        let first = map.clone();
+        let a = thread::spawn(move || assert_eq!(first.insert(1, 101), None));
+        let second = map.clone();
+        let b = thread::spawn(move || assert_eq!(second.insert(2, 102), None));
+        thread::yield_now();
+        assert_eq!(map.get_cloned(0), Some(100));
+        for key in [1, 2] {
+            if let Some(value) = map.get_cloned(key) {
+                assert_eq!(value, 100 + key);
+                assert_eq!(map.get_cloned(key), Some(value));
+            }
+        }
+        a.join().unwrap();
+        b.join().unwrap();
+        for key in [0, 1, 2, 16] {
+            assert_eq!(map.get_cloned(key), Some(100 + key));
+        }
+        assert_eq!(map.len(), 4);
+        assert_eq!(map.allocated_pages(), 4);
+    });
+}

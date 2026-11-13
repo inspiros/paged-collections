@@ -14,7 +14,6 @@ const DIGIT: u32 = 2;
 const FANOUT: usize = 1 << DIGIT;
 const MASK: usize = FANOUT - 1;
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RadixSpine<P> {
     root: AtomicPtr<()>,
     owner: PhantomData<Box<P>>,
@@ -64,7 +63,6 @@ unsafe impl<P: Send> Send for RadixSpine<P> {}
 // are shared as &P, and a losing installer may drop its own unpublished P.
 unsafe impl<P: Send + Sync> Sync for RadixSpine<P> {}
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<P> RadixSpine<P> {
     #[cfg(not(loom))]
     pub(crate) const fn new() -> Self {

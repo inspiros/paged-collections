@@ -6,9 +6,8 @@ use core::mem;
 use core::ops::{Bound, Deref, DerefMut, RangeBounds};
 
 use super::atomic::{AtomicUsize, Ordering};
-use super::index::{INDEX_CHUNKS, page_number};
+use super::directory::{SharedDirectory, SharedPages};
 use super::lock::{ReadGuard, RwLock, WriteGuard};
-use super::spine::Spine;
 use crate::direct_map::PagedDirectMap;
 use crate::key::Key;
 use crate::page::{DEFAULT_PAGE, Flat};
@@ -46,9 +45,12 @@ impl<K, V> PageData<K, V> {
 ///
 /// Values live at [`Key::index`]. Neighbouring keys on the same page contend;
 /// operations on different pages lock independently. Pages remain allocated
-/// until [`reset`](Self::reset) or destruction. The directory is [`Flat`]-like
-/// and has a finite range: inserting outside it panics, while lookups and
-/// removals return absent. `PAGE` must be nonzero.
+/// until [`reset`](Self::reset) or destruction. The default [`Flat`] directory
+/// has O(1) page lookups and memory following the highest page. Its finite
+/// range makes out-of-range insertions panic; lookups and removals return
+/// absent. [`Radix`](crate::page::Radix) accepts any `usize` index, uses directory
+/// memory proportional to installed pages, and looks up pages in O(depth).
+/// `PAGE` must be nonzero.
 ///
 /// Holding a guard or entry and calling any method that locks the same page
 /// from the same thread deadlocks (or panics on `std`). This also applies to
@@ -65,9 +67,37 @@ impl<K, V> PageData<K, V> {
 /// Length is exact when no write is in flight. The `no_std` spin lock permits
 /// writer starvation; the `std` lock ignores poisoning because mutations keep
 /// slots and counts valid even when user code panics.
-pub struct ConcurrentDirectMap<K: Key, V, const PAGE: usize = DEFAULT_PAGE> {
-    pages: Spine<Page<K, V>, INDEX_CHUNKS>,
+///
+/// ```
+/// # #[cfg(feature = "concurrent")] {
+/// use paged_collections::{concurrent::ConcurrentDirectMap, page::Radix};
+/// let map = ConcurrentDirectMap::<usize, _, 4, Radix>::new();
+/// assert_eq!(map.insert(usize::MAX - 1, "wide"), None);
+/// assert_eq!(map.get_cloned(usize::MAX - 1), Some("wide"));
+/// # }
+/// ```
+pub struct ConcurrentDirectMap<
+    K: Key,
+    V,
+    const PAGE: usize = DEFAULT_PAGE,
+    D: SharedDirectory = Flat,
+> {
+    // A GAT projection is invariant in K and V, as shared insertion requires.
+    pages: D::Pages<Page<K, V>>,
     len: AtomicUsize,
+}
+
+// SAFETY: both sealed directories own stable pages and are Send when their
+// pages are Send. Moving the map transfers its keys, values and page locks.
+unsafe impl<K: Key + Send, V: Send, const PAGE: usize, D: SharedDirectory> Send
+    for ConcurrentDirectMap<K, V, PAGE, D>
+{
+}
+// SAFETY: both sealed directories publish pages safely; each page lock
+// synchronizes access to its keys and values. Shared access cannot free pages.
+unsafe impl<K: Key + Send + Sync, V: Send + Sync, const PAGE: usize, D: SharedDirectory> Sync
+    for ConcurrentDirectMap<K, V, PAGE, D>
+{
 }
 
 /// A value reference holding its page's read lock.
@@ -109,7 +139,7 @@ pub struct VacantEntry<'a, K, V> {
     len: &'a AtomicUsize,
 }
 
-impl<K: Key, V, const PAGE: usize> ConcurrentDirectMap<K, V, PAGE> {
+impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V, PAGE, D> {
     /// Number of slots protected by each page lock.
     pub const PAGE_SIZE: usize = PAGE;
 
@@ -124,7 +154,7 @@ impl<K: Key, V, const PAGE: usize> ConcurrentDirectMap<K, V, PAGE> {
             "ConcurrentDirectMap: invalid page capacity"
         );
         Self {
-            pages: Spine::new(),
+            pages: D::Pages::<Page<K, V>>::new(),
             len: AtomicUsize::new(0),
         }
     }
@@ -146,11 +176,12 @@ impl<K: Key, V, const PAGE: usize> ConcurrentDirectMap<K, V, PAGE> {
     }
 
     fn page(&self, index: usize) -> Option<&Page<K, V>> {
-        self.pages.get(page_number::<Page<K, V>, PAGE>(index)?)
+        self.pages
+            .get(D::Pages::<Page<K, V>>::page_number::<PAGE>(index)?)
     }
 
     fn ensure_page(&self, index: usize) -> &Page<K, V> {
-        let number = page_number::<Page<K, V>, PAGE>(index)
+        let number = D::Pages::<Page<K, V>>::page_number::<PAGE>(index)
             .expect("ConcurrentDirectMap: key index exceeds direct spine range");
         self.pages.get_or_insert_with(number, || {
             Box::new(Page {
@@ -206,7 +237,7 @@ impl<K: Key, V, const PAGE: usize> ConcurrentDirectMap<K, V, PAGE> {
 
     /// Inserts a value, returning the old value from this slot, if any.
     /// Keeps an equal stored key; evicts a different generation.
-    /// Panics for indices outside the spine range or allocation overflow.
+    /// Panics for indices outside the Flat spine range or allocation overflow.
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let index = key.index();
         let mut guard = self.ensure_page(index).data.write();
@@ -225,7 +256,7 @@ impl<K: Key, V, const PAGE: usize> ConcurrentDirectMap<K, V, PAGE> {
     }
 
     /// Replaces this slot, always storing `key`, and returns its previous pair.
-    /// Evicts another generation. Panics for an out-of-range insertion.
+    /// Evicts another generation. With `Flat`, panics for an out-of-range insertion.
     pub fn replace(&self, key: K, value: V) -> Option<(K, V)> {
         let index = key.index();
         let mut guard = self.ensure_page(index).data.write();
@@ -235,7 +266,7 @@ impl<K: Key, V, const PAGE: usize> ConcurrentDirectMap<K, V, PAGE> {
     }
 
     /// Inserts only into an empty slot; returns `value` if any generation holds it.
-    /// Panics for an out-of-range insertion.
+    /// With `Flat`, panics for an out-of-range insertion.
     pub fn try_insert(&self, key: K, value: V) -> Result<(), V> {
         let index = key.index();
         let mut guard = self.ensure_page(index).data.write();
@@ -282,7 +313,7 @@ impl<K: Key, V, const PAGE: usize> ConcurrentDirectMap<K, V, PAGE> {
     /// Returns this key's value, constructing it under the page write lock if absent.
     /// Another generation is evicted. A panicking factory leaves entries unchanged.
     /// At most one competing factory runs before the key is removed or evicted.
-    /// Panics for an out-of-range insertion.
+    /// With `Flat`, panics for an out-of-range insertion.
     pub fn get_or_insert_with(
         &self,
         key: K,
@@ -293,7 +324,7 @@ impl<K: Key, V, const PAGE: usize> ConcurrentDirectMap<K, V, PAGE> {
 
     /// Locks the key's page for an entry operation, installing an empty page if needed.
     /// Another generation makes the entry vacant; inserting through it evicts that pair.
-    /// Panics for an out-of-range index.
+    /// With `Flat`, panics for an out-of-range index.
     pub fn entry(&self, key: K) -> Entry<'_, K, V> {
         let index = key.index();
         let guard = self.ensure_page(index).data.write();
@@ -411,14 +442,14 @@ impl<K: Key, V, const PAGE: usize> ConcurrentDirectMap<K, V, PAGE> {
 
     /// Detaches and frees all pages. The map is empty even if a destructor panics.
     pub fn reset(&mut self) {
-        let pages = mem::replace(&mut self.pages, Spine::new());
+        let pages = mem::replace(&mut self.pages, D::Pages::<Page<K, V>>::new());
         self.len.store(0, Ordering::Relaxed);
         drop(pages);
     }
 
     /// Moves entries into a plain map in slot order, scanning allocated slots.
     /// Each occupied entry is moved once; no values are cloned.
-    pub fn into_inner(mut self) -> PagedDirectMap<K, V, PAGE, Flat> {
+    pub fn into_inner(mut self) -> PagedDirectMap<K, V, PAGE, D> {
         let mut map = PagedDirectMap::new();
         for (_, page) in self.pages.iter_mut() {
             let lock = mem::replace(
@@ -600,14 +631,16 @@ impl<'a, K, V> VacantEntry<'a, K, V> {
     }
 }
 
-impl<K: Key, V, const PAGE: usize> Default for ConcurrentDirectMap<K, V, PAGE> {
+impl<K: Key, V, const PAGE: usize, D: SharedDirectory> Default
+    for ConcurrentDirectMap<K, V, PAGE, D>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize> fmt::Debug
-    for ConcurrentDirectMap<K, V, PAGE>
+impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: SharedDirectory> fmt::Debug
+    for ConcurrentDirectMap<K, V, PAGE, D>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut map = f.debug_map();
@@ -618,7 +651,9 @@ impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize> fmt::Debug
     }
 }
 
-impl<K: Key, V, const PAGE: usize> FromIterator<(K, V)> for ConcurrentDirectMap<K, V, PAGE> {
+impl<K: Key, V, const PAGE: usize, D: SharedDirectory> FromIterator<(K, V)>
+    for ConcurrentDirectMap<K, V, PAGE, D>
+{
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
         let mut map = Self::new();
         map.extend(iter);
@@ -626,7 +661,9 @@ impl<K: Key, V, const PAGE: usize> FromIterator<(K, V)> for ConcurrentDirectMap<
     }
 }
 
-impl<K: Key, V, const PAGE: usize> Extend<(K, V)> for ConcurrentDirectMap<K, V, PAGE> {
+impl<K: Key, V, const PAGE: usize, D: SharedDirectory> Extend<(K, V)>
+    for ConcurrentDirectMap<K, V, PAGE, D>
+{
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
         for (key, value) in iter {
             self.insert(key, value);
@@ -634,10 +671,10 @@ impl<K: Key, V, const PAGE: usize> Extend<(K, V)> for ConcurrentDirectMap<K, V, 
     }
 }
 
-impl<K: Key, V, const PAGE: usize> From<PagedDirectMap<K, V, PAGE, Flat>>
-    for ConcurrentDirectMap<K, V, PAGE>
+impl<K: Key, V, const PAGE: usize, D: SharedDirectory> From<PagedDirectMap<K, V, PAGE, D>>
+    for ConcurrentDirectMap<K, V, PAGE, D>
 {
-    fn from(map: PagedDirectMap<K, V, PAGE, Flat>) -> Self {
+    fn from(map: PagedDirectMap<K, V, PAGE, D>) -> Self {
         map.into_iter().collect()
     }
 }

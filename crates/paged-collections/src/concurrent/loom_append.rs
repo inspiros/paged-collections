@@ -304,3 +304,79 @@ fn rollback_wakes_a_same_slot_waiter() {
         assert_eq!(b.join().unwrap(), 9);
     });
 }
+
+#[test]
+fn radix_sparse_set_split_races_install_and_reader() {
+    // PAGE = 4 keeps all four dense entries in a preinstalled append page.
+    // Sparse pages 0 and 16 seed a shift-4 root (loom DIGIT = 2); inserting
+    // keys 4 and 8 sends both writers to leaf 0, racing a split with install.
+    // Yield allows a split/publication before or during the main-thread reads.
+    model(|| {
+        let set = Arc::new(ConcurrentSparseSet::<usize, 4, crate::page::Radix>::new());
+        assert!(set.insert(0));
+        assert!(set.insert(64));
+        let first = set.clone();
+        let a = thread::spawn(move || assert!(first.insert(4)));
+        let second = set.clone();
+        let b = thread::spawn(move || assert!(second.insert(8)));
+        thread::yield_now();
+        assert!(set.contains(0));
+        let first = set.position(4);
+        let second = set.position(8);
+        if let Some(pos) = first {
+            assert!(pos == 2 || pos == 3);
+            assert!(set.contains(4));
+        }
+        if let Some(pos) = second {
+            assert!(pos == 2 || pos == 3);
+            assert!(set.contains(8));
+        }
+        if first.is_some() && second.is_some() {
+            assert_ne!(first, second);
+        }
+        a.join().unwrap();
+        b.join().unwrap();
+        let mut keys: Vec<_> = set.iter().copied().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, [0, 4, 8, 64]);
+        assert_eq!(set.len(), 4);
+        for key in keys {
+            assert!(set.contains(key));
+        }
+    });
+}
+
+#[test]
+fn radix_sparse_map_split_races_install_and_reader() {
+    // As above: sparse pages 1 and 2 both split leaf 0 under a shift-4 root;
+    // loom can pause either installer between loading it and publishing CAS.
+    // Dense storage is preinstalled; yield makes the reader race publication.
+    model(|| {
+        let map = Arc::new(ConcurrentSparseMap::<
+            usize,
+            (usize, usize),
+            4,
+            crate::page::Radix,
+        >::new());
+        assert!(map.try_insert(0, (0, !0)).is_ok());
+        assert!(map.try_insert(64, (64, !64)).is_ok());
+        let first = map.clone();
+        let a = thread::spawn(move || assert_eq!(first.try_insert(4, (4, !4)), Ok(&(4, !4))));
+        let second = map.clone();
+        let b = thread::spawn(move || assert_eq!(second.try_insert(8, (8, !8)), Ok(&(8, !8))));
+        thread::yield_now();
+        assert_eq!(map.get(&0), Some(&(0, !0)));
+        for key in [4, 8] {
+            if let Some(value) = map.get(&key) {
+                assert_eq!(*value, (key, !key));
+                assert_eq!(map.get(&key), Some(value));
+            }
+        }
+        a.join().unwrap();
+        b.join().unwrap();
+        for key in [0, 4, 8, 64] {
+            assert_eq!(map.get(&key), Some(&(key, !key)));
+        }
+        assert_eq!(map.len(), 4);
+    });
+}

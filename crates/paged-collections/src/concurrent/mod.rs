@@ -28,9 +28,9 @@
 //! [`ConcurrentSparseSet`] and [`ConcurrentSparseMap`] allow shared insertion
 //! and return ordinary shared references. Entries cannot be removed or
 //! changed while shared. Insertions of the same slot wait for its writer;
-//! unrelated slots proceed independently. The sparse directory is Flat-like,
-//! with a finite index range, and an occupied slot refuses other generations.
-//! All three types support removal and conversion to their plain equivalents
+//! unrelated slots proceed independently. An occupied slot refuses other
+//! generations. The vector and both sparse types support removal and
+//! conversion to their plain equivalents
 //! under exclusive ownership. Conversion moves elements in O(len) time.
 //!
 //! [`ConcurrentDirectMap`] permits shared replacement and removal through one
@@ -42,12 +42,178 @@
 //! of one-word values. Prefer them over [`ConcurrentDirectMap`] when values
 //! fit their encodings: `usize` keys with `u64` values below `u64::MAX`, or
 //! generational ids with any `u32` value. Traversals copy values in index order.
+//!
+//! The sparse types, [`ConcurrentDirectMap`] and [`AtomicDirectMap`] accept a
+//! [`SharedDirectory`] parameter. The default [`Flat`](crate::page::Flat)
+//! has O(1) page lookups, directory memory following the highest page, and a
+//! finite index range. [`Radix`](crate::page::Radix) accepts any `usize` index,
+//! uses directory memory proportional to installed pages, and has O(depth)
+//! page lookups. [`AtomicIdMap`] remains Flat-only; `Tree` has no concurrent form.
+//!
+//! # Element invariance
+//!
+//! Shared insertion requires invariance in every element type: shortening a
+//! stored reference's lifetime would allow inserting a reference that expires
+//! while the original owner still expects a `'static` reference.
+//! The following identity functions typecheck; changing only their returned
+//! element lifetimes is rejected, for either directory.
+//!
+//! ```
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::*;
+//! use paged_collections::page::{Flat, Radix};
+//! use paged_collections::key::Key;
+//! #[derive(PartialEq, Eq)]
+//! struct K(usize);
+//! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! fn identity_0(x: ConcurrentHive<&'static u8>) -> ConcurrentHive<&'static u8> { x }
+//! fn identity_1(x: ConcurrentAppendHive<&'static u8>) -> ConcurrentAppendHive<&'static u8> { x }
+//! fn identity_2(x: ConcurrentPagedVec<&'static u8>) -> ConcurrentPagedVec<&'static u8> { x }
+//! fn identity_3(x: ConcurrentSparseSet<&'static K, 4, Flat>) -> ConcurrentSparseSet<&'static K, 4, Flat> { x }
+//! fn identity_4(x: ConcurrentSparseMap<&'static K, (), 4, Flat>) -> ConcurrentSparseMap<&'static K, (), 4, Flat> { x }
+//! fn identity_5(x: ConcurrentSparseMap<usize, &'static u8, 4, Flat>) -> ConcurrentSparseMap<usize, &'static u8, 4, Flat> { x }
+//! fn identity_6(x: ConcurrentDirectMap<&'static K, (), 4, Flat>) -> ConcurrentDirectMap<&'static K, (), 4, Flat> { x }
+//! fn identity_7(x: ConcurrentDirectMap<usize, &'static u8, 4, Flat>) -> ConcurrentDirectMap<usize, &'static u8, 4, Flat> { x }
+//! fn identity_8(x: ConcurrentSparseSet<&'static K, 4, Radix>) -> ConcurrentSparseSet<&'static K, 4, Radix> { x }
+//! fn identity_9(x: ConcurrentSparseMap<&'static K, (), 4, Radix>) -> ConcurrentSparseMap<&'static K, (), 4, Radix> { x }
+//! fn identity_10(x: ConcurrentSparseMap<usize, &'static u8, 4, Radix>) -> ConcurrentSparseMap<usize, &'static u8, 4, Radix> { x }
+//! fn identity_11(x: ConcurrentDirectMap<&'static K, (), 4, Radix>) -> ConcurrentDirectMap<&'static K, (), 4, Radix> { x }
+//! fn identity_12(x: ConcurrentDirectMap<usize, &'static u8, 4, Radix>) -> ConcurrentDirectMap<usize, &'static u8, 4, Radix> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentHive;
+//! fn shorten<'a>(x: ConcurrentHive<&'static u8>) -> ConcurrentHive<&'a u8> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentAppendHive;
+//! fn shorten<'a>(x: ConcurrentAppendHive<&'static u8>) -> ConcurrentAppendHive<&'a u8> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentPagedVec;
+//! fn shorten<'a>(x: ConcurrentPagedVec<&'static u8>) -> ConcurrentPagedVec<&'a u8> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentSparseSet;
+//! use paged_collections::page::Flat;
+//! use paged_collections::key::Key;
+//! #[derive(PartialEq, Eq)]
+//! struct K(usize);
+//! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! fn shorten<'a>(x: ConcurrentSparseSet<&'static K, 4, Flat>) -> ConcurrentSparseSet<&'a K, 4, Flat> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentSparseMap;
+//! use paged_collections::page::Flat;
+//! use paged_collections::key::Key;
+//! #[derive(PartialEq, Eq)]
+//! struct K(usize);
+//! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! fn shorten<'a>(x: ConcurrentSparseMap<&'static K, (), 4, Flat>) -> ConcurrentSparseMap<&'a K, (), 4, Flat> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentSparseMap;
+//! use paged_collections::page::Flat;
+//! fn shorten<'a>(x: ConcurrentSparseMap<usize, &'static u8, 4, Flat>) -> ConcurrentSparseMap<usize, &'a u8, 4, Flat> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentDirectMap;
+//! use paged_collections::page::Flat;
+//! use paged_collections::key::Key;
+//! #[derive(PartialEq, Eq)]
+//! struct K(usize);
+//! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! fn shorten<'a>(x: ConcurrentDirectMap<&'static K, (), 4, Flat>) -> ConcurrentDirectMap<&'a K, (), 4, Flat> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentDirectMap;
+//! use paged_collections::page::Flat;
+//! fn shorten<'a>(x: ConcurrentDirectMap<usize, &'static u8, 4, Flat>) -> ConcurrentDirectMap<usize, &'a u8, 4, Flat> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentSparseSet;
+//! use paged_collections::page::Radix;
+//! use paged_collections::key::Key;
+//! #[derive(PartialEq, Eq)]
+//! struct K(usize);
+//! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! fn shorten<'a>(x: ConcurrentSparseSet<&'static K, 4, Radix>) -> ConcurrentSparseSet<&'a K, 4, Radix> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentSparseMap;
+//! use paged_collections::page::Radix;
+//! use paged_collections::key::Key;
+//! #[derive(PartialEq, Eq)]
+//! struct K(usize);
+//! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! fn shorten<'a>(x: ConcurrentSparseMap<&'static K, (), 4, Radix>) -> ConcurrentSparseMap<&'a K, (), 4, Radix> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentSparseMap;
+//! use paged_collections::page::Radix;
+//! fn shorten<'a>(x: ConcurrentSparseMap<usize, &'static u8, 4, Radix>) -> ConcurrentSparseMap<usize, &'a u8, 4, Radix> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentDirectMap;
+//! use paged_collections::page::Radix;
+//! use paged_collections::key::Key;
+//! #[derive(PartialEq, Eq)]
+//! struct K(usize);
+//! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! fn shorten<'a>(x: ConcurrentDirectMap<&'static K, (), 4, Radix>) -> ConcurrentDirectMap<&'a K, (), 4, Radix> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentDirectMap;
+//! use paged_collections::page::Radix;
+//! fn shorten<'a>(x: ConcurrentDirectMap<usize, &'static u8, 4, Radix>) -> ConcurrentDirectMap<usize, &'a u8, 4, Radix> { x }
+//! # }
+//! ```
+//!
 
 mod append;
 mod append_hive;
 mod atomic;
 mod atomic_map;
 mod direct;
+mod directory;
 mod free_stack;
 mod hive;
 mod id_alloc;
@@ -63,6 +229,7 @@ pub use atomic_map::{AtomicDirectMap, AtomicIdMap};
 pub use direct::{
     ConcurrentDirectMap, DirectMapRef, DirectMapRefMut, Entry, OccupiedEntry, VacantEntry,
 };
+pub use directory::SharedDirectory;
 pub use hive::{ConcurrentHive, Drain, Iter, IterMut, Ref};
 pub use id_alloc::ConcurrentIdAllocator;
 pub use sparse::{ConcurrentSparseMap, ConcurrentSparseSet};

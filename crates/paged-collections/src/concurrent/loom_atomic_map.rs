@@ -325,3 +325,36 @@ fn id_insert_publishes_payload_to_failed_compare_exchange() {
         producer.join().unwrap();
     });
 }
+
+#[test]
+fn radix_direct_split_races_install_and_reader() {
+    // With loom DIGIT = 2, root pages 0 and 16 route both installers (1, 2)
+    // to leaf 0. A split can replace that leaf after the other writer loads
+    // it; the loser must retry through the new branch without losing a page.
+    // Yield permits splits before/during the main thread's point lookups.
+    model(|| {
+        let map = Arc::new(AtomicDirectMap::<1, crate::page::Radix>::new());
+        map.insert(0, 100);
+        map.insert(16, 116);
+        let first = map.clone();
+        let a = thread::spawn(move || assert_eq!(first.insert(1, 101), None));
+        let second = map.clone();
+        let b = thread::spawn(move || assert_eq!(second.insert(2, 102), None));
+        thread::yield_now();
+        assert_eq!(map.get(0), Some(100));
+        for key in [1, 2] {
+            if let Some(value) = map.get(key) {
+                assert_eq!(value, 100 + key as u64);
+                assert_eq!(map.get(key), Some(value));
+            }
+        }
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(
+            map.iter().collect::<alloc::vec::Vec<_>>(),
+            [(0, 100), (1, 101), (2, 102), (16, 116)]
+        );
+        assert_eq!(map.len(), 4);
+        assert_eq!(map.allocated_pages(), 4);
+    });
+}

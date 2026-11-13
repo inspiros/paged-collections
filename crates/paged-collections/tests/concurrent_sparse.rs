@@ -16,9 +16,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use paged_collections::concurrent::{ConcurrentSparseMap, ConcurrentSparseSet};
+use paged_collections::concurrent::{ConcurrentSparseMap, ConcurrentSparseSet, SharedDirectory};
 use paged_collections::id_alloc::Id;
 use paged_collections::key::Key;
+use paged_collections::page::{Flat, Radix};
 use paged_collections::sparse_map::PagedSparseMap;
 use paged_collections::sparse_set::PagedSparseSet;
 use proptest::prelude::*;
@@ -385,6 +386,155 @@ fn config() -> ProptestConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WideKey {
+    index: usize,
+    generation: u32,
+}
+
+impl Key for WideKey {
+    fn index(self) -> usize {
+        self.index
+    }
+}
+
+fn wide_index() -> impl Strategy<Value = usize> {
+    prop_oneof![
+        0usize..24,
+        (0usize..24).prop_map(|n| usize::MAX - n),
+        any::<usize>()
+    ]
+}
+
+fn set_model<D: SharedDirectory, K: Key + std::fmt::Debug>(
+    actions: Vec<(u8, usize, u32)>,
+    key_at: impl Fn(usize, u32) -> K,
+) -> Result<(), TestCaseError> {
+    let mut probes: Vec<_> = (0..24)
+        .chain(actions.iter().map(|&(_, index, _)| index))
+        .collect();
+    probes.sort_unstable();
+    probes.dedup();
+    let mut plain = PagedSparseSet::<K, 3, D>::new();
+    let mut set = ConcurrentSparseSet::<K, 3, D>::new();
+    for (action, index, generation) in actions {
+        let key = key_at(index, generation);
+        match action {
+            0 | 1 => {
+                prop_assert_eq!(set.insert(key), plain.insert(key));
+            }
+            2 => {
+                prop_assert_eq!(set.remove(key), plain.remove(key));
+            }
+            3 => {
+                set.clear();
+                plain.clear();
+            }
+            4 => {
+                let moved = set.into_inner();
+                prop_assert_eq!(moved.as_slice(), plain.as_slice());
+                set = ConcurrentSparseSet::from(moved);
+            }
+            _ => {
+                prop_assert_eq!(set.position(key), plain.position(key));
+            }
+        }
+        prop_assert_eq!(set.len(), plain.len());
+        prop_assert_eq!(set.is_empty(), plain.is_empty());
+        prop_assert!(set.iter().eq(plain.iter()));
+        prop_assert!(set.pages().flatten().eq(plain.iter()));
+        for &index in &probes {
+            for generation in 1..4 {
+                let key = key_at(index, generation);
+                prop_assert_eq!(set.contains(key), plain.contains(key));
+                prop_assert_eq!(set.position(key), plain.position(key));
+            }
+        }
+    }
+    let moved = set.into_inner();
+    prop_assert_eq!(moved.as_slice(), plain.as_slice());
+    Ok(())
+}
+
+fn map_model<D: SharedDirectory, K: Key + std::fmt::Debug>(
+    actions: Vec<(u8, usize, u32, i16)>,
+    key_at: impl Fn(usize, u32) -> K,
+) -> Result<(), TestCaseError> {
+    let mut probes: Vec<_> = (0..24)
+        .chain(actions.iter().map(|&(_, index, _, _)| index))
+        .collect();
+    probes.sort_unstable();
+    probes.dedup();
+    let mut plain = PagedSparseMap::<K, i32, 3, D>::new();
+    let mut map = ConcurrentSparseMap::<K, i32, 3, D>::new();
+    for (action, index, generation, value) in actions {
+        let key = key_at(index, generation);
+        let value = i32::from(value);
+        match action {
+            0 => {
+                let a = map.try_insert(key, value).copied();
+                let b = plain.try_insert(key, value).copied().map_err(|v| (key, v));
+                prop_assert_eq!(a, b);
+            }
+            1 => {
+                prop_assert_eq!(map.remove(&key), plain.remove(key));
+            }
+            2 => {
+                if let Some(v) = map.get_mut(&key) {
+                    *v = value;
+                }
+                if let Some(v) = plain.get_mut(key) {
+                    *v = value;
+                }
+            }
+            3 => {
+                for (_, v) in map.iter_mut() {
+                    *v += 1;
+                }
+                for (_, v) in plain.iter_mut() {
+                    *v += 1;
+                }
+            }
+            4 => {
+                map.clear();
+                plain.clear();
+            }
+            5 => {
+                let moved = map.into_inner();
+                prop_assert!(moved.iter().eq(plain.iter()));
+                map = ConcurrentSparseMap::from(moved);
+            }
+            6 => {
+                // Plain get_or_insert_with evicts generations; this API
+                // refuses them, so model that occupied-slot rule first.
+                let occupied = plain.as_set().occupant(index).copied();
+                let expected = if occupied.is_some_and(|stored| stored != key) {
+                    None
+                } else {
+                    Some(*plain.get_or_insert_with(key, || value))
+                };
+                prop_assert_eq!(map.get_or_insert_with(key, || value).copied(), expected);
+            }
+            _ => {
+                prop_assert_eq!(map.get(&key), plain.get(key));
+            }
+        }
+        prop_assert_eq!(map.len(), plain.len());
+        prop_assert_eq!(map.is_empty(), plain.is_empty());
+        prop_assert!(map.iter().eq(plain.iter()));
+        for &index in &probes {
+            for generation in 1..4 {
+                let key = key_at(index, generation);
+                prop_assert_eq!(map.contains_key(&key), plain.contains_key(key));
+                prop_assert_eq!(map.get(&key), plain.get(key));
+            }
+        }
+    }
+    let moved = map.into_inner();
+    prop_assert!(moved.iter().eq(plain.iter()));
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(config())]
 
@@ -392,86 +542,108 @@ proptest! {
     fn set_matches_plain_set_with_generations_and_conversions(
         actions in prop::collection::vec((0u8..6, 0u32..24, 1u32..4), 0..if cfg!(miri) { 20 } else { 200 })
     ) {
-        let mut plain = PagedSparseSet::<Id, 3>::new();
-        let mut set = ConcurrentSparseSet::<Id, 3>::new();
-        for (action, index, generation) in actions {
-            let key = id(index, generation);
-            match action {
-                0 | 1 => { prop_assert_eq!(set.insert(key), plain.insert(key)); }
-                2 => { prop_assert_eq!(set.remove(key), plain.remove(key)); }
-                3 => { set.clear(); plain.clear(); }
-                4 => {
-                    let moved = set.into_inner();
-                    prop_assert_eq!(moved.as_slice(), plain.as_slice());
-                    set = ConcurrentSparseSet::from(moved);
-                }
-                _ => { prop_assert_eq!(set.position(key), plain.position(key)); }
-            }
-            prop_assert_eq!(set.len(), plain.len());
-            prop_assert_eq!(set.is_empty(), plain.is_empty());
-            prop_assert!(set.iter().eq(plain.iter()));
-            prop_assert!(set.pages().flatten().eq(plain.iter()));
-            for index in 0..24 { for generation in 1..4 {
-                let key = id(index, generation);
-                prop_assert_eq!(set.contains(key), plain.contains(key));
-                prop_assert_eq!(set.position(key), plain.position(key));
-            } }
-        }
-        let moved = set.into_inner();
-        prop_assert_eq!(moved.as_slice(), plain.as_slice());
+        set_model::<Flat, Id>(actions.into_iter().map(|(a, i, g)| (a, i as usize, g)).collect(), |i, g| id(i as u32, g))?;
     }
 
     #[test]
     fn map_matches_plain_insert_only_semantics_with_exclusive_edits(
         actions in prop::collection::vec((0u8..8, 0u32..24, 1u32..4, any::<i16>()), 0..if cfg!(miri) { 20 } else { 200 })
     ) {
-        let mut plain = PagedSparseMap::<Id, i32, 3>::new();
-        let mut map = ConcurrentSparseMap::<Id, i32, 3>::new();
-        for (action, index, generation, value) in actions {
-            let key = id(index, generation);
-            let value = i32::from(value);
-            match action {
-                0 => {
-                    let a = map.try_insert(key, value).copied();
-                    let b = plain.try_insert(key, value).copied().map_err(|v| (key, v));
-                    prop_assert_eq!(a, b);
-                }
-                1 => { prop_assert_eq!(map.remove(&key), plain.remove(key)); }
-                2 => {
-                    if let Some(v) = map.get_mut(&key) { *v = value; }
-                    if let Some(v) = plain.get_mut(key) { *v = value; }
-                }
-                3 => {
-                    for (_, v) in map.iter_mut() { *v += 1; }
-                    for (_, v) in plain.iter_mut() { *v += 1; }
-                }
-                4 => { map.clear(); plain.clear(); }
-                5 => {
-                    let moved = map.into_inner();
-                    prop_assert!(moved.iter().eq(plain.iter()));
-                    map = ConcurrentSparseMap::from(moved);
-                }
-                6 => {
-                    // Plain get_or_insert_with evicts generations; this API
-                    // refuses them, so model that occupied-slot rule first.
-                    let occupied = plain.as_set().occupant(index as usize).copied();
-                    let expected = if occupied.is_some_and(|stored| stored != key) {
-                        None
-                    } else { Some(*plain.get_or_insert_with(key, || value)) };
-                    prop_assert_eq!(map.get_or_insert_with(key, || value).copied(), expected);
-                }
-                _ => { prop_assert_eq!(map.get(&key), plain.get(key)); }
-            }
-            prop_assert_eq!(map.len(), plain.len());
-            prop_assert_eq!(map.is_empty(), plain.is_empty());
-            prop_assert!(map.iter().eq(plain.iter()));
-            for index in 0..24 { for generation in 1..4 {
-                let key = id(index, generation);
-                prop_assert_eq!(map.contains_key(&key), plain.contains_key(key));
-                prop_assert_eq!(map.get(&key), plain.get(key));
-            } }
-        }
-        let moved = map.into_inner();
-        prop_assert!(moved.iter().eq(plain.iter()));
+        map_model::<Flat, Id>(actions.into_iter().map(|(a, i, g, v)| (a, i as usize, g, v)).collect(), |i, g| id(i as u32, g))?;
     }
+
+    #[test]
+    fn radix_set_matches_plain_set(
+        actions in prop::collection::vec((0u8..6, wide_index(), 1u32..4), 0..if cfg!(miri) { 20 } else { 200 })
+    ) {
+        set_model::<Radix, WideKey>(actions, |index, generation| WideKey { index, generation })?;
+    }
+
+    #[test]
+    fn radix_map_matches_plain_map(
+        actions in prop::collection::vec((0u8..8, wide_index(), 1u32..4, any::<i16>()), 0..if cfg!(miri) { 20 } else { 200 })
+    ) {
+        map_model::<Radix, WideKey>(actions, |index, generation| WideKey { index, generation })?;
+    }
+}
+
+#[test]
+fn flat_set_rejects_wide_indices_while_radix_accepts_them() {
+    let flat = ConcurrentSparseSet::<usize, 3>::new();
+    assert!(catch_unwind(AssertUnwindSafe(|| flat.insert(usize::MAX))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| flat.contains(usize::MAX))).is_err());
+    let set = ConcurrentSparseSet::<usize, 3, Radix>::new();
+    assert!(set.insert(usize::MAX));
+    assert!(set.contains(usize::MAX));
+    let plain: PagedSparseSet<usize, 3, Radix> = set.into_inner();
+    assert!(ConcurrentSparseSet::from(plain).contains(usize::MAX));
+}
+
+#[test]
+fn flat_map_rejects_wide_indices_while_radix_accepts_them() {
+    let flat = ConcurrentSparseMap::<usize, u32, 3>::new();
+    assert!(catch_unwind(AssertUnwindSafe(|| flat.try_insert(usize::MAX, 42))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| flat.get(&usize::MAX))).is_err());
+    let map = ConcurrentSparseMap::<usize, u32, 3, Radix>::new();
+    assert_eq!(map.try_insert(usize::MAX, 42), Ok(&42));
+    let plain: PagedSparseMap<usize, u32, 3, Radix> = map.into_inner();
+    assert_eq!(ConcurrentSparseMap::from(plain).get(&usize::MAX), Some(&42));
+}
+
+#[test]
+fn radix_scoped_insertions_span_the_index_space() {
+    let set = ConcurrentSparseSet::<usize, 3, Radix>::new();
+    let map = ConcurrentSparseMap::<usize, usize, 3, Radix>::new();
+    let keys: Vec<_> = (0..usize::BITS)
+        .map(|bit| 1usize << bit)
+        .chain([0, usize::MAX - 1, usize::MAX])
+        .collect();
+    thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for &key in &keys {
+                    set.insert(key);
+                    let _ = map.try_insert(key, key);
+                    assert!(set.contains(key));
+                    assert_eq!(map.get(&key), Some(&key));
+                }
+            });
+        }
+    });
+    assert_eq!(set.len(), keys.len());
+    assert_eq!(map.len(), keys.len());
+    let set = ConcurrentSparseSet::from(set.into_inner());
+    let map = ConcurrentSparseMap::from(map.into_inner());
+    for key in keys {
+        assert!(set.contains(key));
+        assert_eq!(map.get(&key), Some(&key));
+    }
+}
+
+#[test]
+fn auto_traits_need_only_shared_directory() {
+    fn check<D: SharedDirectory>() {
+        fn send<T: Send>() {}
+        fn sync<T: Sync>() {}
+        send::<ConcurrentSparseSet<SendKey, 2, D>>();
+        send::<ConcurrentSparseMap<u32, Cell<u8>, 2, D>>();
+        sync::<ConcurrentSparseSet<u32, 2, D>>();
+        sync::<ConcurrentSparseMap<u32, u8, 2, D>>();
+        trait AmbiguousSend<A> {
+            fn check() {}
+        }
+        impl<T> AmbiguousSend<()> for T {}
+        impl<T: Send> AmbiguousSend<u8> for T {}
+        let _ = <ConcurrentSparseSet<LocalKey, 2, D> as AmbiguousSend<_>>::check;
+        let _ = <ConcurrentSparseMap<u32, Rc<u8>, 2, D> as AmbiguousSend<_>>::check;
+        trait AmbiguousSync<A> {
+            fn check() {}
+        }
+        impl<T> AmbiguousSync<()> for T {}
+        impl<T: Sync> AmbiguousSync<u8> for T {}
+        let _ = <ConcurrentSparseSet<SendKey, 2, D> as AmbiguousSync<_>>::check;
+        let _ = <ConcurrentSparseMap<u32, Cell<u8>, 2, D> as AmbiguousSync<_>>::check;
+    }
+    check::<Flat>();
+    check::<Radix>();
 }
