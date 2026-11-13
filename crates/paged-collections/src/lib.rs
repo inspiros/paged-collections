@@ -14,6 +14,7 @@
 //! |---|---|---|
 //! | [`sparse_set`] | `PagedSparseSet<K>` | index; storage optional |
 //! | [`sparse_map`] | `PagedSparseMap<K, V>` | index; storage optional |
+//! | [`priority_queue`] | `PagedPriorityQueue<K, P>` | index (indexed max-heap) |
 //! | [`direct_map`] | `PagedDirectMap<K, V>` | index (values in place, slot order) |
 //! | [`paged_vec`] | `PagedVec<T>` | storage (stable addresses) |
 //! | [`paged_deque`] | `PagedDeque<T>` | storage (stable addresses, double-ended) |
@@ -47,6 +48,7 @@ pub mod key;
 pub mod page;
 pub mod paged_deque;
 pub mod paged_vec;
+pub mod priority_queue;
 pub mod sparse_map;
 pub mod sparse_set;
 

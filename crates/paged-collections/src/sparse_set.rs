@@ -335,6 +335,17 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
         self.dense.iter()
     }
 
+    /// Swaps the keys at dense positions `a` and `b` and fixes their index
+    /// slots. Panics if either is out of bounds.
+    pub(crate) fn swap_positions(&mut self, a: usize, b: usize) {
+        // Validate both positions and read indices before changing anything.
+        let a_index = self.dense[a].index();
+        let b_index = self.dense[b].index();
+        self.dense.swap(a, b);
+        self.set_slot(a_index, encode(b));
+        self.set_slot(b_index, encode(a));
+    }
+
     /// Rewrites every slot after the dense array was reordered.
     fn reindex(&mut self) {
         for pos in 0..self.dense.len() {
@@ -584,6 +595,24 @@ mod tests {
         assert_eq!(set.position(40), Some(0));
         assert!(!set.remove(1));
         assert!(!set.contains(1));
+    }
+
+    #[test]
+    fn swap_positions_reindexes_both_keys() {
+        let old = Gen(2);
+        let new = Gen(2 | 1 << 16);
+        let mut set: PagedSparseSet<Gen, 4> = [Gen(1), old, Gen(40)].into_iter().collect();
+        assert_eq!(set.replace(new), Some(old));
+        set.swap_positions(1, 2);
+        assert_eq!(set.as_slice(), &[Gen(1), Gen(40), new]);
+        for (pos, &key) in set.iter().enumerate() {
+            assert_eq!(set.position(key), Some(pos));
+        }
+        assert!(!set.contains(old));
+        set.swap_positions(0, 0);
+        assert_eq!(set.position(Gen(1)), Some(0));
+        assert!(set.remove(Gen(40)));
+        assert_eq!(set.position(new), Some(1));
     }
 
     #[test]

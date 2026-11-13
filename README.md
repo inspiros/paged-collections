@@ -25,6 +25,7 @@ Paging serves two separate purposes:
 |---|---|---|
 | `PagedSparseSet<K>` | index (storage optional) | Integer set with O(1) insert, remove, contains, clear, and dense iteration |
 | `PagedSparseMap<K, V>` | index (storage optional) | Sparse set with a dense value array |
+| `PagedPriorityQueue<K, P>` | index | Indexed max-heap with priority changes and removal by key |
 | `PagedDirectMap<K, V>` | index | Direct-address map: values stored in place, iterated in slot-index (for integers, key) order |
 | `PagedVec<T>` | storage | Growable vector with stable addresses |
 | `PagedDeque<T>` | storage | Double-ended queue with stable addresses through pushes and pops at either end |
