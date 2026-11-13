@@ -27,6 +27,7 @@ Paging serves two separate purposes:
 | `PagedSparseMap<K, V>` | index (storage optional) | Sparse set with a dense value array |
 | `PagedDirectMap<K, V>` | index | Direct-address map: values stored in place, iterated in slot-index (for integers, key) order |
 | `PagedVec<T>` | storage | Growable vector with stable addresses |
+| `PagedDeque<T>` | storage | Double-ended queue with stable addresses through pushes and pops at either end |
 | `Hive<T>` | storage | Unordered container with stable addresses and generational handles |
 | `IdAllocator` | none | Generational id allocator for use as keys |
 

@@ -16,6 +16,7 @@
 //! | [`sparse_map`] | `PagedSparseMap<K, V>` | index; storage optional |
 //! | [`direct_map`] | `PagedDirectMap<K, V>` | index (values in place, slot order) |
 //! | [`paged_vec`] | `PagedVec<T>` | storage (stable addresses) |
+//! | [`paged_deque`] | `PagedDeque<T>` | storage (stable addresses, double-ended) |
 //! | [`hive`] | `Hive<T>` | storage (stable addresses, reusable slots, generational ids) |
 //! | [`id_alloc`] | `IdAllocator`, `Id` | none (free list of generational ids) |
 //!
@@ -44,6 +45,7 @@ pub mod hive;
 pub mod id_alloc;
 pub mod key;
 pub mod page;
+pub mod paged_deque;
 pub mod paged_vec;
 pub mod sparse_map;
 pub mod sparse_set;
