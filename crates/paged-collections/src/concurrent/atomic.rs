@@ -12,3 +12,51 @@ pub(super) use loom::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize
 /// Keeps a contended word away from neighbouring fields' cache lines.
 #[repr(align(128))]
 pub(super) struct CachePadded<T>(pub(super) T);
+
+/// A value cell with the same checked access interface in loom and production.
+pub(super) struct UnsafeCell<T> {
+    #[cfg(loom)]
+    inner: loom::cell::UnsafeCell<T>,
+    #[cfg(not(loom))]
+    inner: core::cell::UnsafeCell<T>,
+}
+
+impl<T> UnsafeCell<T> {
+    pub(super) fn new(value: T) -> Self {
+        Self {
+            #[cfg(loom)]
+            inner: loom::cell::UnsafeCell::new(value),
+            #[cfg(not(loom))]
+            inner: core::cell::UnsafeCell::new(value),
+        }
+    }
+
+    pub(super) fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+        #[cfg(loom)]
+        {
+            self.inner.with(f)
+        }
+        #[cfg(not(loom))]
+        {
+            f(self.inner.get().cast_const())
+        }
+    }
+
+    pub(super) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+        #[cfg(loom)]
+        {
+            self.inner.with_mut(f)
+        }
+        #[cfg(not(loom))]
+        {
+            f(self.inner.get())
+        }
+    }
+
+    // Keep loom's read tracking alive for the entire Ref, including references
+    // returned by Deref that escape the shorter `with` callback.
+    #[cfg(loom)]
+    pub(super) fn read(&self) -> loom::cell::ConstPtr<T> {
+        self.inner.get()
+    }
+}
