@@ -13,15 +13,36 @@
 //! costs two atomic writes: acquiring the guard and releasing it. Hot values
 //! can therefore contend even between readers. Prefer the plain
 //! [`Hive`](crate::hive::Hive) when shared mutation is unnecessary.
+//!
+//! [`ConcurrentPagedVec`] appends without waiting for earlier writers. Its
+//! point lookups see completed pushes; `len`, iteration and page slices use a
+//! hole-free prefix which can lag while an earlier push is in flight. When
+//! no push is in flight, the prefix equals the number of reservations.
+//!
+//! [`ConcurrentSparseSet`] and [`ConcurrentSparseMap`] allow shared insertion
+//! and return ordinary shared references. Entries cannot be removed or
+//! changed while shared. Insertions of the same slot wait for its writer;
+//! unrelated slots proceed independently. The sparse directory is Flat-like,
+//! with a finite index range, and an occupied slot refuses other generations.
+//! All three types support removal and conversion to their plain equivalents
+//! under exclusive ownership. Conversion moves elements in O(len) time.
 
+mod append;
 mod atomic;
 mod free_stack;
 mod hive;
 mod id_alloc;
+mod sparse;
 mod spine;
+mod vec;
 
 pub use hive::{ConcurrentHive, Drain, Iter, IterMut, Ref};
 pub use id_alloc::ConcurrentIdAllocator;
+pub use sparse::{ConcurrentSparseMap, ConcurrentSparseSet};
+pub use vec::ConcurrentPagedVec;
+
+#[cfg(all(test, loom))]
+mod loom_append;
 
 #[cfg(all(test, loom))]
 mod loom_hive;

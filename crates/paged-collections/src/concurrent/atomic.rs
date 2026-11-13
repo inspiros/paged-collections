@@ -14,6 +14,10 @@ pub(super) use loom::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize
 pub(super) struct CachePadded<T>(pub(super) T);
 
 /// A value cell with the same checked access interface in loom and production.
+// Production append pages expose contiguous initialized prefixes. Preserve the
+// layout of T through both this wrapper and core::cell::UnsafeCell. Loom cells
+// contain tracking metadata, so their prefixes are visited one cell at a time.
+#[cfg_attr(not(loom), repr(transparent))]
 pub(super) struct UnsafeCell<T> {
     #[cfg(loom)]
     inner: loom::cell::UnsafeCell<T>,

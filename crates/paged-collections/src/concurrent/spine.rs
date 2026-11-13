@@ -125,6 +125,16 @@ impl<P, const CHUNKS: usize> Spine<P, CHUNKS> {
 
     /// Installed pages in ascending order, with exclusive access to each.
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut P)> {
+        // The adapter below only stores atomic pointers, which are `Send`
+        // and `Sync` whatever `P` is. The marker ties the iterator's auto
+        // traits to `&mut P`, which it hands out.
+        ExclusivePages {
+            inner: self.iter_mut_raw(),
+            marker: PhantomData,
+        }
+    }
+
+    fn iter_mut_raw(&mut self) -> impl Iterator<Item = (usize, &mut P)> {
         self.chunks.iter_mut().enumerate().flat_map(|(k, cell)| {
             // Relaxed suffices: exclusive access rules out publication races.
             let chunk = cell.load(Ordering::Relaxed);
@@ -172,6 +182,20 @@ impl<P, const CHUNKS: usize> Spine<P, CHUNKS> {
                 }
             }
         }
+    }
+}
+
+/// Carries `&mut P`'s auto traits for [`Spine::iter_mut`].
+struct ExclusivePages<'a, P, I> {
+    inner: I,
+    marker: PhantomData<&'a mut P>,
+}
+
+impl<'a, P: 'a, I: Iterator<Item = (usize, &'a mut P)>> Iterator for ExclusivePages<'a, P, I> {
+    type Item = (usize, &'a mut P);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
     }
 }
 
