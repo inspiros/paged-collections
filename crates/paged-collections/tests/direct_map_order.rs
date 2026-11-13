@@ -7,7 +7,7 @@ use std::ops::Bound::{self, Excluded, Included, Unbounded};
 
 use paged_collections::direct_map::PagedDirectMap;
 use paged_collections::key::Key;
-use paged_collections::page::{Directory, Flat, Tree};
+use paged_collections::page::{Directory, Flat, Radix, Tree};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseResult;
 
@@ -513,11 +513,17 @@ macro_rules! layouts {
         suite!(flat_8, $key, 8, Flat);
         suite!(flat_1024, $key, 1024, Flat);
         suite!(tree_1, $key, 1, Tree);
+        suite!(radix_1, $key, 1, Radix);
         suite!(tree_2, $key, 2, Tree);
+        suite!(radix_2, $key, 2, Radix);
         suite!(tree_3, $key, 3, Tree);
+        suite!(radix_3, $key, 3, Radix);
         suite!(tree_4, $key, 4, Tree);
+        suite!(radix_4, $key, 4, Radix);
         suite!(tree_8, $key, 8, Tree);
+        suite!(radix_8, $key, 8, Radix);
         suite!(tree_1024, $key, 1024, Tree);
+        suite!(radix_1024, $key, 1024, Radix);
     };
 }
 
@@ -532,12 +538,12 @@ mod integer {
     layouts!(u32);
 }
 
-fn high_indices<const PAGE: usize>(
+fn high_indices<const PAGE: usize, D: Directory>(
     offsets: &[u16],
     bounds: &[Bounds<usize>],
     directions: &[bool],
 ) -> TestCaseResult {
-    let mut map = PagedDirectMap::<usize, u32, PAGE, Tree>::new();
+    let mut map = PagedDirectMap::<usize, u32, PAGE, D>::new();
     let mut model = Model::new();
     for index in [0, usize::MAX - PAGE, usize::MAX - 1, usize::MAX]
         .into_iter()
@@ -565,7 +571,7 @@ fn high_indices<const PAGE: usize>(
 proptest! {
     #![proptest_config(config())]
     #[test]
-    fn tree_ranges_near_usize_max(
+    fn wide_ranges_near_usize_max(
         offsets in prop::collection::vec(0_u16..2052, 0..max_len()),
         bounds in prop::collection::vec(slot_bounds(), 1..9),
         directions in prop::collection::vec(any::<bool>(), 1..max_len()),
@@ -585,11 +591,17 @@ proptest! {
             (Unbounded, Excluded(usize::MAX)),
             (Included(usize::MAX - 1), Included(usize::MAX)),
         ]);
-        high_indices::<1>(&offsets, &ranges, &directions)?;
-        high_indices::<2>(&offsets, &ranges, &directions)?;
-        high_indices::<3>(&offsets, &ranges, &directions)?;
-        high_indices::<4>(&offsets, &ranges, &directions)?;
-        high_indices::<8>(&offsets, &ranges, &directions)?;
-        high_indices::<1024>(&offsets, &ranges, &directions)?;
+        high_indices::<1, Tree>(&offsets, &ranges, &directions)?;
+        high_indices::<1, Radix>(&offsets, &ranges, &directions)?;
+        high_indices::<2, Tree>(&offsets, &ranges, &directions)?;
+        high_indices::<2, Radix>(&offsets, &ranges, &directions)?;
+        high_indices::<3, Tree>(&offsets, &ranges, &directions)?;
+        high_indices::<3, Radix>(&offsets, &ranges, &directions)?;
+        high_indices::<4, Tree>(&offsets, &ranges, &directions)?;
+        high_indices::<4, Radix>(&offsets, &ranges, &directions)?;
+        high_indices::<8, Tree>(&offsets, &ranges, &directions)?;
+        high_indices::<8, Radix>(&offsets, &ranges, &directions)?;
+        high_indices::<1024, Tree>(&offsets, &ranges, &directions)?;
+        high_indices::<1024, Radix>(&offsets, &ranges, &directions)?;
     }
 }

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
 use paged_collections::key::Key;
-use paged_collections::page::{Directory, Flat, Tree};
+use paged_collections::page::{Directory, Flat, Radix, Tree};
 use paged_collections::sparse_set::{PagedSparseSet, Slot};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseResult;
@@ -478,6 +478,7 @@ sequence_test!(gen_flat_3, Gen, 3, Flat, gen_keys(), gen_probes());
 sequence_test!(gen_flat_4, Gen, 4, Flat, gen_keys(), gen_probes());
 sequence_test!(gen_flat_8, Gen, 8, Flat, gen_keys(), gen_probes());
 sequence_test!(gen_tree_4, Gen, 4, Tree, gen_keys(), gen_probes());
+sequence_test!(gen_radix_4, Gen, 4, Radix, gen_keys(), gen_probes());
 
 #[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
 mod integer_sequences {
@@ -488,10 +489,20 @@ mod integer_sequences {
     sequence_test!(u32_flat_4, u32, 4, Flat, integer_keys(), (0..52).collect());
     sequence_test!(u32_flat_8, u32, 8, Flat, integer_keys(), (0..52).collect());
     sequence_test!(u32_tree_4, u32, 4, Tree, integer_keys(), (0..52).collect());
+    sequence_test!(
+        u32_radix_4,
+        u32,
+        4,
+        Radix,
+        integer_keys(),
+        (0..52).collect()
+    );
 }
 
 #[cfg(target_pointer_width = "64")]
 sequence_test!(u64_tree_4, u64, 4, Tree, wide_keys(), wide_probes());
+#[cfg(target_pointer_width = "64")]
+sequence_test!(u64_radix_4, u64, 4, Radix, wide_keys(), wide_probes());
 
 fn check_traits<K: TestKey, const PAGE: usize, D: Directory>(keys: &[K]) -> TestCaseResult
 where
@@ -566,10 +577,13 @@ trait_test!(traits_gen_flat_3, Gen, 3, Flat, gen_keys());
 trait_test!(traits_gen_flat_4, Gen, 4, Flat, gen_keys());
 trait_test!(traits_gen_flat_8, Gen, 8, Flat, gen_keys());
 trait_test!(traits_gen_tree_4, Gen, 4, Tree, gen_keys());
+trait_test!(traits_gen_radix_4, Gen, 4, Radix, gen_keys());
 #[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
 trait_test!(traits_u32_flat_4, u32, 4, Flat, integer_keys());
 #[cfg(target_pointer_width = "64")]
 trait_test!(traits_u64_tree_4, u64, 4, Tree, wide_keys());
+#[cfg(target_pointer_width = "64")]
+trait_test!(traits_u64_radix_4, u64, 4, Radix, wide_keys());
 
 fn generation_equality<const PAGE: usize, D: Directory>() {
     let old = Gen {
@@ -599,6 +613,7 @@ fn equality_distinguishes_generations_in_every_directory() {
     generation_equality::<4, Flat>();
     generation_equality::<8, Flat>();
     generation_equality::<4, Tree>();
+    generation_equality::<4, Radix>();
 }
 
 #[test]
@@ -647,6 +662,7 @@ fn stale_slots_and_last_removal_in_every_directory() -> TestCaseResult {
     run_sequence::<Gen, 4, Flat>(&ops, gen_probes())?;
     run_sequence::<Gen, 8, Flat>(&ops, gen_probes())?;
     run_sequence::<Gen, 4, Tree>(&ops, gen_probes())?;
+    run_sequence::<Gen, 4, Radix>(&ops, gen_probes())?;
     Ok(())
 }
 
@@ -667,7 +683,9 @@ fn maximum_tree_index_with_single_slot_pages() -> TestCaseResult {
         Op::ShrinkToFit,
     ];
     run_sequence::<u64, 1, Tree>(&ops, wide_probes())?;
+    run_sequence::<u64, 1, Radix>(&ops, wide_probes())?;
     run_sequence::<u64, 4, Tree>(&ops, wide_probes())?;
+    run_sequence::<u64, 4, Radix>(&ops, wide_probes())?;
     Ok(())
 }
 
@@ -734,6 +752,7 @@ mod serde_tests {
     serde_test!(round_trip_flat_4, 4, Flat);
     serde_test!(round_trip_flat_8, 8, Flat);
     serde_test!(round_trip_tree_4, 4, Tree);
+    serde_test!(round_trip_radix_4, 4, Radix);
 
     fn first_per_slot<const PAGE: usize, D: Directory>() {
         let first = Gen {
@@ -773,6 +792,7 @@ mod serde_tests {
         first_per_slot::<4, Flat>();
         first_per_slot::<8, Flat>();
         first_per_slot::<4, Tree>();
+        first_per_slot::<4, Radix>();
     }
 }
 

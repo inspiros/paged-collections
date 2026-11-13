@@ -7,7 +7,7 @@
 //!
 //! | Operation | Cost |
 //! |---|---|
-//! | [`insert`](PagedSparseSet::insert), [`remove`](PagedSparseSet::remove), [`contains`](PagedSparseSet::contains) | O(1) (O(log pages) with [`Tree`](crate::page::Tree)) |
+//! | [`insert`](PagedSparseSet::insert), [`remove`](PagedSparseSet::remove), [`contains`](PagedSparseSet::contains) | O(1) (O(depth) with [`Radix`](crate::page::Radix), O(log pages) with [`Tree`](crate::page::Tree)) |
 //! | [`clear`](PagedSparseSet::clear) | O(1): pages are kept and old slots are ignored |
 //! | iteration, [`as_slice`](PagedSparseSet::as_slice) | over the dense array only |
 //!
@@ -50,8 +50,9 @@ pub type Slot = Option<NonZeroU32>;
 ///
 /// - `PAGE` is the number of slots per page of the sparse index; it must be
 ///   non-zero. See [`DEFAULT_PAGE`].
-/// - `D` picks the page directory: [`Flat`] (default) or
-///   [`Tree`](crate::page::Tree) for keys spread over the 64-bit range.
+/// - `D` picks the page directory: [`Flat`] (default) for dense keys,
+///   [`Radix`](crate::page::Radix) for keys spread over the 64-bit range,
+///   or [`Tree`](crate::page::Tree). See [`crate::page`].
 ///
 /// The set holds at most one key per slot index. With plain integer keys that
 /// is the usual set semantics. With generational keys, [`insert`] refuses a
@@ -512,8 +513,8 @@ mod serde_impl {
     /// Memory follows the key indices, not the input length: with the
     /// [`Flat`] directory one large index allocates a directory entry for
     /// every page below it, and an index near `usize::MAX` panics. For
-    /// untrusted input, use [`Tree`](crate::page::Tree) or validate the
-    /// keys first.
+    /// untrusted input, use [`Radix`](crate::page::Radix) or
+    /// [`Tree`](crate::page::Tree), or validate the keys first.
     impl<'de, K: Key + Deserialize<'de>, const PAGE: usize, D: Directory> Deserialize<'de>
         for PagedSparseSet<K, PAGE, D>
     {

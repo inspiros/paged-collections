@@ -30,6 +30,13 @@ Paging serves two separate purposes:
 | `Hive<T>` | storage | Unordered container with stable addresses and generational handles |
 | `IdAllocator` | none | Generational id allocator for use as keys |
 
+The indexed collections use `page::Flat` by default, for dense keys below a
+few billion. Choose `page::Radix` for wide keys spread over the `usize` range;
+its compressed radix directory uses memory proportional to allocated pages.
+Choose `page::Tree` for a standard B-tree, or when benchmarks show it wins
+for your key pattern. The directory is the final type parameter, for example
+`PagedDirectMap<usize, u32, 1024, page::Radix>`.
+
 ## Rust
 
 A `Hive` owns elements at stable addresses and hands out generational ids;

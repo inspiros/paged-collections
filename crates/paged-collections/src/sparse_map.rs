@@ -7,7 +7,7 @@
 //!
 //! | Operation | Cost |
 //! |---|---|
-//! | [`get`](PagedSparseMap::get), [`remove`](PagedSparseMap::remove) | O(1) (O(log pages) with [`Tree`](crate::page::Tree)) |
+//! | [`get`](PagedSparseMap::get), [`remove`](PagedSparseMap::remove) | O(1) (O(depth) with [`Radix`](crate::page::Radix), O(log pages) with [`Tree`](crate::page::Tree)) |
 //! | [`insert`](PagedSparseMap::insert) | as `get`, amortized over dense-array growth; the first key in a page also allocates the page (and, with [`Flat`], grows the directory up to it) |
 //! | [`clear`](PagedSparseMap::clear) | O(1) for the index, plus dropping the values |
 //! | iteration, [`value_slice`](PagedSparseMap::value_slice) | over the dense arrays only |
@@ -61,8 +61,9 @@ use crate::sparse_set::{PagedSparseSet, Slot};
 /// contiguous arrays of its keys and values.
 ///
 /// `PAGE` and `D` are as for [`PagedSparseSet`]: slots per page of the
-/// sparse index, and the page directory ([`Flat`] or
-/// [`Tree`](crate::page::Tree)).
+/// sparse index, and the page directory ([`Flat`] by default,
+/// [`Radix`](crate::page::Radix) for wide keys, or
+/// [`Tree`](crate::page::Tree)). See [`crate::page`].
 ///
 /// Entries are kept in insertion order until a removal, which moves the last
 /// entry into the gap. See the [module docs](self) for how methods treat a
@@ -835,7 +836,8 @@ mod serde_impl {
     ///
     /// Memory follows the key indices, not the input length: see the
     /// warning on [`PagedSparseSet`]'s `Deserialize` impl. For untrusted
-    /// input, use [`Tree`](crate::page::Tree) or validate the keys first.
+    /// input, use [`Radix`](crate::page::Radix) or [`Tree`](crate::page::Tree),
+    /// or validate the keys first.
     impl<'de, K, V, const PAGE: usize, D> Deserialize<'de> for PagedSparseMap<K, V, PAGE, D>
     where
         K: Key + Deserialize<'de>,

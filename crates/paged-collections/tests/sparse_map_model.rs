@@ -11,7 +11,7 @@ use std::iter::FusedIterator;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use paged_collections::key::Key;
-use paged_collections::page::{Directory, Flat, Tree};
+use paged_collections::page::{Directory, Flat, Radix, Tree};
 use paged_collections::sparse_map::PagedSparseMap;
 use paged_collections::sparse_set::Slot;
 use proptest::prelude::*;
@@ -660,7 +660,9 @@ sequence_test!(gen_flat_3, Gen, 3, Flat, gen_keys(), gen_probes());
 sequence_test!(gen_flat_4, Gen, 4, Flat, gen_keys(), gen_probes());
 sequence_test!(gen_flat_8, Gen, 8, Flat, gen_keys(), gen_probes());
 sequence_test!(gen_tree_1, Gen, 1, Tree, gen_keys(), gen_probes());
+sequence_test!(gen_radix_1, Gen, 1, Radix, gen_keys(), gen_probes());
 sequence_test!(gen_tree_4, Gen, 4, Tree, gen_keys(), gen_probes());
+sequence_test!(gen_radix_4, Gen, 4, Radix, gen_keys(), gen_probes());
 
 #[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
 mod integer_sequences {
@@ -671,12 +673,24 @@ mod integer_sequences {
     sequence_test!(u32_flat_4, u32, 4, Flat, integer_keys(), (0..52).collect());
     sequence_test!(u32_flat_8, u32, 8, Flat, integer_keys(), (0..52).collect());
     sequence_test!(u32_tree_4, u32, 4, Tree, integer_keys(), (0..52).collect());
+    sequence_test!(
+        u32_radix_4,
+        u32,
+        4,
+        Radix,
+        integer_keys(),
+        (0..52).collect()
+    );
 }
 
 #[cfg(target_pointer_width = "64")]
 sequence_test!(u64_tree_1, u64, 1, Tree, wide_keys(), wide_probes());
 #[cfg(target_pointer_width = "64")]
+sequence_test!(u64_radix_1, u64, 1, Radix, wide_keys(), wide_probes());
+#[cfg(target_pointer_width = "64")]
 sequence_test!(u64_tree_4, u64, 4, Tree, wide_keys(), wide_probes());
+#[cfg(target_pointer_width = "64")]
+sequence_test!(u64_radix_4, u64, 4, Radix, wide_keys(), wide_probes());
 
 fn check_traits<K: TestKey, const PAGE: usize, D: Directory>(entries: &[(K, u32)]) -> TestCaseResult
 where
@@ -852,11 +866,15 @@ trait_test!(traits_gen_flat_3, Gen, 3, Flat, gen_keys());
 trait_test!(traits_gen_flat_4, Gen, 4, Flat, gen_keys());
 trait_test!(traits_gen_flat_8, Gen, 8, Flat, gen_keys());
 trait_test!(traits_gen_tree_1, Gen, 1, Tree, gen_keys());
+trait_test!(traits_gen_radix_1, Gen, 1, Radix, gen_keys());
 trait_test!(traits_gen_tree_4, Gen, 4, Tree, gen_keys());
+trait_test!(traits_gen_radix_4, Gen, 4, Radix, gen_keys());
 #[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
 trait_test!(traits_u32_flat_4, u32, 4, Flat, integer_keys());
 #[cfg(target_pointer_width = "64")]
 trait_test!(traits_u64_tree_4, u64, 4, Tree, wide_keys());
+#[cfg(target_pointer_width = "64")]
+trait_test!(traits_u64_radix_4, u64, 4, Radix, wide_keys());
 
 fn generation_equality<const PAGE: usize, D: Directory>() {
     let old = Gen {
@@ -896,7 +914,9 @@ fn equality_and_indexing_distinguish_generations_in_every_directory() {
     generation_equality::<4, Flat>();
     generation_equality::<8, Flat>();
     generation_equality::<1, Tree>();
+    generation_equality::<1, Radix>();
     generation_equality::<4, Tree>();
+    generation_equality::<4, Radix>();
 }
 
 fn targeted_mutations<const PAGE: usize, D: Directory>() -> TestCaseResult
@@ -987,7 +1007,9 @@ fn dense_positions_swap_removal_and_stale_slots_in_every_directory() -> TestCase
     targeted_mutations::<4, Flat>()?;
     targeted_mutations::<8, Flat>()?;
     targeted_mutations::<1, Tree>()?;
+    targeted_mutations::<1, Radix>()?;
     targeted_mutations::<4, Tree>()?;
+    targeted_mutations::<4, Radix>()?;
     Ok(())
 }
 
@@ -1041,7 +1063,9 @@ fn returned_mutable_values_and_value_slice_write_through() {
     mutable_access::<4, Flat>();
     mutable_access::<8, Flat>();
     mutable_access::<1, Tree>();
+    mutable_access::<1, Radix>();
     mutable_access::<4, Tree>();
+    mutable_access::<4, Radix>();
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -1062,7 +1086,9 @@ fn maximum_tree_index_with_single_slot_pages() -> TestCaseResult {
         Op::ShrinkToFit,
     ];
     run_sequence::<u64, 1, Tree>(&ops, wide_probes())?;
+    run_sequence::<u64, 1, Radix>(&ops, wide_probes())?;
     run_sequence::<u64, 4, Tree>(&ops, wide_probes())?;
+    run_sequence::<u64, 4, Radix>(&ops, wide_probes())?;
     Ok(())
 }
 
@@ -1128,7 +1154,9 @@ mod serde_tests {
         serde_test!(round_trip_flat_4, 4, Flat);
         serde_test!(round_trip_flat_8, 8, Flat);
         serde_test!(round_trip_tree_1, 1, Tree);
+        serde_test!(round_trip_radix_1, 1, Radix);
         serde_test!(round_trip_tree_4, 4, Tree);
+        serde_test!(round_trip_radix_4, 4, Radix);
 
         #[test]
         fn duplicate_json_keys_keep_last_value() -> TestCaseResult {
@@ -1138,7 +1166,9 @@ mod serde_tests {
             round_trip::<4, Flat>(&entries)?;
             round_trip::<8, Flat>(&entries)?;
             round_trip::<1, Tree>(&entries)?;
+            round_trip::<1, Radix>(&entries)?;
             round_trip::<4, Tree>(&entries)?;
+            round_trip::<4, Radix>(&entries)?;
             Ok(())
         }
     }
@@ -1177,6 +1207,7 @@ mod serde_tests {
             deserialize_generations::<1, Flat>(&entries)?;
             deserialize_generations::<3, Flat>(&entries)?;
             deserialize_generations::<4, Tree>(&entries)?;
+            deserialize_generations::<4, Radix>(&entries)?;
         }
     }
 
@@ -1200,7 +1231,9 @@ mod serde_tests {
         deserialize_generations::<4, Flat>(&entries)?;
         deserialize_generations::<8, Flat>(&entries)?;
         deserialize_generations::<1, Tree>(&entries)?;
+        deserialize_generations::<1, Radix>(&entries)?;
         deserialize_generations::<4, Tree>(&entries)?;
+        deserialize_generations::<4, Radix>(&entries)?;
         Ok(())
     }
 }
@@ -1409,7 +1442,9 @@ mod equality_panic_tests {
         occupied_slot::<4, Flat>();
         occupied_slot::<8, Flat>();
         occupied_slot::<1, Tree>();
+        occupied_slot::<1, Radix>();
         occupied_slot::<4, Tree>();
+        occupied_slot::<4, Radix>();
     }
 }
 
@@ -1464,6 +1499,7 @@ fn panicking_comparator_and_sort_key_leave_map_unchanged() {
     panicking_sorts::<1, Flat>();
     panicking_sorts::<3, Flat>();
     panicking_sorts::<4, Tree>();
+    panicking_sorts::<4, Radix>();
 }
 
 fn panicking_retain<const PAGE: usize, D: Directory>() -> TestCaseResult {
@@ -1525,6 +1561,7 @@ fn panicking_retain_keeps_unvisited_entries_and_mutations() -> TestCaseResult {
     panicking_retain::<1, Flat>()?;
     panicking_retain::<3, Flat>()?;
     panicking_retain::<4, Tree>()?;
+    panicking_retain::<4, Radix>()?;
     Ok(())
 }
 
@@ -1565,6 +1602,7 @@ fn panicking_get_or_insert_with_make_leaves_map_unchanged() {
     panicking_make::<1, Flat>();
     panicking_make::<3, Flat>();
     panicking_make::<4, Tree>();
+    panicking_make::<4, Radix>();
 }
 
 mod drop_tests {
@@ -1713,6 +1751,7 @@ mod drop_tests {
         panicking_drop::<1, Flat>();
         panicking_drop::<3, Flat>();
         panicking_drop::<4, Tree>();
+        panicking_drop::<4, Radix>();
     }
 
     fn count_drops<const PAGE: usize, D: Directory>() {
@@ -1785,5 +1824,6 @@ mod drop_tests {
         count_drops::<1, Flat>();
         count_drops::<3, Flat>();
         count_drops::<4, Tree>();
+        count_drops::<4, Radix>();
     }
 }

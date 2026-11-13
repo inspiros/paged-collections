@@ -16,9 +16,9 @@
 //!
 //! | Operation | Cost |
 //! |---|---|
-//! | [`get`](PagedDirectMap::get), [`insert`](PagedDirectMap::insert), [`remove`](PagedDirectMap::remove) | O(1) (O(log pages) with [`Tree`](crate::page::Tree)); the first key in a page also allocates the page (and, with [`Flat`], grows the directory up to it) |
+//! | [`get`](PagedDirectMap::get), [`insert`](PagedDirectMap::insert), [`remove`](PagedDirectMap::remove) | O(1) (O(depth) with [`Radix`](crate::page::Radix), O(log pages) with [`Tree`](crate::page::Tree)); the first key in a page also allocates the page (and, with [`Flat`], grows the directory up to it) |
 //! | iteration, [`clear`](PagedDirectMap::clear), [`retain`](PagedDirectMap::retain) | O(allocated pages × `PAGE`), plus with [`Flat`] O(directory length) to skip unallocated pages |
-//! | [`range`](PagedDirectMap::range), [`next_occupant`](PagedDirectMap::next_occupant), [`first_key_value`](PagedDirectMap::first_key_value) and the other [ordered queries](self#ordered-queries) | reaching the first page of the range is O(1) (O(log pages) with [`Tree`](crate::page::Tree)); then the slots of the allocated pages in the range are scanned up to the entry wanted, plus with [`Flat`] the unallocated directory entries between them |
+//! | [`range`](PagedDirectMap::range), [`next_occupant`](PagedDirectMap::next_occupant), [`first_key_value`](PagedDirectMap::first_key_value) and the other [ordered queries](self#ordered-queries) | reaching the first page of the range is O(1) (O(depth) with [`Radix`](crate::page::Radix), O(log pages) with [`Tree`](crate::page::Tree)); then the slots of the allocated pages in the range are scanned up to the entry wanted, plus with [`Flat`] the unallocated directory entries between them |
 //! | [`len`](PagedDirectMap::len) | O(1) |
 //!
 //! Pages are not freed when they empty, as `HashMap` keeps its capacity;
@@ -111,7 +111,8 @@ type IntoPages<K, V, const PAGE: usize, D> =
 ///
 /// - `PAGE` is the number of slots per page; it must be non-zero. Each slot
 ///   takes `size_of::<Option<(K, V)>>()` bytes whether or not it is occupied.
-/// - `D` is the page directory: [`Flat`] (default) or
+/// - `D` is the page directory: [`Flat`] (default),
+///   [`Radix`](crate::page::Radix) for wide keys, or
 ///   [`Tree`](crate::page::Tree). See [`crate::page`].
 ///
 /// Entries are ordered by slot index. See the [module docs](self) for costs
@@ -1211,8 +1212,8 @@ mod serde_impl {
     ///
     /// Memory follows the key indices, not the input length: one key can
     /// allocate a page, and with [`Flat`] a directory up to that page. For
-    /// untrusted input, use [`Tree`](crate::page::Tree) or validate the keys
-    /// first.
+    /// untrusted input, use [`Radix`](crate::page::Radix) or
+    /// [`Tree`](crate::page::Tree), or validate the keys first.
     impl<'de, K, V, const PAGE: usize, D> Deserialize<'de> for PagedDirectMap<K, V, PAGE, D>
     where
         K: Key + Deserialize<'de>,

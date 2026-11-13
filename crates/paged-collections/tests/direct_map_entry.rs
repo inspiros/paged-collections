@@ -5,7 +5,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use paged_collections::direct_map::{Entry, PagedDirectMap};
 use paged_collections::key::Key;
-use paged_collections::page::{Directory, Flat, Tree};
+use paged_collections::page::{Directory, Flat, Radix, Tree};
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestCaseResult};
 
@@ -465,5 +465,8 @@ suite!(flat_1, 1, Flat);
 suite!(flat_3, 3, Flat);
 suite!(flat_8, 8, Flat);
 suite!(tree_1, 1, Tree);
+suite!(radix_1, 1, Radix);
 suite!(tree_3, 3, Tree);
+suite!(radix_3, 3, Radix);
 suite!(tree_8, 8, Tree);
+suite!(radix_8, 8, Radix);

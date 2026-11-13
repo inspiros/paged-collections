@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
 use paged_collections::key::Key;
-use paged_collections::page::{Directory, Flat, Tree};
+use paged_collections::page::{Directory, Flat, Radix, Tree};
 use paged_collections::sparse_map::PagedSparseMap;
 use paged_collections::sparse_set::PagedSparseSet;
 use proptest::prelude::*;
@@ -313,11 +313,17 @@ macro_rules! layouts {
         suite!(flat_8, $key, 8, Flat);
         suite!(flat_1024, $key, 1024, Flat);
         suite!(tree_1, $key, 1, Tree);
+        suite!(radix_1, $key, 1, Radix);
         suite!(tree_2, $key, 2, Tree);
+        suite!(radix_2, $key, 2, Radix);
         suite!(tree_3, $key, 3, Tree);
+        suite!(radix_3, $key, 3, Radix);
         suite!(tree_4, $key, 4, Tree);
+        suite!(radix_4, $key, 4, Radix);
         suite!(tree_8, $key, 8, Tree);
+        suite!(radix_8, $key, 8, Radix);
         suite!(tree_1024, $key, 1024, Tree);
+        suite!(radix_1024, $key, 1024, Radix);
     };
 }
 

@@ -8,7 +8,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use paged_collections::direct_map::PagedDirectMap;
 use paged_collections::key::Key;
-use paged_collections::page::{Directory, Flat, Tree};
+use paged_collections::page::{Directory, Flat, Radix, Tree};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseResult;
 
@@ -723,9 +723,13 @@ suite!(gen_flat_3, Gen, 3, Flat, gen_keys(), gen_probes());
 suite!(gen_flat_4, Gen, 4, Flat, gen_keys(), gen_probes());
 suite!(gen_flat_1024, Gen, 1024, Flat, gen_keys(), gen_probes());
 suite!(gen_tree_1, Gen, 1, Tree, gen_keys(), gen_probes());
+suite!(gen_radix_1, Gen, 1, Radix, gen_keys(), gen_probes());
 suite!(gen_tree_3, Gen, 3, Tree, gen_keys(), gen_probes());
+suite!(gen_radix_3, Gen, 3, Radix, gen_keys(), gen_probes());
 suite!(gen_tree_4, Gen, 4, Tree, gen_keys(), gen_probes());
+suite!(gen_radix_4, Gen, 4, Radix, gen_keys(), gen_probes());
 suite!(gen_tree_1024, Gen, 1024, Tree, gen_keys(), gen_probes());
+suite!(gen_radix_1024, Gen, 1024, Radix, gen_keys(), gen_probes());
 
 #[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
 mod integer_suites {
@@ -738,9 +742,13 @@ mod integer_suites {
     suite!(u32_flat_4, u32, 4, Flat, integer_keys(), probes());
     suite!(u32_flat_1024, u32, 1024, Flat, integer_keys(), probes());
     suite!(u32_tree_1, u32, 1, Tree, integer_keys(), probes());
+    suite!(u32_radix_1, u32, 1, Radix, integer_keys(), probes());
     suite!(u32_tree_3, u32, 3, Tree, integer_keys(), probes());
+    suite!(u32_radix_3, u32, 3, Radix, integer_keys(), probes());
     suite!(u32_tree_4, u32, 4, Tree, integer_keys(), probes());
+    suite!(u32_radix_4, u32, 4, Radix, integer_keys(), probes());
     suite!(u32_tree_1024, u32, 1024, Tree, integer_keys(), probes());
+    suite!(u32_radix_1024, u32, 1024, Radix, integer_keys(), probes());
 }
 
 macro_rules! all_layouts {
@@ -750,9 +758,13 @@ macro_rules! all_layouts {
         $test::<4, Flat>();
         $test::<1024, Flat>();
         $test::<1, Tree>();
+        $test::<1, Radix>();
         $test::<3, Tree>();
+        $test::<3, Radix>();
         $test::<4, Tree>();
+        $test::<4, Radix>();
         $test::<1024, Tree>();
+        $test::<1024, Radix>();
     };
 }
 
