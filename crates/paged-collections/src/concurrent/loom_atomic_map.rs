@@ -74,6 +74,9 @@ fn direct_insert_races_remove() {
         let map = Arc::new(AtomicDirectMap::<1>::new());
         let writer = map.clone();
         let worker = thread::spawn(move || assert_eq!(writer.insert(0, 7), None));
+        // A yield costs no preemption and lets loom run the insert first;
+        // without it the remove always won and the Some(7) arm never ran.
+        thread::yield_now();
         let removed = map.remove(0);
         worker.join().unwrap();
         match removed {
@@ -97,6 +100,8 @@ fn id_insert_races_remove() {
         let key = id(0, 1);
         let writer = map.clone();
         let worker = thread::spawn(move || assert_eq!(writer.insert(key, 7), None));
+        // Lets loom run the insert first (see direct_insert_races_remove).
+        thread::yield_now();
         let removed = map.remove(key);
         worker.join().unwrap();
         match removed {
@@ -221,7 +226,10 @@ fn direct_traversal_races_old_and_new_chunks() {
             writer.insert(1, 101);
             writer.insert(2, 102);
         });
-        let seen: alloc::vec::Vec<_> = map.iter().collect();
+        // Yields cost no preemption and let loom run the writer before and
+        // during the traversal; without them every traversal saw only key 0.
+        thread::yield_now();
+        let seen: alloc::vec::Vec<_> = map.iter().inspect(|_| thread::yield_now()).collect();
         assert_eq!(seen.first(), Some(&(0, 100)));
         assert!(seen.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert!(seen.iter().all(|&(key, value)| value == 100 + key as u64));
@@ -245,7 +253,10 @@ fn id_traversal_races_old_and_new_chunks() {
             writer.insert(id(1, 2), 101);
             writer.insert(id(2, 3), 102);
         });
-        let seen: alloc::vec::Vec<_> = map.iter().collect();
+        // Yields cost no preemption and let loom run the writer before and
+        // during the traversal; without them every traversal saw only key 0.
+        thread::yield_now();
+        let seen: alloc::vec::Vec<_> = map.iter().inspect(|_| thread::yield_now()).collect();
         assert_eq!(seen.first(), Some(&(id(0, 1), 100)));
         assert!(
             seen.windows(2)

@@ -73,10 +73,14 @@ fn traversal_races_installs_in_old_and_new_chunks() {
             writer.insert(1, 101);
             writer.insert(2, 102);
         });
+        // Yields cost no preemption and let loom run the writer before and
+        // during the traversal; without them every traversal saw only key 0.
+        thread::yield_now();
         let mut seen = alloc::vec::Vec::new();
         map.for_each(|&key, &value| {
             assert_eq!(value, 100 + key);
             seen.push(key);
+            thread::yield_now();
         });
         assert_eq!(seen.first(), Some(&0));
         assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
