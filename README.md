@@ -70,6 +70,59 @@ let in_range: Vec<u32> = score.range(a..=b).map(|(_, &s)| s).collect();
 assert_eq!(in_range, [10, 20]);
 ```
 
+## Concurrent
+
+The `concurrent` feature adds separate types for shared (`&self`) mutation
+across threads. They use only `core` atomics and `alloc`, so they also work
+without `std`. One rule holds throughout: *grow shared, shrink exclusive*.
+Shared access may install pages and fill slots, but memory is freed only
+under `&mut self` or on drop, so no epochs or hazard pointers are needed.
+
+| Type | Shared operations | Notes |
+|---|---|---|
+| `ConcurrentHive<T>` | insert, remove, lookup | Lookups return a `Ref` guard that pins the value |
+| `ConcurrentAppendHive<T>` | insert, lookup | Lookups return plain `&T`; removal needs `&mut self` |
+| `ConcurrentPagedVec<T>` | push, lookup | `len` and iteration cover the hole-free prefix |
+| `ConcurrentSparseSet<K>`, `ConcurrentSparseMap<K, V>` | insert-only, lookup | Plain `&V` references; removal needs `&mut self` |
+| `ConcurrentDirectMap<K, V>` | insert, replace, remove, entry | One reader-writer lock per page |
+| `AtomicDirectMap`, `AtomicIdMap` | lock-free one-word updates | `usize -> u64` (below `u64::MAX`), `Id -> u32` |
+| `ConcurrentIdAllocator` | allocate, free | Generational ids, as `IdAllocator` |
+
+Each type converts to and from its plain counterpart under exclusive
+ownership (`into_inner`, `From`). The sparse types, `ConcurrentDirectMap` and
+`AtomicDirectMap` take a final `SharedDirectory` parameter: `page::Flat` by
+default, or `page::Radix` for keys anywhere in the `usize` range.
+`page::Tree` has no concurrent form.
+
+```rust
+# #[cfg(feature = "concurrent")] {
+use paged_collections::concurrent::{AtomicDirectMap, ConcurrentSparseMap};
+use paged_collections::page::Radix;
+
+let names: ConcurrentSparseMap<usize, String, 1024, Radix> = ConcurrentSparseMap::new();
+let hits: AtomicDirectMap = AtomicDirectMap::new();
+std::thread::scope(|s| {
+    for t in 0..4usize {
+        let (names, hits) = (&names, &hits);
+        s.spawn(move || {
+            // Wide keys are fine with Radix.
+            let _ = names.try_insert(usize::MAX - t, format!("worker {t}"));
+            for _ in 0..100 {
+                let _ = hits.fetch_update(7, |n| Some(Some(n.unwrap_or(0) + 1)));
+            }
+        });
+    }
+});
+assert_eq!(names.len(), 4);
+assert_eq!(names.get(&(usize::MAX - 2)).map(String::as_str), Some("worker 2"));
+assert_eq!(hits.get(7), Some(400));
+
+// Exclusive ownership converts to the plain map, keeping the directory.
+let plain = names.into_inner();
+assert_eq!(plain.len(), 4);
+# }
+```
+
 ## Python
 
 Keys are integers in `0 <= key < 2**32`. `SparseSet` holds keys,
