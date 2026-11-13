@@ -53,6 +53,7 @@ mod hive;
 mod id_alloc;
 mod index;
 mod lock;
+mod radix;
 mod sparse;
 mod spine;
 mod vec;
@@ -81,6 +82,9 @@ mod loom_direct;
 
 #[cfg(all(test, loom))]
 mod loom_hive;
+
+#[cfg(all(test, loom))]
+mod loom_radix;
 
 #[cfg(all(test, loom))]
 mod loom_tests;
