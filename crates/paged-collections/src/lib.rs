@@ -29,6 +29,8 @@
 //! - `std` (default): `std`-only conveniences. Without it the crate is `no_std`
 //!   and needs only `alloc`.
 //! - `serde`: serialization support.
+//! - `concurrent`: thread-safe variants in [`concurrent`], which use `unsafe`
+//!   code and atomics. Off by default.
 
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -37,6 +39,15 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+// Needs pointer-sized and 64-bit atomics, and `u32` indices that fit `usize`.
+#[cfg(all(
+    feature = "concurrent",
+    target_has_atomic = "ptr",
+    target_has_atomic = "64",
+    any(target_pointer_width = "32", target_pointer_width = "64")
+))]
+#[cfg_attr(docsrs, doc(cfg(feature = "concurrent")))]
+pub mod concurrent;
 pub mod direct_map;
 // Slot indices are `u32` and must convert to `usize` without loss.
 #[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]

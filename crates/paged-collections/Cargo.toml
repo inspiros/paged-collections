@@ -15,9 +15,14 @@ default = ["std"]
 std = []
 ## `Serialize`/`Deserialize` for the collections.
 serde = ["dep:serde"]
+## Concurrent containers using core atomics and alloc.
+concurrent = []
 
 [dependencies]
 serde = { workspace = true, optional = true }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
 
 [lints]
 workspace = true
