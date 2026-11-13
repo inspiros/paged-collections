@@ -5,21 +5,13 @@ use core::fmt;
 use core::iter::FusedIterator;
 
 use super::append::AppendLog;
-use super::atomic::{AtomicPtr, AtomicU32, Ordering, spin_loop};
+use super::atomic::{AtomicU32, Ordering};
+use super::index::{INDEX_CHUNKS, page_number, retry};
 use super::spine::Spine;
 use crate::key::Key;
 use crate::page::{DEFAULT_PAGE, Flat};
 use crate::sparse_map::PagedSparseMap;
 use crate::sparse_set::PagedSparseSet;
-
-#[cfg(not(loom))]
-const INDEX_CHUNKS: usize = 28;
-#[cfg(loom)]
-const INDEX_CHUNKS: usize = 32;
-#[cfg(not(loom))]
-const SPINE_BASE: usize = 32;
-#[cfg(loom)]
-const SPINE_BASE: usize = 2;
 
 const RESERVED: u32 = u32::MAX;
 // 0 is empty and u32::MAX is RESERVED: encodings 1..u32::MAX are positions.
@@ -31,16 +23,6 @@ struct IndexPage {
 
 struct Index<const PAGE: usize> {
     pages: Spine<IndexPage, INDEX_CHUNKS>,
-}
-
-fn retry(spins: &mut u32) {
-    *spins = spins.saturating_add(1);
-    #[cfg(all(feature = "std", not(loom)))]
-    if *spins >= 64 {
-        std::thread::yield_now();
-        return;
-    }
-    spin_loop();
 }
 
 /// Only a successful 0 -> RESERVED CAS creates this guard. It restores 0 on
@@ -81,21 +63,8 @@ impl<const PAGE: usize> Index<PAGE> {
     }
 
     fn page_number(index: usize) -> usize {
-        let page = index / PAGE;
-        let k = ((page / SPINE_BASE) + 1).ilog2() as usize;
-        // Check both the directory range and the chunk allocation layout.
-        // In particular the last u32 pages with PAGE=1 do not fit on 32-bit.
-        let cells = 1usize
-            .checked_shl(k as u32)
-            .and_then(|factor| SPINE_BASE.checked_mul(factor));
-        assert!(
-            k < INDEX_CHUNKS
-                && cells.is_some_and(
-                    |n| n <= isize::MAX as usize / core::mem::size_of::<AtomicPtr<IndexPage>>()
-                ),
-            "ConcurrentSparse: key index exceeds sparse spine range"
-        );
-        page
+        page_number::<IndexPage, PAGE>(index)
+            .expect("ConcurrentSparse: key index exceeds sparse spine range")
     }
 
     fn slot(&self, index: usize) -> Option<&AtomicU32> {

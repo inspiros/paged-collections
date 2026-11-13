@@ -123,6 +123,22 @@ impl<P, const CHUNKS: usize> Spine<P, CHUNKS> {
         unsafe { &*installed }
     }
 
+    /// Installed pages in ascending order, weakly consistent across pages.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &P)> {
+        self.chunks.iter().enumerate().flat_map(move |(k, cell)| {
+            // Acquire observes publication; chunks remain installed while shared.
+            let len = if cell.load(Ordering::Acquire).is_null() {
+                0
+            } else {
+                BASE << k
+            };
+            (0..len).filter_map(move |offset| {
+                let number = (BASE << k) - BASE + offset;
+                self.get(number).map(|page| (number, page))
+            })
+        })
+    }
+
     /// Installed pages in ascending order, with exclusive access to each.
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut P)> {
         // The adapter below only stores atomic pointers, which are `Send`

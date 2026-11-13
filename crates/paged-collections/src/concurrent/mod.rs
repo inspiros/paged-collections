@@ -26,16 +26,27 @@
 //! with a finite index range, and an occupied slot refuses other generations.
 //! All three types support removal and conversion to their plain equivalents
 //! under exclusive ownership. Conversion moves elements in O(len) time.
+//!
+//! [`ConcurrentDirectMap`] permits shared replacement and removal through one
+//! reader-writer lock per page. Neighbouring keys contend; guards and entries
+//! must be released before locking the same page again. Ordered traversals
+//! are consistent per page only. Pages are freed only with exclusive access.
 
 mod append;
 mod atomic;
+mod direct;
 mod free_stack;
 mod hive;
 mod id_alloc;
+mod index;
+mod lock;
 mod sparse;
 mod spine;
 mod vec;
 
+pub use direct::{
+    ConcurrentDirectMap, DirectMapRef, DirectMapRefMut, Entry, OccupiedEntry, VacantEntry,
+};
 pub use hive::{ConcurrentHive, Drain, Iter, IterMut, Ref};
 pub use id_alloc::ConcurrentIdAllocator;
 pub use sparse::{ConcurrentSparseMap, ConcurrentSparseSet};
@@ -43,6 +54,9 @@ pub use vec::ConcurrentPagedVec;
 
 #[cfg(all(test, loom))]
 mod loom_append;
+
+#[cfg(all(test, loom))]
+mod loom_direct;
 
 #[cfg(all(test, loom))]
 mod loom_hive;

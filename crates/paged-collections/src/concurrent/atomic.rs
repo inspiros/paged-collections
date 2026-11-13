@@ -57,6 +57,16 @@ impl<T> UnsafeCell<T> {
         }
     }
 
+    #[cfg(any(not(feature = "std"), loom))]
+    pub(super) fn into_inner(self) -> T {
+        self.inner.into_inner()
+    }
+
+    #[cfg(loom)]
+    pub(super) fn write(&self) -> loom::cell::MutPtr<T> {
+        self.inner.get_mut()
+    }
+
     // Keep loom's read tracking alive for the entire Ref, including references
     // returned by Deref that escape the shorter `with` callback.
     #[cfg(loom)]
