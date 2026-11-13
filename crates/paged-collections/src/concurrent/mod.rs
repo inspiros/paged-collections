@@ -14,6 +14,12 @@
 //! can therefore contend even between readers. Prefer the plain
 //! [`Hive`](crate::hive::Hive) when shared mutation is unnecessary.
 //!
+//! [`ConcurrentAppendHive`] supports shared insertion and ordinary `&T`
+//! lookups with one Acquire slot-state load and no guard or reference count.
+//! Removal and mutable access require exclusive ownership. Iteration may
+//! miss insertions in flight; conversions to and from [`Hive`](crate::hive::Hive)
+//! preserve live ids and stale-id history in O(index bound) time.
+//!
 //! [`ConcurrentPagedVec`] appends without waiting for earlier writers. Its
 //! point lookups see completed pushes; `len`, iteration and page slices use a
 //! hole-free prefix which can lag while an earlier push is in flight. When
@@ -38,6 +44,7 @@
 //! generational ids with any `u32` value. Traversals copy values in index order.
 
 mod append;
+mod append_hive;
 mod atomic;
 mod atomic_map;
 mod direct;
@@ -50,6 +57,7 @@ mod sparse;
 mod spine;
 mod vec;
 
+pub use append_hive::{AppendDrain, AppendIter, AppendIterMut, ConcurrentAppendHive};
 pub use atomic_map::{AtomicDirectMap, AtomicIdMap};
 pub use direct::{
     ConcurrentDirectMap, DirectMapRef, DirectMapRefMut, Entry, OccupiedEntry, VacantEntry,
@@ -61,6 +69,9 @@ pub use vec::ConcurrentPagedVec;
 
 #[cfg(all(test, loom))]
 mod loom_append;
+
+#[cfg(all(test, loom))]
+mod loom_append_hive;
 
 #[cfg(all(test, loom))]
 mod loom_atomic_map;

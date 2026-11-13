@@ -122,4 +122,11 @@ impl FreeStack {
         // Relaxed: a reservation bound, not a page-initialization barrier.
         self.next_fresh.load(Ordering::Relaxed)
     }
+
+    /// Sets the fresh-index boundary during exclusive construction only.
+    pub(crate) fn set_next_fresh(&mut self, bound: u32) {
+        debug_assert_eq!(self.index_bound(), 0);
+        // Relaxed: the newly built owner has not been shared or reserved from.
+        self.next_fresh.store(bound, Ordering::Relaxed);
+    }
 }
