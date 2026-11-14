@@ -8,7 +8,7 @@
 //! | Marker | Store | Page lookup | Directory memory |
 //! |---|---|---|---|
 //! | [`Flat`] | `Vec<Option<Box<[T; PAGE]>>>` | O(1), one indirection | one pointer per page up to the highest page used |
-//! | [`Radix`] | path-compressed 64-ary trie | O(depth), at most ceil(usize bits / 6) branches | proportional to allocated pages only |
+//! | [`Radix`] | flat window for low page numbers, then a path-compressed 64-ary trie | O(1) in the window, else O(depth), at most ceil(usize bits / 6) branches | proportional to allocated pages only |
 //! | [`Tree`] | `BTreeMap<usize, Box<[T; PAGE]>>` | O(log pages) | proportional to allocated pages only |
 //!
 //! Use [`Flat`] (the default) when indices stay below a few billion, for
@@ -453,14 +453,14 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for TreePages<T, PAGE> {
     }
 }
 
-/// Pages in a bitmapped, path-compressed radix directory.
+/// The radix tree behind [`RadixPages`]: a bitmapped, path-compressed trie.
 ///
 /// Page numbers may use the full `usize` range. Each branch examines six
 /// bits, and shared paths are compressed, so lookup costs O(depth) and
 /// directory memory is proportional to the number of allocated pages. The
 /// last six bits are resolved by a table of 64 page pointers, indexed
 /// directly, as soon as two pages share a group of 64.
-pub struct RadixPages<T, const PAGE: usize> {
+pub(crate) struct RadixTree<T, const PAGE: usize> {
     root: Option<Child<T, PAGE>>,
     allocated: usize,
 }
@@ -789,7 +789,7 @@ impl<T, const PAGE: usize> Child<T, PAGE> {
     }
 }
 
-impl<T, const PAGE: usize> Default for RadixPages<T, PAGE> {
+impl<T, const PAGE: usize> Default for RadixTree<T, PAGE> {
     fn default() -> Self {
         Self {
             root: None,
@@ -798,7 +798,7 @@ impl<T, const PAGE: usize> Default for RadixPages<T, PAGE> {
     }
 }
 
-impl<T: Clone, const PAGE: usize> Clone for RadixPages<T, PAGE> {
+impl<T: Clone, const PAGE: usize> Clone for RadixTree<T, PAGE> {
     fn clone(&self) -> Self {
         Self {
             root: self.root.clone(),
@@ -807,9 +807,9 @@ impl<T: Clone, const PAGE: usize> Clone for RadixPages<T, PAGE> {
     }
 }
 
-impl<T, const PAGE: usize> fmt::Debug for RadixPages<T, PAGE> {
+impl<T, const PAGE: usize> fmt::Debug for RadixTree<T, PAGE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RadixPages")
+        f.debug_struct("RadixTree")
             .field("page_size", &PAGE)
             .field("allocated", &self.allocated)
             .field("depth", &self.root.as_ref().map_or(0, Child::depth))
@@ -1045,7 +1045,7 @@ macro_rules! radix_iterator {
 radix_iterator!(RadixIter, 'a, &'a [T; PAGE], iter, as_deref);
 radix_iterator!(RadixIterMut, 'a, &'a mut [T; PAGE], iter_mut, as_deref_mut);
 
-impl<T, const PAGE: usize> PageStore<T, PAGE> for RadixPages<T, PAGE> {
+impl<T, const PAGE: usize> PageStore<T, PAGE> for RadixTree<T, PAGE> {
     type Pages<'a>
         = RadixIter<'a, T, PAGE>
     where
@@ -1161,8 +1161,212 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for RadixPages<T, PAGE> {
     }
 }
 
+/// Pages in a dense flat window followed by a bitmapped, path-compressed
+/// radix tree.
+///
+/// Page numbers may use the full `usize` range. Low page numbers live in a
+/// flat window (`Vec<Option<Box<[T; PAGE]>>>`, as in [`FlatPages`]), so a
+/// lookup there costs one bounds check and one indirection. Every page at or
+/// above the window's length lives in the radix tree: each branch examines
+/// six bits, shared paths are compressed, and the last six bits are resolved
+/// by a table of 64 page pointers, so lookup costs O(depth).
+///
+/// The window only grows to cover a new page `p` when `p` is below
+/// `8 * (allocated + 1) + 64`; pages of the tree it then covers move into it.
+/// Its length is therefore at most eight pointers per allocated page (at the
+/// time it grew) plus 64, so directory memory stays proportional to the
+/// pages allocated, as with the tree alone. Removing pages does not shrink
+/// the window; [`shrink_to_fit`](PageStore::shrink_to_fit) drops its empty
+/// tail.
+pub struct RadixPages<T, const PAGE: usize> {
+    /// Pages `0 .. window.pages.len()`.
+    window: FlatPages<T, PAGE>,
+    /// Pages at or above `window.pages.len()`.
+    tree: RadixTree<T, PAGE>,
+}
+
+/// Window pointers allowed per allocated page, and the window's free length.
+const WINDOW_SLACK: usize = 8;
+const WINDOW_MIN: usize = 64;
+
+impl<T, const PAGE: usize> Default for RadixPages<T, PAGE> {
+    fn default() -> Self {
+        Self {
+            window: FlatPages::default(),
+            tree: RadixTree::default(),
+        }
+    }
+}
+
+impl<T: Clone, const PAGE: usize> Clone for RadixPages<T, PAGE> {
+    fn clone(&self) -> Self {
+        Self {
+            window: self.window.clone(),
+            tree: self.tree.clone(),
+        }
+    }
+}
+
+impl<T, const PAGE: usize> fmt::Debug for RadixPages<T, PAGE> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RadixPages")
+            .field("page_size", &PAGE)
+            .field("window_len", &self.window.pages.len())
+            .field("allocated", &self.allocated())
+            .finish()
+    }
+}
+
+impl<T, const PAGE: usize> RadixPages<T, PAGE> {
+    /// Whether the window may grow to cover `page`.
+    fn admits(&self, page: usize) -> bool {
+        let limit = WINDOW_SLACK
+            .saturating_mul(self.allocated().saturating_add(1))
+            .saturating_add(WINDOW_MIN);
+        page < limit
+    }
+
+    /// Grows the window to cover `page` and moves the tree's pages it now
+    /// covers into it. Runs no user code.
+    #[cold]
+    #[inline(never)]
+    fn grow_window(&mut self, page: usize) {
+        let old = self.window.pages.len();
+        self.window.pages.resize_with(page + 1, || None);
+        let moved: Vec<usize> = self.tree.pages_in(old..=page).map(|(n, _)| n).collect();
+        for n in moved {
+            let taken = self.tree.remove(n).expect("page was just listed");
+            self.window.pages[n] = Some(taken);
+            self.window.allocated += 1;
+        }
+    }
+}
+
+impl<T, const PAGE: usize> PageStore<T, PAGE> for RadixPages<T, PAGE> {
+    type Pages<'a>
+        = core::iter::Chain<
+        <FlatPages<T, PAGE> as PageStore<T, PAGE>>::Pages<'a>,
+        RadixIter<'a, T, PAGE>,
+    >
+    where
+        T: 'a;
+
+    type PagesMut<'a>
+        = core::iter::Chain<
+        <FlatPages<T, PAGE> as PageStore<T, PAGE>>::PagesMut<'a>,
+        RadixIterMut<'a, T, PAGE>,
+    >
+    where
+        T: 'a;
+
+    type IntoPages = core::iter::Chain<
+        <FlatPages<T, PAGE> as PageStore<T, PAGE>>::IntoPages,
+        alloc::vec::IntoIter<(usize, Box<[T; PAGE]>)>,
+    >;
+
+    #[inline]
+    fn get(&self, page: usize) -> Option<&[T; PAGE]> {
+        match self.window.pages.get(page) {
+            Some(entry) => entry.as_deref(),
+            None => self.tree.get(page),
+        }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, page: usize) -> Option<&mut [T; PAGE]> {
+        match self.window.pages.get_mut(page) {
+            Some(entry) => entry.as_deref_mut(),
+            None => self.tree.get_mut(page),
+        }
+    }
+
+    fn get_or_alloc(&mut self, page: usize) -> &mut [T; PAGE]
+    where
+        T: Default,
+    {
+        if page >= self.window.pages.len() {
+            if self.tree.get(page).is_some() {
+                return self.tree.get_mut(page).expect("page was just found");
+            }
+            if !self.admits(page) {
+                return self.tree.get_or_alloc(page);
+            }
+            self.grow_window(page);
+        }
+        self.window.get_or_alloc(page)
+    }
+
+    fn remove(&mut self, page: usize) -> Option<Box<[T; PAGE]>> {
+        if page < self.window.pages.len() {
+            self.window.remove(page)
+        } else {
+            self.tree.remove(page)
+        }
+    }
+
+    fn clear(&mut self) {
+        // Empty the store before dropping pages: `T::drop()` may panic, and
+        // the other half is then still dropped while unwinding.
+        let window = core::mem::take(&mut self.window);
+        let tree = core::mem::take(&mut self.tree);
+        drop(tree);
+        drop(window);
+    }
+
+    #[inline]
+    fn allocated(&self) -> usize {
+        self.window.allocated() + self.tree.allocated()
+    }
+
+    fn shrink_to_fit(&mut self) {
+        // Trimming the window's empty tail keeps every tree page above it.
+        self.window.shrink_to_fit();
+        self.tree.shrink_to_fit();
+    }
+
+    fn pages(&self) -> Self::Pages<'_> {
+        self.pages_in(0..=usize::MAX)
+    }
+
+    fn pages_mut(&mut self) -> Self::PagesMut<'_> {
+        self.pages_in_mut(0..=usize::MAX)
+    }
+
+    fn pages_in(&self, numbers: RangeInclusive<usize>) -> Self::Pages<'_> {
+        self.window
+            .pages_in(numbers.clone())
+            .chain(self.tree.pages_in(numbers))
+    }
+
+    fn pages_in_mut(&mut self, numbers: RangeInclusive<usize>) -> Self::PagesMut<'_> {
+        self.window
+            .pages_in_mut(numbers.clone())
+            .chain(self.tree.pages_in_mut(numbers))
+    }
+
+    fn into_pages(self) -> Self::IntoPages {
+        self.window.into_pages().chain(self.tree.into_pages())
+    }
+}
+
 #[cfg(test)]
 impl<T, const PAGE: usize> RadixPages<T, PAGE> {
+    fn check(&self) {
+        self.tree.check();
+        let len = self.window.pages.len();
+        assert_eq!(
+            self.window.pages.iter().flatten().count(),
+            self.window.allocated
+        );
+        assert!(self.tree.pages().all(|(n, _)| n >= len));
+        let numbers: Vec<usize> = self.pages().map(|(n, _)| n).collect();
+        assert_eq!(numbers.len(), self.allocated());
+        assert!(numbers.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+}
+
+#[cfg(test)]
+impl<T, const PAGE: usize> RadixTree<T, PAGE> {
     fn check(&self) {
         fn visit<T, const PAGE: usize>(child: &Child<T, PAGE>, numbers: &mut Vec<usize>) {
             match child {
@@ -1279,7 +1483,34 @@ mod tests {
             store.remove(n);
             store.check();
         }
-        assert!(store.root.is_none());
+        assert!(store.tree.root.is_none());
+        assert_eq!(store.window.allocated(), 0);
+    }
+
+    #[test]
+    fn radix_window_absorbs_tree_pages() {
+        let mut store = RadixPages::<u8, 2>::default();
+        store.get_or_alloc(100)[0] = 7;
+        store.get_or_alloc(usize::MAX);
+        assert_eq!(store.tree.allocated(), 2);
+        for n in 0..10 {
+            store.get_or_alloc(n);
+            store.check();
+        }
+        assert_eq!(store.window.pages.len(), 10);
+        store.get_or_alloc(101);
+        store.check();
+        assert_eq!(store.window.pages.len(), 102);
+        assert_eq!(store.tree.allocated(), 1);
+        assert_eq!(store.get(100).map(|p| p[0]), Some(7));
+        store.remove(101);
+        store.shrink_to_fit();
+        store.check();
+        assert_eq!(store.window.pages.len(), 101);
+        let all: Vec<usize> = store.pages().map(|(n, _)| n).collect();
+        let mut expected: Vec<usize> = (0..10).collect();
+        expected.extend([100, usize::MAX]);
+        assert_eq!(all, expected);
     }
 
     #[test]
