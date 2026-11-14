@@ -68,7 +68,7 @@ pub trait Map: Default {
     fn delete(&mut self, key: u32);
     fn visit(&self) -> u64;
 }
-impl Map for PagedSparseMap<u32, u64> {
+impl<const PAGE: usize> Map for PagedSparseMap<u32, u64, PAGE> {
     fn put(&mut self, k: u32, v: u64) {
         let _ = self.insert(k, v);
     }
@@ -82,7 +82,7 @@ impl Map for PagedSparseMap<u32, u64> {
         self.iter().fold(0u64, |a, (_, v)| a.wrapping_add(*v))
     }
 }
-impl<D: Directory> Map for PagedDirectMap<u32, u64, 1024, D> {
+impl<const PAGE: usize, D: Directory> Map for PagedDirectMap<u32, u64, PAGE, D> {
     fn put(&mut self, k: u32, v: u64) {
         let _ = self.insert(k, v);
     }
@@ -155,7 +155,7 @@ pub trait Set: Default {
     fn delete(&mut self, key: u32);
     fn visit(&self) -> u64;
 }
-impl Set for PagedSparseSet<u32> {
+impl<const PAGE: usize> Set for PagedSparseSet<u32, PAGE> {
     fn put(&mut self, k: u32) {
         let _ = self.insert(k);
     }
