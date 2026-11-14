@@ -457,18 +457,40 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for TreePages<T, PAGE> {
 ///
 /// Page numbers may use the full `usize` range. Each branch examines six
 /// bits, and shared paths are compressed, so lookup costs O(depth) and
-/// directory memory is proportional to the number of allocated pages.
+/// directory memory is proportional to the number of allocated pages. The
+/// last six bits are resolved by a table of 64 page pointers, indexed
+/// directly, as soon as two pages share a group of 64.
 pub struct RadixPages<T, const PAGE: usize> {
     root: Option<Child<T, PAGE>>,
     allocated: usize,
 }
 
+/// A table slot: the page with that number, if allocated.
+type PageSlot<T, const PAGE: usize> = Option<Box<[T; PAGE]>>;
+
+/// Pointers to the pages of one aligned group of 64 page numbers.
+type Slots<T, const PAGE: usize> = [PageSlot<T, PAGE>; 64];
+
 #[derive(Clone)]
 enum Child<T, const PAGE: usize> {
-    Leaf { number: usize, page: Box<[T; PAGE]> },
-    Node(Box<Node<T, PAGE>>),
+    /// A single page, at any depth (lazy expansion).
+    Leaf {
+        number: usize,
+        page: Box<[T; PAGE]>,
+    },
+    /// Pages `group * 64 .. group * 64 + 64`, at least two of them present
+    /// (`len` counts them). Replaces a branch on the lowest six bits.
+    Table {
+        group: usize,
+        len: u32,
+        slots: Box<Slots<T, PAGE>>,
+    },
+    // Inline, not boxed: a lookup then pays one dependent load per level
+    // (the parent's children buffer) instead of two.
+    Node(Node<T, PAGE>),
 }
 
+/// A branch on bits `shift .. shift + 6`; `shift` is a nonzero multiple of 6.
 #[derive(Clone)]
 struct Node<T, const PAGE: usize> {
     shift: u32,
@@ -482,11 +504,20 @@ fn chunk(number: usize, shift: u32) -> u32 {
 }
 
 fn prefix(number: usize, shift: u32) -> usize {
-    number.checked_shr(shift + 6).unwrap_or(0)
+    // Two shifts, each below `usize::BITS`, so no overflow check is needed;
+    // for the top node the result is 0, as with a checked shift.
+    number >> shift >> 6
 }
 
+#[inline]
 fn position(bitmap: u64, chunk: u32) -> usize {
-    (bitmap & ((1_u64 << chunk) - 1)).count_ones() as usize
+    // Full nodes (the common case for dense page numbers) skip the popcount,
+    // which is a software routine unless the target has `popcnt`.
+    if bitmap == u64::MAX {
+        chunk as usize
+    } else {
+        (bitmap & ((1_u64 << chunk) - 1)).count_ones() as usize
+    }
 }
 
 impl<T, const PAGE: usize> Node<T, PAGE> {
@@ -508,20 +539,33 @@ impl<T, const PAGE: usize> Node<T, PAGE> {
     }
 }
 
+/// Slots of the table for `group` that can hold page numbers in these
+/// bounds, as a range of offsets.
+fn slot_span(group: usize, lo: usize, hi: usize) -> RangeInclusive<usize> {
+    let base = group << 6;
+    let top = base | 63;
+    if hi < base || lo > top {
+        #[allow(clippy::reversed_empty_ranges)]
+        return 1..=0;
+    }
+    lo.saturating_sub(base)..=hi.min(top) - base
+}
+
 impl<T, const PAGE: usize> Child<T, PAGE> {
     /// A number with the same prefix as every leaf below this child.
     fn representative(&self) -> usize {
         match self {
             Self::Leaf { number, .. } => *number,
+            Self::Table { group, .. } => group << 6,
             Self::Node(node) => node.prefix.checked_shl(node.shift + 6).unwrap_or(0),
         }
     }
 
+    #[inline]
     fn get(&self, number: usize) -> Option<&[T; PAGE]> {
         let mut child = self;
         loop {
             match child {
-                Self::Leaf { number: n, page } => return (*n == number).then_some(page),
                 Self::Node(node) => {
                     let c = chunk(number, node.shift);
                     if prefix(number, node.shift) != node.prefix || node.bitmap & (1_u64 << c) == 0
@@ -530,15 +574,23 @@ impl<T, const PAGE: usize> Child<T, PAGE> {
                     }
                     child = &node.children[position(node.bitmap, c)];
                 }
+                Self::Table { group, slots, .. } => {
+                    return if number >> 6 == *group {
+                        slots[number & 63].as_deref()
+                    } else {
+                        None
+                    };
+                }
+                Self::Leaf { number: n, page } => return (*n == number).then_some(page),
             }
         }
     }
 
+    #[inline]
     fn get_mut(&mut self, number: usize) -> Option<&mut [T; PAGE]> {
         let mut child = self;
         loop {
             match child {
-                Self::Leaf { number: n, page } => return (*n == number).then_some(page),
                 Self::Node(node) => {
                     let c = chunk(number, node.shift);
                     if prefix(number, node.shift) != node.prefix || node.bitmap & (1_u64 << c) == 0
@@ -547,6 +599,14 @@ impl<T, const PAGE: usize> Child<T, PAGE> {
                     }
                     child = &mut node.children[position(node.bitmap, c)];
                 }
+                Self::Table { group, slots, .. } => {
+                    return if number >> 6 == *group {
+                        slots[number & 63].as_deref_mut()
+                    } else {
+                        None
+                    };
+                }
+                Self::Leaf { number: n, page } => return (*n == number).then_some(page),
             }
         }
     }
@@ -555,7 +615,7 @@ impl<T, const PAGE: usize> Child<T, PAGE> {
     fn leaf_page(&mut self) -> &mut [T; PAGE] {
         match self {
             Self::Leaf { page, .. } => page,
-            Self::Node(_) => unreachable!("child was just inserted as a leaf"),
+            _ => unreachable!("child was just inserted as a leaf"),
         }
     }
 
@@ -563,33 +623,70 @@ impl<T, const PAGE: usize> Child<T, PAGE> {
     /// returns it.
     fn insert(&mut self, number: usize, page: Box<[T; PAGE]>) -> &mut [T; PAGE] {
         // Decide first, so the borrow of `self` below ends on every path.
-        let descend = matches!(self, Self::Node(node) if prefix(number, node.shift) == node.prefix);
+        let descend = match self {
+            Self::Node(node) => prefix(number, node.shift) == node.prefix,
+            Self::Table { group, .. } => number >> 6 == *group,
+            Self::Leaf { .. } => false,
+        };
         if descend {
-            let Self::Node(node) = self else {
-                unreachable!("checked above")
-            };
-            let c = chunk(number, node.shift);
-            let pos = position(node.bitmap, c);
-            if node.bitmap & (1_u64 << c) == 0 {
-                node.children.insert(pos, Self::Leaf { number, page });
-                node.bitmap |= 1_u64 << c;
-                return node.children[pos].leaf_page();
+            match self {
+                Self::Node(node) => {
+                    let c = chunk(number, node.shift);
+                    let pos = position(node.bitmap, c);
+                    if node.bitmap & (1_u64 << c) == 0 {
+                        node.children.insert(pos, Self::Leaf { number, page });
+                        node.bitmap |= 1_u64 << c;
+                        return node.children[pos].leaf_page();
+                    }
+                    return node.children[pos].insert(number, page);
+                }
+                Self::Table { len, slots, .. } => {
+                    *len += 1;
+                    return slots[number & 63].insert(page);
+                }
+                Self::Leaf { .. } => unreachable!("leaves never descend"),
             }
-            return node.children[pos].insert(number, page);
         }
 
         let existing = self.representative();
         let shift = (usize::BITS - 1 - (existing ^ number).leading_zeros()) / 6 * 6;
+        if shift == 0 {
+            // Same group of 64. Only a leaf can get here: a table of this
+            // group would have descended, and a node's representative
+            // differs from every number outside it above bit `shift + 6`.
+            // Allocate before replacing the leaf; no user code runs below.
+            let slots = Box::new([const { None }; 64]);
+            let old = core::mem::replace(
+                self,
+                Self::Table {
+                    group: number >> 6,
+                    len: 2,
+                    slots,
+                },
+            );
+            let (
+                Self::Leaf {
+                    number: m,
+                    page: old_page,
+                },
+                Self::Table { slots, .. },
+            ) = (old, self)
+            else {
+                unreachable!("a leaf was just replaced by a table")
+            };
+            slots[m & 63] = Some(old_page);
+            return slots[number & 63].insert(page);
+        }
         let old_chunk = chunk(existing, shift);
         let new_chunk = chunk(number, shift);
         // Allocate before replacing the old child. No user code runs while
         // the new branch is being linked into the directory.
-        let branch = Box::new(Node {
+        let branch = Node {
             shift,
             prefix: prefix(number, shift),
             bitmap: (1_u64 << old_chunk) | (1_u64 << new_chunk),
             children: Vec::with_capacity(2),
-        });
+        };
         let old = core::mem::replace(self, Self::Node(branch));
         let Self::Node(node) = self else {
             unreachable!("branch was just installed")
@@ -607,10 +704,36 @@ impl<T, const PAGE: usize> Child<T, PAGE> {
         node.children[pos].leaf_page()
     }
 
-    /// Removes a known leaf and collapses every branch left with one child.
+    /// Removes a known leaf and collapses every branch left with one child,
+    /// and every table left with one page.
     fn remove(self, number: usize) -> (Option<Self>, Box<[T; PAGE]>) {
         match self {
             Self::Leaf { page, .. } => (None, page),
+            Self::Table {
+                group,
+                len,
+                mut slots,
+            } => {
+                let page = slots[number & 63].take().expect("page is allocated");
+                if len > 2 {
+                    let table = Self::Table {
+                        group,
+                        len: len - 1,
+                        slots,
+                    };
+                    return (Some(table), page);
+                }
+                let (offset, last) = slots
+                    .iter_mut()
+                    .enumerate()
+                    .find_map(|(offset, slot)| Some((offset, slot.take()?)))
+                    .expect("a table holds at least two pages");
+                let leaf = Self::Leaf {
+                    number: group << 6 | offset,
+                    page: last,
+                };
+                (Some(leaf), page)
+            }
             Self::Node(mut node) => {
                 let c = chunk(number, node.shift);
                 let pos = position(node.bitmap, c);
@@ -642,6 +765,7 @@ impl<T, const PAGE: usize> Child<T, PAGE> {
     fn depth(&self) -> usize {
         match self {
             Self::Leaf { .. } => 0,
+            Self::Table { .. } => 1,
             Self::Node(node) => 1 + node.children.iter().map(Self::depth).max().unwrap_or(0),
         }
     }
@@ -649,6 +773,13 @@ impl<T, const PAGE: usize> Child<T, PAGE> {
     fn into_pages(self, pages: &mut Vec<(usize, Box<[T; PAGE]>)>) {
         match self {
             Self::Leaf { number, page } => pages.push((number, page)),
+            Self::Table { group, slots, .. } => {
+                for (offset, slot) in (*slots).into_iter().enumerate() {
+                    if let Some(page) = slot {
+                        pages.push((group << 6 | offset, page));
+                    }
+                }
+            }
             Self::Node(node) => {
                 for child in node.children {
                     child.into_pages(pages);
@@ -767,11 +898,26 @@ impl<I> Chain<I> {
 /// and `next_back` visits each page exactly once. The chain is stored
 /// inline: creating or cloning the iterator never allocates.
 pub struct RadixIter<'a, T, const PAGE: usize> {
-    levels: Chain<slice::Iter<'a, Child<T, PAGE>>>,
+    levels: Walk<'a, T, PAGE>,
     lo: usize,
     hi: usize,
     done: bool,
 }
+
+/// One step of a walker's path: a node's children, or a table's slots
+/// together with the page number of the first slot left in `iter`'s range
+/// (the walker slices tables down to the range, so slot numbers come from
+/// the slice offset).
+#[derive(Clone)]
+enum Level<C, S> {
+    Children(C),
+    Slots { first: usize, iter: Enumerate<S> },
+}
+
+type Walk<'a, T, const PAGE: usize> =
+    Chain<Level<slice::Iter<'a, Child<T, PAGE>>, slice::Iter<'a, PageSlot<T, PAGE>>>>;
+type WalkMut<'a, T, const PAGE: usize> =
+    Chain<Level<slice::IterMut<'a, Child<T, PAGE>>, slice::IterMut<'a, PageSlot<T, PAGE>>>>;
 
 impl<T, const PAGE: usize> Clone for RadixIter<'_, T, PAGE> {
     fn clone(&self) -> Self {
@@ -790,7 +936,7 @@ impl<T, const PAGE: usize> Clone for RadixIter<'_, T, PAGE> {
 /// `next_back` are interleaved. The chain is stored inline: creating the
 /// iterator never allocates.
 pub struct RadixIterMut<'a, T, const PAGE: usize> {
-    levels: Chain<slice::IterMut<'a, Child<T, PAGE>>>,
+    levels: WalkMut<'a, T, PAGE>,
     lo: usize,
     hi: usize,
     done: bool,
@@ -799,7 +945,7 @@ pub struct RadixIterMut<'a, T, const PAGE: usize> {
 // Both walkers split slices through their iterators. In particular, the
 // mutable walker never borrows a child again after yielding one of its pages.
 macro_rules! radix_iterator {
-    ($name:ident, $lt:lifetime, $reference:ty, $iter:ident) => {
+    ($name:ident, $lt:lifetime, $reference:ty, $iter:ident, $deref:ident) => {
         impl<$lt, T, const PAGE: usize> $name<$lt, T, PAGE> {
             fn step(&mut self, back: bool) -> Option<(usize, $reference)> {
                 while !self.done {
@@ -812,10 +958,26 @@ macro_rules! radix_iterator {
                         self.done = true;
                         return None;
                     };
-                    let child = if back {
-                        level.next_back()
-                    } else {
-                        level.next()
+                    let child = match level {
+                        Level::Children(children) => {
+                            if back {
+                                children.next_back()
+                            } else {
+                                children.next()
+                            }
+                        }
+                        Level::Slots { first, iter } => {
+                            let slot = if back { iter.next_back() } else { iter.next() };
+                            match slot {
+                                Some((offset, slot)) => {
+                                    if let Some(page) = slot.$deref() {
+                                        return Some((*first + offset, page));
+                                    }
+                                    continue;
+                                }
+                                None => None,
+                            }
+                        }
                     };
                     let Some(child) = child else {
                         if back {
@@ -825,7 +987,7 @@ macro_rules! radix_iterator {
                         }
                         continue;
                     };
-                    match child {
+                    let pushed = match child {
                         Child::Leaf { number, page } => {
                             if (!back && *number > self.hi) || (back && *number < self.lo) {
                                 self.done = true;
@@ -834,18 +996,30 @@ macro_rules! radix_iterator {
                             if *number >= self.lo && *number <= self.hi {
                                 return Some((*number, page));
                             }
+                            continue;
+                        }
+                        Child::Table { group, slots, .. } => {
+                            let span = slot_span(*group, self.lo, self.hi);
+                            if span.is_empty() {
+                                continue;
+                            }
+                            Level::Slots {
+                                first: (*group << 6) + *span.start(),
+                                iter: slots[span].$iter().enumerate(),
+                            }
                         }
                         Child::Node(node) => {
                             let span = node.span(self.lo, self.hi);
-                            if !span.is_empty() {
-                                let children = node.children[span].$iter();
-                                if back {
-                                    self.levels.push_back(children);
-                                } else {
-                                    self.levels.push_front(children);
-                                }
+                            if span.is_empty() {
+                                continue;
                             }
+                            Level::Children(node.children[span].$iter())
                         }
+                    };
+                    if back {
+                        self.levels.push_back(pushed);
+                    } else {
+                        self.levels.push_front(pushed);
                     }
                 }
                 None
@@ -868,8 +1042,8 @@ macro_rules! radix_iterator {
     };
 }
 
-radix_iterator!(RadixIter, 'a, &'a [T; PAGE], iter);
-radix_iterator!(RadixIterMut, 'a, &'a mut [T; PAGE], iter_mut);
+radix_iterator!(RadixIter, 'a, &'a [T; PAGE], iter, as_deref);
+radix_iterator!(RadixIterMut, 'a, &'a mut [T; PAGE], iter_mut, as_deref_mut);
 
 impl<T, const PAGE: usize> PageStore<T, PAGE> for RadixPages<T, PAGE> {
     type Pages<'a>
@@ -955,7 +1129,7 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for RadixPages<T, PAGE> {
     fn pages_in(&self, numbers: RangeInclusive<usize>) -> Self::Pages<'_> {
         let mut levels = Chain::new();
         if let Some(root) = self.root.as_ref().filter(|_| !numbers.is_empty()) {
-            levels.push_back(slice::from_ref(root).iter());
+            levels.push_back(Level::Children(slice::from_ref(root).iter()));
         }
         RadixIter {
             levels,
@@ -968,7 +1142,7 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for RadixPages<T, PAGE> {
     fn pages_in_mut(&mut self, numbers: RangeInclusive<usize>) -> Self::PagesMut<'_> {
         let mut levels = Chain::new();
         if let Some(root) = self.root.as_mut().filter(|_| !numbers.is_empty()) {
-            levels.push_back(slice::from_mut(root).iter_mut());
+            levels.push_back(Level::Children(slice::from_mut(root).iter_mut()));
         }
         RadixIterMut {
             levels,
@@ -993,9 +1167,20 @@ impl<T, const PAGE: usize> RadixPages<T, PAGE> {
         fn visit<T, const PAGE: usize>(child: &Child<T, PAGE>, numbers: &mut Vec<usize>) {
             match child {
                 Child::Leaf { number, .. } => numbers.push(*number),
+                Child::Table { group, len, slots } => {
+                    assert!(*len >= 2);
+                    assert!(*group <= usize::MAX >> 6, "group keeps only high bits");
+                    assert_eq!(slots.iter().flatten().count(), *len as usize);
+                    for (offset, slot) in slots.iter().enumerate() {
+                        if slot.is_some() {
+                            numbers.push(group << 6 | offset);
+                        }
+                    }
+                }
                 Child::Node(node) => {
                     assert!(node.children.len() >= 2);
                     assert_eq!(node.shift % 6, 0);
+                    assert!(node.shift >= 6, "tables replace branches on the low bits");
                     assert!(node.shift < usize::BITS);
                     assert_eq!(node.bitmap.count_ones() as usize, node.children.len());
                     let mut chunks = (0..64).filter(|c| node.bitmap & (1_u64 << c) != 0);
@@ -1127,6 +1312,7 @@ mod tests {
         proptest::test_runner::TestRunner::new(config)
             .run(&ops, |ops| {
                 let mut store = RadixPages::<u8, 2>::default();
+                let mut oracle = alloc::collections::BTreeSet::new();
                 for (op, value, region, level) in ops {
                     let shift = (u32::from(level) * 6).min((usize::BITS - 1) / 6 * 6);
                     let boundary = 1_usize << shift;
@@ -1139,17 +1325,48 @@ mod tests {
                     match op {
                         0..=3 => {
                             store.get_or_alloc(n);
+                            oracle.insert(n);
                         }
                         4 => {
-                            store.remove(n);
+                            assert_eq!(store.remove(n).is_some(), oracle.remove(&n));
                         }
-                        5 => store.clear(),
+                        5 => {
+                            store.clear();
+                            oracle.clear();
+                        }
                         6 => store.shrink_to_fit(),
                         7 => {
                             store.clone().check();
                         }
                         8 => {
-                            store.get(n);
+                            assert_eq!(store.get(n).is_some(), oracle.contains(&n));
+                            // A bounded range around `n`, walked from both
+                            // ends alternately, against the oracle.
+                            let hi = n.saturating_add(value % 200);
+                            let mut walk = store.pages_in(n.saturating_sub(value % 150)..=hi);
+                            let expected: Vec<_> = oracle
+                                .range(n.saturating_sub(value % 150)..=hi)
+                                .copied()
+                                .collect();
+                            let (mut front, mut back) = (Vec::new(), Vec::new());
+                            let mut from_back = value % 2 == 0;
+                            loop {
+                                let next = if from_back {
+                                    walk.next_back()
+                                } else {
+                                    walk.next()
+                                };
+                                let Some((number, _)) = next else { break };
+                                if from_back {
+                                    back.push(number)
+                                } else {
+                                    front.push(number)
+                                }
+                                from_back = !from_back;
+                            }
+                            back.reverse();
+                            front.extend(back);
+                            assert_eq!(front, expected);
                         }
                         9 => {
                             if let Some(page) = store.get_mut(n) {
