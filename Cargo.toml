@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/paged-collections", "crates/paged-collections-py"]
+members = ["crates/paged-collections", "crates/paged-collections-py", "crates/bench"]
 default-members = ["crates/paged-collections"]
 
 [workspace.package]

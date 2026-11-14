@@ -1,0 +1,35 @@
+[package]
+name = "paged-collections-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+paged-collections = { path = "../paged-collections", features = ["concurrent"] }
+criterion = "0.5"
+hashbrown = "0.17"
+rustc-hash = "2"
+slotmap = "1"
+slab = "0.4"
+thunderdome = "0.6"
+priority-queue = "2"
+
+[[bench]]
+name = "sparse"
+harness = false
+
+[[bench]]
+name = "direct"
+harness = false
+
+[[bench]]
+name = "ids"
+harness = false
+
+[[bench]]
+name = "seq"
+harness = false
+
+[[bench]]
+name = "pq"
+harness = false
