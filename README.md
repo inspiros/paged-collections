@@ -284,4 +284,4 @@ development library is installed; build it through maturin (`uv sync` or
 
 ## License
 
-MIT OR Apache-2.0 (to be confirmed before the first release).
+MIT. See [LICENSE](LICENSE).

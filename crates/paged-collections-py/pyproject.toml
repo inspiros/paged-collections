@@ -7,7 +7,8 @@ name = "paged-collections"
 description = "Paged sparse sets, maps and stable-address containers, implemented in Rust"
 readme = "../../README.md"
 requires-python = ">=3.10"
-license = "MIT OR Apache-2.0"
+license = "MIT"
+authors = [{ name = "Hoang-Nhat Tran" }]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -15,6 +16,9 @@ classifiers = [
 ]
 dependencies = ["numpy>=1.24"]
 dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/inspiros/paged-collections"
 
 [dependency-groups]
 dev = ["maturin>=1.16,<2", "pytest>=8"]
