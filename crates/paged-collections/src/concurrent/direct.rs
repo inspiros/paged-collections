@@ -9,20 +9,28 @@ use super::atomic::{AtomicUsize, Ordering};
 use super::directory::{SharedDirectory, SharedPages};
 use super::lock::{ReadGuard, RwLock, WriteGuard};
 use crate::direct_map::PagedDirectMap;
-use crate::key::{DirectKey, Key};
+use crate::key::DirectKey;
 use crate::page::{DEFAULT_PAGE, Flat};
 
-struct Page<K, V> {
+/// One slot: the tag of the key held there and its value, if any.
+type Slot<K, V> = Option<(<K as DirectKey>::Tag, V)>;
+
+struct Page<K: DirectKey, V> {
     data: RwLock<PageData<K, V>>,
 }
 
-struct PageData<K, V> {
-    slots: Box<[Option<(K, V)>]>,
+struct PageData<K: DirectKey, V> {
+    slots: Box<[Slot<K, V>]>,
     occupied: usize,
 }
 
-impl<K, V> PageData<K, V> {
-    fn replace(&mut self, offset: usize, pair: (K, V), len: &AtomicUsize) -> Option<(K, V)> {
+impl<K: DirectKey, V> PageData<K, V> {
+    fn replace(
+        &mut self,
+        offset: usize,
+        pair: (K::Tag, V),
+        len: &AtomicUsize,
+    ) -> Option<(K::Tag, V)> {
         let old = self.slots[offset].replace(pair);
         if old.is_none() {
             self.occupied += 1;
@@ -31,7 +39,7 @@ impl<K, V> PageData<K, V> {
         old
     }
 
-    fn remove(&mut self, offset: usize, len: &AtomicUsize) -> Option<(K, V)> {
+    fn remove(&mut self, offset: usize, len: &AtomicUsize) -> Option<(K::Tag, V)> {
         let old = self.slots[offset].take();
         if old.is_some() {
             self.occupied -= 1;
@@ -43,7 +51,9 @@ impl<K, V> PageData<K, V> {
 
 /// A shared direct-address map with one reader-writer lock per page.
 ///
-/// Values live at [`Key::index`]. Neighbouring keys on the same page contend;
+/// Values live at [`Key::index`](crate::key::Key::index); each slot stores the key's
+/// [`DirectKey::Tag`], as in [`PagedDirectMap`], and keys are rebuilt from
+/// their slot index. Neighbouring keys on the same page contend;
 /// operations on different pages lock independently. Pages remain allocated
 /// until [`reset`](Self::reset) or destruction. The default [`Flat`] directory
 /// has O(1) page lookups and memory following the highest page. Its finite
@@ -60,7 +70,7 @@ impl<K, V> PageData<K, V> {
 /// one thread holds page A and waits for page B while another holds B and
 /// waits for A (for example, two factories each looking up the other's key).
 /// Nested calls must lock pages in one global order (such as ascending
-/// [`Key::index`]), or callbacks must not touch the map at all.
+/// [`Key::index`](crate::key::Key::index)), or callbacks must not touch the map at all.
 ///
 /// Traversals visit ascending slot indices, holding one page lock at a time.
 /// They are consistent per page only and weakly consistent across pages.
@@ -77,7 +87,7 @@ impl<K, V> PageData<K, V> {
 /// # }
 /// ```
 pub struct ConcurrentDirectMap<
-    K: Key,
+    K: DirectKey,
     V,
     const PAGE: usize = DEFAULT_PAGE,
     D: SharedDirectory = Flat,
@@ -88,15 +98,27 @@ pub struct ConcurrentDirectMap<
 }
 
 // SAFETY: both sealed directories own stable pages and are Send when their
-// pages are Send. Moving the map transfers its keys, values and page locks.
-unsafe impl<K: Key + Send, V: Send, const PAGE: usize, D: SharedDirectory> Send
-    for ConcurrentDirectMap<K, V, PAGE, D>
+// pages are Send. Moving the map transfers its stored tags, values and page
+// locks; keys are rebuilt from tags on whichever thread asks, so the stored
+// `K::Tag` must be Send as well as `K`.
+unsafe impl<K, V, const PAGE: usize, D> Send for ConcurrentDirectMap<K, V, PAGE, D>
+where
+    K: DirectKey + Send,
+    K::Tag: Send,
+    V: Send,
+    D: SharedDirectory,
 {
 }
 // SAFETY: both sealed directories publish pages safely; each page lock
-// synchronizes access to its keys and values. Shared access cannot free pages.
-unsafe impl<K: Key + Send + Sync, V: Send + Sync, const PAGE: usize, D: SharedDirectory> Sync
-    for ConcurrentDirectMap<K, V, PAGE, D>
+// synchronizes access to its tags and values, which shared calls insert from
+// one thread and read or take on another (hence Send + Sync for both `K`
+// and `K::Tag`). Shared access cannot free pages.
+unsafe impl<K, V, const PAGE: usize, D> Sync for ConcurrentDirectMap<K, V, PAGE, D>
+where
+    K: DirectKey + Send + Sync,
+    K::Tag: Send + Sync,
+    V: Send + Sync,
+    D: SharedDirectory,
 {
 }
 
@@ -104,22 +126,27 @@ unsafe impl<K: Key + Send + Sync, V: Send + Sync, const PAGE: usize, D: SharedDi
 ///
 /// Calling another method that locks this page while holding the guard may
 /// deadlock or panic. See [`ConcurrentDirectMap`].
-pub struct DirectMapRef<'a, K, V> {
+pub struct DirectMapRef<'a, K: DirectKey, V> {
+    // Invariant: the slot at `offset` is `Some` and `key` is its stored key.
     guard: ReadGuard<'a, PageData<K, V>>,
     offset: usize,
+    key: K,
 }
 
 /// A mutable value reference holding its page's write lock.
 ///
 /// Calling another method that locks this page while holding the guard
 /// deadlocks or panics. See [`ConcurrentDirectMap`].
-pub struct DirectMapRefMut<'a, K, V> {
+pub struct DirectMapRefMut<'a, K: DirectKey, V> {
+    // Invariant: as for `DirectMapRef`, except inside a `VacantEntry`, whose
+    // slot may be empty or hold another generation until it is inserted.
     guard: WriteGuard<'a, PageData<K, V>>,
     offset: usize,
+    key: K,
 }
 
 /// A page-write-locked view of a key, occupied only by that key itself.
-pub enum Entry<'a, K, V> {
+pub enum Entry<'a, K: DirectKey, V> {
     /// The requested key is present.
     Occupied(OccupiedEntry<'a, K, V>),
     /// The slot is empty or holds another generation.
@@ -127,19 +154,18 @@ pub enum Entry<'a, K, V> {
 }
 
 /// An occupied entry holding its page's write lock.
-pub struct OccupiedEntry<'a, K, V> {
+pub struct OccupiedEntry<'a, K: DirectKey, V> {
     value: DirectMapRefMut<'a, K, V>,
     len: &'a AtomicUsize,
 }
 
 /// A vacant entry holding its page's write lock, possibly over another generation.
-pub struct VacantEntry<'a, K, V> {
-    key: K,
+pub struct VacantEntry<'a, K: DirectKey, V> {
     value: DirectMapRefMut<'a, K, V>,
     len: &'a AtomicUsize,
 }
 
-impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V, PAGE, D> {
+impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V, PAGE, D> {
     /// Number of slots protected by each page lock.
     pub const PAGE_SIZE: usize = PAGE;
 
@@ -150,7 +176,7 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
     /// Panics if `PAGE` is zero or its slot storage exceeds `isize::MAX` bytes.
     pub fn new() -> Self {
         assert!(
-            PAGE > 0 && PAGE <= isize::MAX as usize / mem::size_of::<Option<(K, V)>>(),
+            PAGE > 0 && PAGE <= isize::MAX as usize / mem::size_of::<Slot<K, V>>(),
             "ConcurrentDirectMap: invalid page capacity"
         );
         Self {
@@ -204,10 +230,12 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
         let index = key.index();
         let guard = self.page(index)?.data.read();
         let offset = index % PAGE;
-        if !matches!(&guard.slots[offset], Some((stored, _)) if *stored == key) {
-            return None;
-        }
-        Some(DirectMapRef { guard, offset })
+        let tag = match &guard.slots[offset] {
+            Some((stored, _)) if *stored == key.tag() => *stored,
+            _ => return None,
+        };
+        let key = K::from_parts(index, tag);
+        Some(DirectMapRef { guard, offset, key })
     }
 
     /// Acquires a write guard if this key itself is present.
@@ -216,10 +244,12 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
         let index = key.index();
         let guard = self.page(index)?.data.write();
         let offset = index % PAGE;
-        if !matches!(&guard.slots[offset], Some((stored, _)) if *stored == key) {
-            return None;
-        }
-        Some(DirectMapRefMut { guard, offset })
+        let tag = match &guard.slots[offset] {
+            Some((stored, _)) if *stored == key.tag() => *stored,
+            _ => return None,
+        };
+        let key = K::from_parts(index, tag);
+        Some(DirectMapRefMut { guard, offset, key })
     }
 
     /// Calls `f` under the page's read lock if this key is present.
@@ -242,15 +272,16 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
         let index = key.index();
         let mut guard = self.ensure_page(index).data.write();
         let offset = index % PAGE;
+        let tag = key.tag();
         if let Some((stored, old)) = &mut guard.slots[offset] {
-            if *stored != key {
-                *stored = key;
+            if *stored != tag {
+                *stored = tag;
             }
             let old = mem::replace(old, value);
             drop(guard);
             return Some(old);
         }
-        let old = guard.replace(offset, (key, value), &self.len);
+        let old = guard.replace(offset, (tag, value), &self.len);
         drop(guard);
         old.map(|(_, value)| value)
     }
@@ -260,9 +291,9 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
     pub fn replace(&self, key: K, value: V) -> Option<(K, V)> {
         let index = key.index();
         let mut guard = self.ensure_page(index).data.write();
-        let old = guard.replace(index % PAGE, (key, value), &self.len);
+        let old = guard.replace(index % PAGE, (key.tag(), value), &self.len);
         drop(guard);
-        old
+        old.map(|(tag, value)| (K::from_parts(index, tag), value))
     }
 
     /// Inserts only into an empty slot; returns `value` if any generation holds it.
@@ -275,7 +306,7 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
             drop(guard);
             return Err(value);
         }
-        let old = guard.replace(offset, (key, value), &self.len);
+        let old = guard.replace(offset, (key.tag(), value), &self.len);
         drop(guard);
         drop(old);
         Ok(())
@@ -293,12 +324,12 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
         let index = key.index();
         let mut guard = self.page(index)?.data.write();
         let offset = index % PAGE;
-        if !matches!(&guard.slots[offset], Some((stored, _)) if *stored == key) {
+        if !matches!(&guard.slots[offset], Some((stored, _)) if *stored == key.tag()) {
             return None;
         }
         let old = guard.remove(offset, &self.len);
         drop(guard);
-        old
+        old.map(|(tag, value)| (K::from_parts(index, tag), value))
     }
 
     /// Removes whichever generation occupies `index`, releasing the lock first.
@@ -307,7 +338,7 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
         let mut guard = self.page(index)?.data.write();
         let old = guard.remove(index % PAGE, &self.len);
         drop(guard);
-        old
+        old.map(|(tag, value)| (K::from_parts(index, tag), value))
     }
 
     /// Returns this key's value, constructing it under the page write lock if absent.
@@ -329,19 +360,24 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
         let index = key.index();
         let guard = self.ensure_page(index).data.write();
         let offset = index % PAGE;
-        let occupied = matches!(&guard.slots[offset], Some((stored, _)) if *stored == key);
-        let value = DirectMapRefMut { guard, offset };
-        if occupied {
-            Entry::Occupied(OccupiedEntry {
-                value,
+        let stored = match &guard.slots[offset] {
+            Some((stored, _)) if *stored == key.tag() => Some(*stored),
+            _ => None,
+        };
+        match stored {
+            Some(tag) => Entry::Occupied(OccupiedEntry {
+                value: DirectMapRefMut {
+                    guard,
+                    offset,
+                    key: K::from_parts(index, tag),
+                },
                 len: &self.len,
-            })
-        } else {
-            Entry::Vacant(VacantEntry {
-                key,
-                value,
+            }),
+            // The guard carries the query key until an insert stores it.
+            None => Entry::Vacant(VacantEntry {
+                value: DirectMapRefMut { guard, offset, key },
                 len: &self.len,
-            })
+            }),
         }
     }
 
@@ -349,11 +385,13 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
     /// Holds one page write lock at a time; atomic only within each page.
     /// Counts remain correct if the callback or a removed value's destructor panics.
     pub fn retain(&self, mut keep: impl FnMut(&K, &mut V) -> bool) {
-        for (_, page) in self.pages.iter() {
+        for (number, page) in self.pages.iter() {
             let mut guard = page.data.write();
             for offset in 0..guard.slots.len() {
                 let remove = match &mut guard.slots[offset] {
-                    Some((key, value)) => !keep(key, value),
+                    Some((tag, value)) => {
+                        !keep(&K::from_parts(number * PAGE + offset, *tag), value)
+                    }
                     None => false,
                 };
                 if remove {
@@ -370,7 +408,7 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
         self.range_for_each(.., f);
     }
 
-    /// Calls `f` for a range bounded by [`Key::index`], in ascending slot order.
+    /// Calls `f` for a range bounded by [`Key::index`](crate::key::Key::index), in ascending slot order.
     /// Empty or inverted ranges visit nothing. Holds one page read lock at a
     /// time; consistent per page only, weakly consistent across pages.
     pub fn range_for_each(&self, keys: impl RangeBounds<K>, mut f: impl FnMut(&K, &V)) {
@@ -411,20 +449,28 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
                 PAGE
             };
             let guard = page.data.read();
-            for (key, value) in guard.slots[first..last].iter().flatten() {
-                f(key, value);
+            let base = number * PAGE;
+            for (offset, slot) in guard.slots.iter().enumerate().take(last).skip(first) {
+                if let Some((tag, value)) = slot {
+                    f(&K::from_parts(base + offset, *tag), value);
+                }
             }
         }
     }
 
     /// Iterates exclusively in ascending slot order without acquiring page locks.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
-        self.pages.iter_mut().flat_map(|(_, page)| {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut V)> {
+        self.pages.iter_mut().flat_map(|(number, page)| {
+            let base = number * PAGE;
             page.data
                 .get_mut()
                 .slots
                 .iter_mut()
-                .filter_map(|slot| slot.as_mut().map(|(key, value)| (&*key, value)))
+                .enumerate()
+                .filter_map(move |(offset, slot)| {
+                    let (tag, value) = slot.as_mut()?;
+                    Some((K::from_parts(base + offset, *tag), value))
+                })
         })
     }
 
@@ -453,7 +499,7 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
     /// Each occupied entry is moved once; no values are cloned.
     pub fn into_inner(mut self) -> PagedDirectMap<K, V, PAGE, D> {
         let mut map = PagedDirectMap::new();
-        for (_, page) in self.pages.iter_mut() {
+        for (number, page) in self.pages.iter_mut() {
             let lock = mem::replace(
                 &mut page.data,
                 RwLock::new(PageData {
@@ -461,22 +507,26 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
                     occupied: 0,
                 }),
             );
-            for (key, value) in lock.into_inner().slots.into_vec().into_iter().flatten() {
-                map.insert(key, value);
+            let base = number * PAGE;
+            let slots = lock.into_inner().slots.into_vec().into_iter().enumerate();
+            for (offset, slot) in slots {
+                if let Some((tag, value)) = slot {
+                    map.insert(K::from_parts(base + offset, tag), value);
+                }
             }
         }
         map
     }
 }
 
-impl<K, V> DirectMapRef<'_, K, V> {
+impl<K: DirectKey, V> DirectMapRef<'_, K, V> {
     /// The stored key, which may differ in representation from an equal query key.
     pub fn key(&self) -> &K {
-        &self.guard.slots[self.offset].as_ref().unwrap().0
+        &self.key
     }
 }
 
-impl<K, V> Deref for DirectMapRef<'_, K, V> {
+impl<K: DirectKey, V> Deref for DirectMapRef<'_, K, V> {
     type Target = V;
 
     fn deref(&self) -> &V {
@@ -484,14 +534,14 @@ impl<K, V> Deref for DirectMapRef<'_, K, V> {
     }
 }
 
-impl<K, V> DirectMapRefMut<'_, K, V> {
+impl<K: DirectKey, V> DirectMapRefMut<'_, K, V> {
     /// The stored key, which cannot be changed through the guard.
     pub fn key(&self) -> &K {
-        &self.guard.slots[self.offset].as_ref().unwrap().0
+        &self.key
     }
 }
 
-impl<K, V> Deref for DirectMapRefMut<'_, K, V> {
+impl<K: DirectKey, V> Deref for DirectMapRefMut<'_, K, V> {
     type Target = V;
 
     fn deref(&self) -> &V {
@@ -499,13 +549,13 @@ impl<K, V> Deref for DirectMapRefMut<'_, K, V> {
     }
 }
 
-impl<K, V> DerefMut for DirectMapRefMut<'_, K, V> {
+impl<K: DirectKey, V> DerefMut for DirectMapRefMut<'_, K, V> {
     fn deref_mut(&mut self) -> &mut V {
         &mut self.guard.slots[self.offset].as_mut().unwrap().1
     }
 }
 
-impl<'a, K, V> Entry<'a, K, V> {
+impl<'a, K: DirectKey, V> Entry<'a, K, V> {
     /// The occupied stored key, or the query key for a vacant entry.
     pub fn key(&self) -> &K {
         match self {
@@ -562,7 +612,7 @@ impl<'a, K, V> Entry<'a, K, V> {
     }
 }
 
-impl<'a, K, V> OccupiedEntry<'a, K, V> {
+impl<'a, K: DirectKey, V> OccupiedEntry<'a, K, V> {
     /// The stored key.
     pub fn key(&self) -> &K {
         self.value.key()
@@ -596,44 +646,42 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     /// Removes the pair and returns it after releasing the page lock.
     pub fn remove_entry(mut self) -> (K, V) {
         let offset = self.value.offset;
-        let old = self.value.guard.remove(offset, self.len).unwrap();
+        let (_, value) = self.value.guard.remove(offset, self.len).unwrap();
+        let key = self.value.key;
         drop(self);
-        old
+        (key, value)
     }
 }
 
-impl<'a, K, V> VacantEntry<'a, K, V> {
+impl<'a, K: DirectKey, V> VacantEntry<'a, K, V> {
     /// The query key, which may share its slot with another generation.
     pub fn key(&self) -> &K {
-        &self.key
+        &self.value.key
     }
 
     /// Releases the lock and returns the query key without changing the slot.
     pub fn into_key(self) -> K {
-        self.key
+        self.value.key
     }
 
     /// The pair from another generation that insertion would evict.
-    pub fn occupant(&self) -> Option<(&K, &V)> {
-        self.value.guard.slots[self.value.offset]
-            .as_ref()
-            .map(|(key, value)| (key, value))
+    pub fn occupant(&self) -> Option<(K, &V)> {
+        let (tag, value) = self.value.guard.slots[self.value.offset].as_ref()?;
+        Some((K::from_parts(self.value.key.index(), *tag), value))
     }
 
     /// Inserts this key and returns a mutable guard, evicting another generation.
     /// The slot and counts are consistent before an evicted value is dropped.
     pub fn insert(mut self, value: V) -> DirectMapRefMut<'a, K, V> {
         let offset = self.value.offset;
-        let old = self
-            .value
-            .guard
-            .replace(offset, (self.key, value), self.len);
+        let tag = self.value.key.tag();
+        let old = self.value.guard.replace(offset, (tag, value), self.len);
         drop(old);
         self.value
     }
 }
 
-impl<K: Key, V, const PAGE: usize, D: SharedDirectory> Default
+impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> Default
     for ConcurrentDirectMap<K, V, PAGE, D>
 {
     fn default() -> Self {
@@ -641,7 +689,7 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> Default
     }
 }
 
-impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: SharedDirectory> fmt::Debug
+impl<K: DirectKey + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: SharedDirectory> fmt::Debug
     for ConcurrentDirectMap<K, V, PAGE, D>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -653,7 +701,7 @@ impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: SharedDirectory> 
     }
 }
 
-impl<K: Key, V, const PAGE: usize, D: SharedDirectory> FromIterator<(K, V)>
+impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> FromIterator<(K, V)>
     for ConcurrentDirectMap<K, V, PAGE, D>
 {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
@@ -663,7 +711,7 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> FromIterator<(K, V)>
     }
 }
 
-impl<K: Key, V, const PAGE: usize, D: SharedDirectory> Extend<(K, V)>
+impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> Extend<(K, V)>
     for ConcurrentDirectMap<K, V, PAGE, D>
 {
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {

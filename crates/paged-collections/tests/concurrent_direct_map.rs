@@ -46,7 +46,7 @@ impl DirectKey for Gen {
     }
 }
 
-fn contents<K: Key, V: Clone, const PAGE: usize, D: SharedDirectory>(
+fn contents<K: DirectKey, V: Clone, const PAGE: usize, D: SharedDirectory>(
     map: &ConcurrentDirectMap<K, V, PAGE, D>,
 ) -> Vec<(K, V)> {
     let mut entries = Vec::new();
@@ -113,7 +113,7 @@ fn sequential_model_for<D: SharedDirectory>(
                 }
                 (Entry::Vacant(a), PlainEntry::Vacant(b)) => {
                     prop_assert_eq!(a.key(), b.key());
-                    prop_assert_eq!(a.occupant().map(|(&k, v)| (k, v)), b.occupant());
+                    prop_assert_eq!(a.occupant(), b.occupant());
                     prop_assert_eq!(*a.insert(value), *b.insert(value));
                 }
                 _ => prop_assert!(false, "entry occupancy differs"),
@@ -123,7 +123,7 @@ fn sequential_model_for<D: SharedDirectory>(
                     prop_assert_eq!(*a.into_ref(), *b.into_mut());
                 }
                 (Entry::Vacant(a), PlainEntry::Vacant(b)) => {
-                    prop_assert_eq!(a.occupant().map(|(&k, v)| (k, v)), b.occupant());
+                    prop_assert_eq!(a.occupant(), b.occupant());
                     prop_assert_eq!(a.into_key(), b.into_key());
                 }
                 _ => prop_assert!(false, "entry occupancy differs"),
@@ -493,6 +493,18 @@ impl PartialEq for Tagged {
 impl Key for Tagged {
     fn index(self) -> usize {
         usize::from(self.index)
+    }
+}
+
+// `Eq` ignores `tag`, so the whole key is the slot tag: these tests check
+// that the stored representation is kept.
+impl DirectKey for Tagged {
+    type Tag = Self;
+    fn tag(self) -> Self {
+        self
+    }
+    fn from_parts(_: usize, key: Self) -> Self {
+        key
     }
 }
 

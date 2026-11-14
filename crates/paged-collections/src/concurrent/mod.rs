@@ -62,10 +62,11 @@
 //! # #[cfg(feature = "concurrent")] {
 //! use paged_collections::concurrent::*;
 //! use paged_collections::page::{Flat, Radix};
-//! use paged_collections::key::Key;
+//! use paged_collections::key::{DirectKey, Key};
 //! #[derive(PartialEq, Eq)]
 //! struct K(usize);
 //! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! impl DirectKey for &K { type Tag = Self; fn tag(self) -> Self { self } fn from_parts(_: usize, k: Self) -> Self { k } }
 //! fn identity_0(x: ConcurrentHive<&'static u8>) -> ConcurrentHive<&'static u8> { x }
 //! fn identity_1(x: ConcurrentAppendHive<&'static u8>) -> ConcurrentAppendHive<&'static u8> { x }
 //! fn identity_2(x: ConcurrentPagedVec<&'static u8>) -> ConcurrentPagedVec<&'static u8> { x }
@@ -139,10 +140,11 @@
 //! # #[cfg(feature = "concurrent")] {
 //! use paged_collections::concurrent::ConcurrentDirectMap;
 //! use paged_collections::page::Flat;
-//! use paged_collections::key::Key;
+//! use paged_collections::key::{DirectKey, Key};
 //! #[derive(PartialEq, Eq)]
 //! struct K(usize);
 //! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! impl DirectKey for &K { type Tag = Self; fn tag(self) -> Self { self } fn from_parts(_: usize, k: Self) -> Self { k } }
 //! fn shorten<'a>(x: ConcurrentDirectMap<&'static K, (), 4, Flat>) -> ConcurrentDirectMap<&'a K, (), 4, Flat> { x }
 //! # }
 //! ```
@@ -191,10 +193,11 @@
 //! # #[cfg(feature = "concurrent")] {
 //! use paged_collections::concurrent::ConcurrentDirectMap;
 //! use paged_collections::page::Radix;
-//! use paged_collections::key::Key;
+//! use paged_collections::key::{DirectKey, Key};
 //! #[derive(PartialEq, Eq)]
 //! struct K(usize);
 //! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! impl DirectKey for &K { type Tag = Self; fn tag(self) -> Self { self } fn from_parts(_: usize, k: Self) -> Self { k } }
 //! fn shorten<'a>(x: ConcurrentDirectMap<&'static K, (), 4, Radix>) -> ConcurrentDirectMap<&'a K, (), 4, Radix> { x }
 //! # }
 //! ```
