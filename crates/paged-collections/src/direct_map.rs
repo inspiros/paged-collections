@@ -1619,6 +1619,7 @@ mod tests {
         assert_eq!(*map.entry(new).or_insert("x"), "new");
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn entry_or_insert_with_panic_leaves_map_unchanged() {
         let mut map: PagedDirectMap<u32, i32> = PagedDirectMap::new();
