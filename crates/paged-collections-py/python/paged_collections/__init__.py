@@ -11,7 +11,12 @@ and ``id_map(dtype)`` pick the map class for a dtype.
 
 ``PagedList`` stores arbitrary objects in pages; typed variants store numbers
 unboxed and expose individual pages as NumPy views. ``paged_list(dtype)``
-picks the list class for a dtype.
+picks the list class for a dtype. ``PagedDeque`` is a paged
+``collections.deque`` of objects with an optional ``maxlen``.
+
+``PriorityQueue`` (int64 priorities) and ``PriorityQueueF64`` (float64) map
+integer keys to priorities; ``pop`` returns the greatest, or the least with
+``min=True``. Pushing a present key changes its priority.
 
 ``Hive`` stores objects in reusable slots and issues generational ids.
 Removing a value makes its id stale; insertions reuse slots with new generations.
@@ -52,6 +57,7 @@ from paged_collections._core import (
     IdMapI64,
     IdMapU32,
     IdMapU64,
+    PagedDeque,
     PagedList,
     PagedListBool,
     PagedListF32,
@@ -60,6 +66,8 @@ from paged_collections._core import (
     PagedListI64,
     PagedListU32,
     PagedListU64,
+    PriorityQueue,
+    PriorityQueueF64,
     SparseMap,
     SparseMapBool,
     SparseMapF32,
@@ -228,6 +236,7 @@ __all__ = [
     "IdMapI64",
     "IdMapU32",
     "IdMapU64",
+    "PagedDeque",
     "PagedList",
     "PagedListBool",
     "PagedListF32",
@@ -236,6 +245,8 @@ __all__ = [
     "PagedListI64",
     "PagedListU32",
     "PagedListU64",
+    "PriorityQueue",
+    "PriorityQueueF64",
     "SparseMap",
     "SparseMapBool",
     "SparseMapF32",
