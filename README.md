@@ -40,6 +40,31 @@ Choose `page::Tree` for a standard B-tree, or when benchmarks show it wins
 for your key pattern. The directory is the final type parameter, for example
 `PagedDirectMap<usize, u32, 1024, page::Radix>`.
 
+## When to use
+
+Numbers come from the bench crate `crates/bench` (see
+`crates/bench/README.md`), one run per case; treat the ratios as indicative.
+
+| Container | Use it when | Pick something else when |
+|---|---|---|
+| `PagedSparseSet`, `PagedSparseMap`, `PagedDirectMap` | Keys come in runs or ranges: iteration is 2-10x faster than `HashMap`/`BTreeMap`, misses 2-3x faster. Dense `u32`-like keys with `page::Flat` work well too | Keys are spread uniformly over a wide range (use a `HashMap`). Dense hits are 1.1-2.5x slower than `HashSet`, and much slower than a plain `Vec<bool>` |
+| `PagedPriorityQueue` | You need `change_priority` or removal by key: push is 3-17x faster than the `priority-queue` crate | You never change priorities: `BinaryHeap` is 1.3-2x faster |
+| `PagedDeque` | Large queues (parity with `VecDeque` at 10 million elements) or stable addresses | Small queues: `VecDeque` is 1.4-1.7x faster |
+| `PagedVec` | You need stable addresses: iteration matches `Vec` | Random access dominates: `Vec` is 1.8-2.5x faster |
+| `Hive`, `IdMap` | Generational handles with stable addresses: `IdMap` is within 1.2-4x of `SlotMap` and iterates faster at small and medium sizes | Raw lookup speed matters more than stable addresses: `SlotMap` is faster |
+
+- **Spread-out keys are the worst case.** Each key in a new page allocates
+  and zeroes a whole page, so uniformly spread keys made inserts 36-480x
+  slower and used far more memory.
+- **Clustered keys still cost memory.** Short runs (64 keys) fill about 6%
+  of a 1024-slot page, up to roughly 19x the memory of a `HashMap`. Long runs
+  and dense ranges do not have this problem.
+- **Pages are freed only when whole key ranges go.** Removing 90% of the
+  keys at random frees nothing, because nearly every page stays partly full.
+  There is no automatic page freeing, which keeps addresses stable.
+- **Radix** is for page numbers spread over 64 bits; use `page::Flat` when
+  keys are dense and below a few billion.
+
 ## Rust
 
 A `Hive` owns elements at stable addresses and hands out generational ids;
