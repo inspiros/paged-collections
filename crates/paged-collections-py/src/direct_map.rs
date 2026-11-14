@@ -102,7 +102,7 @@ impl DirectMap {
 
     fn next_key_from(&self, index: u64) -> Option<Key> {
         if index < KEY_LIMIT {
-            self.map.next_occupant(index as usize).map(|(&key, _)| key)
+            self.map.next_occupant(index as usize).map(|(key, _)| key)
         } else {
             None
         }
@@ -205,7 +205,7 @@ impl DirectMap {
         if self.map.len() != other.map.len() {
             return Ok(false);
         }
-        for (&key, value) in self.map.iter() {
+        for (key, value) in self.map.iter() {
             let Some(other_value) = other.map.get(key) else {
                 return Ok(false);
             };
@@ -221,7 +221,7 @@ impl DirectMap {
         let name = slf.get_type().name()?.to_string();
         crate::repr_guarded(slf.as_any(), &name, || {
             let this = slf.try_borrow()?;
-            let items = repr_items(this.map.iter().map(|(&k, v)| (k, v.bind(py).clone())), py)?;
+            let items = repr_items(this.map.iter().map(|(k, v)| (k, v.bind(py).clone())), py)?;
             Ok(format!("{name}({{{items}}})"))
         })
     }
@@ -244,7 +244,7 @@ impl DirectMap {
     /// Return a shallow copy: the values are shared, not copied.
     fn copy(&self, py: Python<'_>) -> Self {
         let mut map = PagedDirectMap::new();
-        for (&key, value) in self.map.iter() {
+        for (key, value) in self.map.iter() {
             map.insert(key, value.clone_ref(py));
         }
         Self { map, mods: 0 }
@@ -290,7 +290,7 @@ impl DirectMap {
     fn first_item(&self, py: Python<'_>) -> PyResult<(Key, Py<PyAny>)> {
         self.map
             .first_key_value()
-            .map(|(&key, value)| (key, value.clone_ref(py)))
+            .map(|(key, value)| (key, value.clone_ref(py)))
             .ok_or_else(|| PyKeyError::new_err("first_item(): DirectMap is empty"))
     }
 
@@ -298,7 +298,7 @@ impl DirectMap {
     fn last_item(&self, py: Python<'_>) -> PyResult<(Key, Py<PyAny>)> {
         self.map
             .last_key_value()
-            .map(|(&key, value)| (key, value.clone_ref(py)))
+            .map(|(key, value)| (key, value.clone_ref(py)))
             .ok_or_else(|| PyKeyError::new_err("last_item(): DirectMap is empty"))
     }
 
@@ -334,7 +334,7 @@ impl DirectMap {
         Ok(if index < KEY_LIMIT {
             self.map
                 .next_occupant(index as usize)
-                .map(|(&key, value)| (key, value.clone_ref(py)))
+                .map(|(key, value)| (key, value.clone_ref(py)))
         } else {
             None
         })
@@ -352,7 +352,7 @@ impl DirectMap {
         Ok(self
             .map
             .prev_occupant(index.min(KEY_LIMIT - 1) as usize)
-            .map(|(&key, value)| (key, value.clone_ref(py))))
+            .map(|(key, value)| (key, value.clone_ref(py))))
     }
 
     /// Return the entries in ``[start, stop)``, in ascending key order.
@@ -367,7 +367,7 @@ impl DirectMap {
         Ok(self
             .map
             .slot_range(query_bounds(start, stop)?)
-            .map(|(&key, value)| (key, value.clone_ref(py)))
+            .map(|(key, value)| (key, value.clone_ref(py)))
             .collect())
     }
 
@@ -383,7 +383,7 @@ impl DirectMap {
             py,
             self.map
                 .slot_range(query_bounds(start, stop)?)
-                .map(|(&key, _)| key)
+                .map(|(key, _)| key)
                 .collect(),
         ))
     }
@@ -454,7 +454,7 @@ impl DirectMap {
 
     /// Return the keys as a new ``uint32`` array, in ascending key order.
     fn keys<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<Key>> {
-        PyArray1::from_vec(py, self.map.keys().copied().collect())
+        PyArray1::from_vec(py, self.map.keys().collect())
     }
 
     /// Return the values as a new list, in ascending key order.
@@ -464,10 +464,7 @@ impl DirectMap {
 
     /// Return a list of ``(key, value)`` pairs in ascending key order.
     fn items(&self, py: Python<'_>) -> Vec<(Key, Py<PyAny>)> {
-        self.map
-            .iter()
-            .map(|(&k, v)| (k, v.clone_ref(py)))
-            .collect()
+        self.map.iter().map(|(k, v)| (k, v.clone_ref(py))).collect()
     }
 
     /// Set the value of each key in ``keys`` to the matching item of
@@ -602,7 +599,7 @@ macro_rules! typed_direct_map {
 
             fn next_key_from(&self, index: u64) -> Option<Key> {
                 if index < KEY_LIMIT {
-                    self.map.next_occupant(index as usize).map(|(&key, _)| key)
+                    self.map.next_occupant(index as usize).map(|(key, _)| key)
                 } else {
                     None
                 }
@@ -695,7 +692,7 @@ macro_rules! typed_direct_map {
             fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
                 let py = slf.py();
                 let this = slf.try_borrow()?;
-                let items = repr_items(this.map.iter().map(|(&k, v)| (k, *v)), py)?;
+                let items = repr_items(this.map.iter().map(|(k, v)| (k, *v)), py)?;
                 Ok(format!("{}({{{items}}})", slf.get_type().name()?))
             }
 
@@ -759,14 +756,14 @@ macro_rules! typed_direct_map {
             /// Return the entry with the smallest key; raise ``KeyError`` if empty.
             fn first_item(&self) -> PyResult<(Key, $t)> {
                 self.map.first_key_value()
-                    .map(|(&key, value)| (key, *value))
+                    .map(|(key, value)| (key, *value))
                     .ok_or_else(|| PyKeyError::new_err(concat!("first_item(): ", $pyname, " is empty")))
             }
 
             /// Return the entry with the largest key; raise ``KeyError`` if empty.
             fn last_item(&self) -> PyResult<(Key, $t)> {
                 self.map.last_key_value()
-                    .map(|(&key, value)| (key, *value))
+                    .map(|(key, value)| (key, *value))
                     .ok_or_else(|| PyKeyError::new_err(concat!("last_item(): ", $pyname, " is empty")))
             }
 
@@ -795,7 +792,7 @@ macro_rules! typed_direct_map {
                 let index = query_index(index)?.unwrap_or(0);
                 Ok(if index < KEY_LIMIT {
                     self.map.next_occupant(index as usize)
-                        .map(|(&key, value)| (key, *value))
+                        .map(|(key, value)| (key, *value))
                 } else {
                     None
                 })
@@ -805,7 +802,7 @@ macro_rules! typed_direct_map {
             fn prev_occupant(&self, index: &Bound<'_, PyAny>) -> PyResult<Option<(Key, $t)>> {
                 let Some(index) = query_index(index)? else { return Ok(None) };
                 Ok(self.map.prev_occupant(index.min(KEY_LIMIT - 1) as usize)
-                    .map(|(&key, value)| (key, *value)))
+                    .map(|(key, value)| (key, *value)))
             }
 
             /// Return the entries in ``[start, stop)``, in ascending key order.
@@ -814,7 +811,7 @@ macro_rules! typed_direct_map {
             fn items_range(&self, start: Option<&Bound<'_, PyAny>>, stop: Option<&Bound<'_, PyAny>>)
                 -> PyResult<Vec<(Key, $t)>> {
                 Ok(self.map.slot_range(query_bounds(start, stop)?)
-                    .map(|(&key, value)| (key, *value)).collect())
+                    .map(|(key, value)| (key, *value)).collect())
             }
 
             /// Return the keys in ``[start, stop)`` as a new ``uint32`` array.
@@ -822,7 +819,7 @@ macro_rules! typed_direct_map {
             fn keys_range<'py>(&self, py: Python<'py>, start: Option<&Bound<'_, PyAny>>, stop: Option<&Bound<'_, PyAny>>)
                 -> PyResult<Bound<'py, PyArray1<Key>>> {
                 Ok(PyArray1::from_vec(py, self.map.slot_range(query_bounds(start, stop)?)
-                    .map(|(&key, _)| key).collect()))
+                    .map(|(key, _)| key).collect()))
             }
 
             /// Return the values in ``[start, stop)`` as a new array, in key order.
@@ -876,7 +873,7 @@ macro_rules! typed_direct_map {
 
             /// Return the keys as a new ``uint32`` array, in ascending key order.
             fn keys<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<Key>> {
-                PyArray1::from_vec(py, self.map.keys().copied().collect())
+                PyArray1::from_vec(py, self.map.keys().collect())
             }
 
             #[doc = concat!("Return the values as a new ``", stringify!($t), "`` array, in ascending key order.")]
@@ -886,7 +883,7 @@ macro_rules! typed_direct_map {
 
             /// Return a list of ``(key, value)`` pairs in ascending key order.
             fn items(&self) -> Vec<(Key, $t)> {
-                self.map.iter().map(|(&k, v)| (k, *v)).collect()
+                self.map.iter().map(|(k, v)| (k, *v)).collect()
             }
 
             /// Set the value of each key in ``keys`` to the matching entry of

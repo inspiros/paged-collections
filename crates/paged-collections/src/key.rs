@@ -54,6 +54,70 @@ pub trait Key: Copy + Eq {
     fn index(self) -> usize;
 }
 
+/// A [`Key`] that its slot index and a small *tag* determine, so a direct map
+/// stores only the tag in each slot, not the whole key.
+///
+/// [`PagedDirectMap`](crate::direct_map::PagedDirectMap) keeps
+/// `Option<(K::Tag, V)>` in each slot and rebuilds keys with
+/// [`from_parts`](DirectKey::from_parts). For plain integers the index is the
+/// whole key and the tag is `()`, so a `u32 -> u64` map uses 16-byte slots
+/// instead of 24. A generational id's tag is its generation. A key that its
+/// index does not help to rebuild can use `type Tag = Self`, which stores the
+/// whole key as before.
+///
+/// # Contract
+///
+/// For all keys `a` and `b`:
+///
+/// - `a == b` exactly when `a.index() == b.index()` and `a.tag() == b.tag()`;
+/// - `K::from_parts(a.index(), a.tag()) == a`.
+///
+/// Neither `tag` nor `from_parts` may panic: the map calls `from_parts` only
+/// with the parts of a key it was given, while iterating or removing.
+/// Breaking the contract cannot cause undefined behaviour, but maps may then
+/// return wrong keys or results.
+///
+/// ```
+/// use paged_collections::direct_map::PagedDirectMap;
+/// use paged_collections::key::{DirectKey, Key};
+///
+/// /// 32-bit entity id: low 24 bits are the index, high 8 bits the generation.
+/// #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// struct Entity(u32);
+///
+/// impl Key for Entity {
+///     fn index(self) -> usize {
+///         (self.0 & 0x00ff_ffff) as usize
+///     }
+/// }
+///
+/// impl DirectKey for Entity {
+///     type Tag = u8;
+///     fn tag(self) -> u8 {
+///         (self.0 >> 24) as u8
+///     }
+///     fn from_parts(index: usize, tag: u8) -> Self {
+///         Entity(index as u32 | u32::from(tag) << 24)
+///     }
+/// }
+///
+/// let mut map: PagedDirectMap<Entity, &str> = PagedDirectMap::new();
+/// map.insert(Entity(5 | 1 << 24), "second generation");
+/// assert_eq!(map.keys().next(), Some(Entity(5 | 1 << 24)));
+/// assert_eq!(map.get(Entity(5)), None);
+/// ```
+pub trait DirectKey: Key {
+    /// What a slot stores besides the value: the part of the key that the
+    /// slot index does not give.
+    type Tag: Copy + Eq;
+
+    /// The part of this key that its index does not give.
+    fn tag(self) -> Self::Tag;
+
+    /// The key with slot index `index` and tag `tag`.
+    fn from_parts(index: usize, tag: Self::Tag) -> Self;
+}
+
 macro_rules! impl_key_lossless {
     ($($t:ty),* $(,)?) => {$(
         impl Key for $t {
@@ -64,6 +128,30 @@ macro_rules! impl_key_lossless {
         }
     )*};
 }
+
+/// Integers are their own index: the tag is `()`, and `from_parts` narrows
+/// an index that came from a key of the same type, so it loses nothing.
+macro_rules! impl_direct_key_int {
+    ($($t:ty),* $(,)?) => {$(
+        impl DirectKey for $t {
+            type Tag = ();
+
+            #[inline]
+            fn tag(self) {}
+
+            #[inline]
+            fn from_parts(index: usize, (): ()) -> Self {
+                index as $t
+            }
+        }
+    )*};
+}
+
+impl_direct_key_int!(u8, u16, usize);
+#[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
+impl_direct_key_int!(u32);
+#[cfg(target_pointer_width = "64")]
+impl_direct_key_int!(u64);
 
 impl_key_lossless!(u8, u16);
 

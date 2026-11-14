@@ -57,7 +57,7 @@ use core::fmt;
 use core::iter::{Enumerate, FusedIterator};
 use core::num::NonZeroU32;
 
-use crate::key::Key;
+use crate::key::{DirectKey, Key};
 
 /// The largest generation an allocator issues, 2³¹. An index whose id of
 /// this generation is freed is retired. [`Id::new`] accepts larger
@@ -158,6 +158,23 @@ impl Key for Id {
     #[inline]
     fn index(self) -> usize {
         self.index as usize
+    }
+}
+
+/// A direct map stores only the generation; its `NonZeroU32` niche keeps
+/// `Option<(NonZeroU32, V)>` as small as `(u32, V)`.
+impl DirectKey for Id {
+    type Tag = NonZeroU32;
+
+    #[inline]
+    fn tag(self) -> NonZeroU32 {
+        self.generation
+    }
+
+    #[inline]
+    fn from_parts(index: usize, generation: NonZeroU32) -> Self {
+        // `index` came from an `Id`, so it fits in `u32`.
+        Self::new(index as u32, generation)
     }
 }
 

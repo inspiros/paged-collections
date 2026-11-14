@@ -129,7 +129,7 @@ fn direct_model<D: SharedDirectory>(
     prop_assert!(
         plain
             .iter()
-            .map(|(&k, &v)| (k, v))
+            .map(|(k, &v)| (k, v))
             .eq(expected.iter().copied())
     );
     let map = AtomicDirectMap::from(plain);
@@ -175,7 +175,7 @@ proptest! {
                 1 => prop_assert_eq!(map.insert(key, value), model.insert(key, value)),
                 2 => {
                     let expected = match model.occupant(index as usize) {
-                        Some((&held, &current)) => Err((held, current)),
+                        Some((held, &current)) => Err((held, current)),
                         None => { model.insert(key, value); Ok(()) }
                     };
                     prop_assert_eq!(map.try_insert(key, value), expected);
@@ -214,14 +214,14 @@ proptest! {
                 }
                 6 => prop_assert_eq!(map.replace(key, value), model.replace(key, value)),
                 7 => prop_assert_eq!(map.remove_occupant(index), model.remove_occupant(index as usize)),
-                _ => prop_assert_eq!(map.occupant(index), model.occupant(index as usize).map(|(&k, &v)| (k, v))),
+                _ => prop_assert_eq!(map.occupant(index), model.occupant(index as usize).map(|(k, &v)| (k, v))),
             }
-            let expected: Vec<_> = model.iter().map(|(&k, &v)| (k, v)).collect();
+            let expected: Vec<_> = model.iter().map(|(k, &v)| (k, v)).collect();
             prop_assert_eq!(map.iter().collect::<Vec<_>>(), expected);
             prop_assert_eq!(map.len(), model.len());
             prop_assert_eq!(map.is_empty(), model.is_empty());
             prop_assert_eq!(map.contains_key(key), model.contains_key(key));
-            let expected: Vec<_> = model.slot_range(5..=15).map(|(&k, &v)| (k, v)).collect();
+            let expected: Vec<_> = model.slot_range(5..=15).map(|(k, &v)| (k, v)).collect();
             prop_assert_eq!(map.range(5..=15).collect::<Vec<_>>(), expected);
         }
     }

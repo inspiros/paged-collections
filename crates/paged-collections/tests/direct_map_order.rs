@@ -6,7 +6,7 @@ use std::iter::FusedIterator;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 
 use paged_collections::direct_map::PagedDirectMap;
-use paged_collections::key::Key;
+use paged_collections::key::{DirectKey, Key};
 use paged_collections::page::{Directory, Flat, Radix, Tree};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseResult;
@@ -39,7 +39,19 @@ impl Key for Gen {
     }
 }
 
-trait TestKey: Key + Debug {
+impl DirectKey for Gen {
+    type Tag = u16;
+
+    fn tag(self) -> Self::Tag {
+        (self.0 >> 16) as u16
+    }
+
+    fn from_parts(index: usize, tag: Self::Tag) -> Self {
+        Self(index as u32 | (u32::from(tag) << 16))
+    }
+}
+
+trait TestKey: DirectKey + Debug {
     fn make(index: u16, generation: u8) -> Self;
 
     fn upper_bound() -> Self {
@@ -193,34 +205,34 @@ where
     Ok(())
 }
 
-fn check_order<K: Key + Debug, const PAGE: usize, D: Directory>(
+fn check_order<K: DirectKey + Debug, const PAGE: usize, D: Directory>(
     map: &PagedDirectMap<K, u32, PAGE, D>,
     model: &Model<K>,
     probes: &[usize],
 ) -> TestCaseResult {
     prop_assert_eq!(map.len(), model.len());
     prop_assert_eq!(
-        map.first_key_value().map(|(&k, &v)| (k, v)),
+        map.first_key_value().map(|(k, &v)| (k, v)),
         model.first_key_value().map(|(_, &entry)| entry)
     );
     prop_assert_eq!(
-        map.last_key_value().map(|(&k, &v)| (k, v)),
+        map.last_key_value().map(|(k, &v)| (k, v)),
         model.last_key_value().map(|(_, &entry)| entry)
     );
     for &index in probes {
         prop_assert_eq!(
-            map.next_occupant(index).map(|(&k, &v)| (k, v)),
+            map.next_occupant(index).map(|(k, &v)| (k, v)),
             model.range(index..).next().map(|(_, &entry)| entry)
         );
         prop_assert_eq!(
-            map.prev_occupant(index).map(|(&k, &v)| (k, v)),
+            map.prev_occupant(index).map(|(k, &v)| (k, v)),
             model.range(..=index).next_back().map(|(_, &entry)| entry)
         );
     }
     Ok(())
 }
 
-fn check_queries<K: Key + Debug, const PAGE: usize, D: Directory>(
+fn check_queries<K: DirectKey + Debug, const PAGE: usize, D: Directory>(
     map: &PagedDirectMap<K, u32, PAGE, D>,
     model: &Model<K>,
     slots: Bounds<usize>,
@@ -229,7 +241,7 @@ fn check_queries<K: Key + Debug, const PAGE: usize, D: Directory>(
     prefix: usize,
 ) -> TestCaseResult {
     check_range(
-        map.slot_range(slots).map(|(&k, &v)| (k, v)),
+        map.slot_range(slots).map(|(k, &v)| (k, v)),
         &selected(model, slots),
         directions,
         prefix,
@@ -237,14 +249,14 @@ fn check_queries<K: Key + Debug, const PAGE: usize, D: Directory>(
     let indices = index_bounds(keys);
     let expected = selected(model, indices);
     check_range(
-        map.range(keys).map(|(&k, &v)| (k, v)),
+        map.range(keys).map(|(k, &v)| (k, v)),
         &expected,
         directions,
         prefix,
     )?;
     prop_assert_eq!(
         map.slot_range(indices)
-            .map(|(&k, &v)| (k, v))
+            .map(|(k, &v)| (k, v))
             .collect::<Vec<_>>(),
         expected
     );
@@ -259,7 +271,7 @@ fn mutate_range<'a, K, I>(
 ) -> TestCaseResult
 where
     K: Key + Debug + 'a,
-    I: DoubleEndedIterator<Item = (&'a K, &'a mut u32)> + FusedIterator,
+    I: DoubleEndedIterator<Item = (K, &'a mut u32)> + FusedIterator,
 {
     let (mut front, mut back) = (0, expected.len());
     for step in 0..expected.len() {
@@ -273,7 +285,7 @@ where
             (iter.next(), want)
         };
         let (key, value) = entry.expect("model has an entry remaining");
-        prop_assert_eq!((*key, *value), want);
+        prop_assert_eq!((key, *value), want);
         *value = value.wrapping_add(delta);
     }
     for _ in 0..4 {
@@ -284,7 +296,7 @@ where
     Ok(())
 }
 
-fn update_model<K: Key + Debug, const PAGE: usize, D: Directory>(
+fn update_model<K: DirectKey + Debug, const PAGE: usize, D: Directory>(
     map: &PagedDirectMap<K, u32, PAGE, D>,
     model: &mut Model<K>,
     bounds: Bounds<usize>,
@@ -297,13 +309,13 @@ fn update_model<K: Key + Debug, const PAGE: usize, D: Directory>(
     }
     prop_assert_eq!(map.len(), model.len());
     prop_assert_eq!(
-        map.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
+        map.iter().map(|(k, &v)| (k, v)).collect::<Vec<_>>(),
         model.values().copied().collect::<Vec<_>>()
     );
     Ok(())
 }
 
-fn check_mutations<K: Key + Debug, const PAGE: usize, D: Directory>(
+fn check_mutations<K: DirectKey + Debug, const PAGE: usize, D: Directory>(
     map: &mut PagedDirectMap<K, u32, PAGE, D>,
     model: &mut Model<K>,
     slots: Bounds<usize>,
@@ -329,7 +341,7 @@ fn check_mutations<K: Key + Debug, const PAGE: usize, D: Directory>(
     Ok(())
 }
 
-fn pop_all<K: Key + Debug, const PAGE: usize, D: Directory>(
+fn pop_all<K: DirectKey + Debug, const PAGE: usize, D: Directory>(
     map: &mut PagedDirectMap<K, u32, PAGE, D>,
     model: &mut Model<K>,
     directions: &[bool],

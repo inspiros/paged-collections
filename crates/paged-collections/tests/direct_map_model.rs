@@ -7,7 +7,7 @@ use std::iter::FusedIterator;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use paged_collections::direct_map::PagedDirectMap;
-use paged_collections::key::Key;
+use paged_collections::key::{DirectKey, Key};
 use paged_collections::page::{Directory, Flat, Radix, Tree};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseResult;
@@ -45,6 +45,21 @@ impl Key for Gen {
     }
 }
 
+impl DirectKey for Gen {
+    type Tag = u8;
+
+    fn tag(self) -> Self::Tag {
+        self.generation
+    }
+
+    fn from_parts(index: usize, tag: Self::Tag) -> Self {
+        Self {
+            index: index as u16,
+            generation: tag,
+        }
+    }
+}
+
 // A string representation lets JSON exercise generational map keys too.
 #[cfg(feature = "serde")]
 impl From<Gen> for String {
@@ -66,7 +81,7 @@ impl TryFrom<String> for Gen {
     }
 }
 
-trait TestKey: Key + Ord + Debug + Hash {
+trait TestKey: DirectKey + Ord + Debug + Hash {
     /// A key outside every generated input, on a separate page at all sizes.
     fn unused() -> Self;
 
@@ -259,13 +274,13 @@ fn check_state<K: TestKey, const PAGE: usize, D: Directory>(
     prop_assert_eq!(map.allocated_pages(), model.pages.len(), "{}", context);
     let expected = model.entries();
     prop_assert_eq!(
-        &map.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
+        &map.iter().map(|(k, &v)| (k, v)).collect::<Vec<_>>(),
         &expected,
         "{}",
         context
     );
     prop_assert_eq!(
-        map.iter().rev().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
+        map.iter().rev().map(|(k, &v)| (k, v)).collect::<Vec<_>>(),
         expected.iter().rev().copied().collect::<Vec<_>>(),
         "{}",
         context
@@ -289,7 +304,7 @@ fn check_state<K: TestKey, const PAGE: usize, D: Directory>(
             context
         );
         prop_assert_eq!(
-            map.get_key_value(key).map(|(&k, &v)| (k, v)),
+            map.get_key_value(key).map(|(k, &v)| (k, v)),
             entry,
             "key {:?}: {}",
             key,
@@ -302,14 +317,14 @@ fn check_state<K: TestKey, const PAGE: usize, D: Directory>(
     for &index in indices {
         let expected = model.slots.get(&index).copied();
         prop_assert_eq!(
-            map.occupant(index).map(|(&k, &v)| (k, v)),
+            map.occupant(index).map(|(k, &v)| (k, v)),
             expected,
             "index {}: {}",
             index,
             context
         );
         prop_assert_eq!(
-            map.occupant_mut(index).map(|(&k, v)| (k, *v)),
+            map.occupant_mut(index).map(|(k, v)| (k, *v)),
             expected,
             "index {}: {}",
             index,
@@ -411,7 +426,7 @@ fn run_sequence<K: TestKey, const PAGE: usize, D: Directory>(
                 prop_assert_eq!(actual, expected, "{}", context);
             }
             Op::OccupantMut(i, delta) => {
-                let actual = map.occupant_mut(i).map(|(&k, v)| {
+                let actual = map.occupant_mut(i).map(|(k, v)| {
                     *v = v.wrapping_add(delta);
                     (k, *v)
                 });
@@ -595,25 +610,25 @@ fn check_traits<K: TestKey, const PAGE: usize, D: Directory>(
     }
     let keys: Vec<_> = expected.iter().map(|&(k, _)| k).collect();
     let values: Vec<_> = expected.iter().map(|&(_, v)| v).collect();
-    check_iterator(map.iter().map(|(&k, &v)| (k, v)), &expected, directions)?;
+    check_iterator(map.iter().map(|(k, &v)| (k, v)), &expected, directions)?;
     check_iterator(
-        (&map).into_iter().map(|(&k, &v)| (k, v)),
+        (&map).into_iter().map(|(k, &v)| (k, v)),
         &expected,
         directions,
     )?;
-    check_iterator(map.keys().copied(), &keys, directions)?;
+    check_iterator(map.keys(), &keys, directions)?;
     check_iterator(map.values().copied(), &values, directions)?;
     check_cloned_iterator(
-        map.iter().map(|(&k, &v)| (k, v)),
+        map.iter().map(|(k, &v)| (k, v)),
         &expected,
         directions,
         prefix,
     )?;
-    check_cloned_iterator(map.keys().copied(), &keys, directions, prefix)?;
+    check_cloned_iterator(map.keys(), &keys, directions, prefix)?;
     check_cloned_iterator(map.values().copied(), &values, directions, prefix)?;
     // Mutation through each yielded reference must reach the original slot.
     check_iterator(
-        map.iter_mut().map(|(&k, v)| {
+        map.iter_mut().map(|(k, v)| {
             let old = *v;
             *v = v.wrapping_add(17);
             (k, old)
@@ -640,7 +655,7 @@ fn check_traits<K: TestKey, const PAGE: usize, D: Directory>(
     }
     check_state(&mut map, &model, &probes, &indices, "values_mut writes")?;
     check_iterator(
-        (&mut map).into_iter().map(|(&k, v)| (k, *v)),
+        (&mut map).into_iter().map(|(k, v)| (k, *v)),
         &model.entries(),
         directions,
     )?;
@@ -786,6 +801,18 @@ impl Key for Tagged {
     }
 }
 
+impl DirectKey for Tagged {
+    type Tag = Self;
+
+    fn tag(self) -> Self {
+        self
+    }
+
+    fn from_parts(_: usize, key: Self) -> Self {
+        key
+    }
+}
+
 fn generation_semantics<const PAGE: usize, D: Directory>() {
     let first = Tagged {
         identity: Gen {
@@ -869,6 +896,52 @@ fn generation_semantics<const PAGE: usize, D: Directory>() {
 #[test]
 fn stored_keys_and_generations_follow_each_insert_contract() {
     all_layouts!(generation_semantics);
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn compact_slots_rebuild_id_generations_after_reuse() {
+    use std::mem::size_of;
+
+    use paged_collections::direct_map::Slot;
+    use paged_collections::id_alloc::{Id, IdAllocator};
+
+    assert_eq!(size_of::<Slot<u32, u64>>(), 16);
+    assert_eq!(size_of::<Slot<u32, Box<u8>>>(), size_of::<usize>());
+    assert_eq!(size_of::<Slot<Id, u64>>(), 16);
+
+    let mut ids = IdAllocator::default();
+    let keys: Vec<_> = (0..6).map(|_| ids.alloc()).collect();
+    let mut map = PagedDirectMap::<Id, u64, 4>::new();
+    for (value, &key) in keys.iter().enumerate() {
+        assert_eq!(map.insert(key, value as u64), None);
+    }
+    assert_eq!(map.keys().collect::<Vec<_>>(), keys);
+
+    let old = keys[5];
+    assert!(ids.free(old));
+    let new = ids.alloc();
+    assert_eq!(new.index(), old.index());
+    assert_eq!(new.generation().get(), old.generation().get() + 1);
+    assert_eq!(map.insert(new, 99), Some(5));
+    assert_eq!(map.get(old), None);
+    assert_eq!(map.get(new), Some(&99));
+    let mut expected: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(value, &key)| (key, value as u64))
+        .collect();
+    expected[5] = (new, 99);
+    assert_eq!(
+        map.iter()
+            .map(|(key, &value)| (key, value))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let rebuilt: PagedDirectMap<Id, u64, 4> =
+        map.iter().map(|(key, &value)| (key, value)).collect();
+    assert_eq!(rebuilt, map);
+    assert_eq!(rebuilt.last_key_value(), Some((new, &99)));
 }
 
 fn allocation_and_equality<const PAGE: usize, D: Directory>() {
@@ -977,20 +1050,20 @@ fn cursor_edges<const PAGE: usize, D: Directory>() {
         &[false, true, true, false],
     ] {
         let mut map = make();
-        check_iterator(map.iter().map(|(&k, &v)| (k, v)), &expected, directions).unwrap();
-        check_iterator(map.iter_mut().map(|(&k, v)| (k, *v)), &expected, directions).unwrap();
-        check_iterator(map.keys().copied(), &keys, directions).unwrap();
+        check_iterator(map.iter().map(|(k, &v)| (k, v)), &expected, directions).unwrap();
+        check_iterator(map.iter_mut().map(|(k, v)| (k, *v)), &expected, directions).unwrap();
+        check_iterator(map.keys(), &keys, directions).unwrap();
         check_iterator(map.values().copied(), &values, directions).unwrap();
         check_iterator(map.values_mut().map(|v| *v), &values, directions).unwrap();
         for prefix in 0..=expected.len() {
             check_cloned_iterator(
-                map.iter().map(|(&k, &v)| (k, v)),
+                map.iter().map(|(k, &v)| (k, v)),
                 &expected,
                 directions,
                 prefix,
             )
             .unwrap();
-            check_cloned_iterator(map.keys().copied(), &keys, directions, prefix).unwrap();
+            check_cloned_iterator(map.keys(), &keys, directions, prefix).unwrap();
             check_cloned_iterator(map.values().copied(), &values, directions, prefix).unwrap();
         }
         check_iterator(make().into_iter(), &expected, directions).unwrap();
@@ -1027,7 +1100,7 @@ fn panicking_make<const PAGE: usize, D: Directory>() {
         ),
     ];
     let mut map: PagedDirectMap<Gen, u32, PAGE, D> = entries.into_iter().collect();
-    let before: Vec<_> = map.iter().map(|(&k, &v)| (k, v)).collect();
+    let before: Vec<_> = map.iter().map(|(k, &v)| (k, v)).collect();
     for key in [
         Gen {
             generation: 1,
@@ -1046,10 +1119,7 @@ fn panicking_make<const PAGE: usize, D: Directory>() {
         assert!(result.is_err());
         assert_eq!(calls, 1);
         assert_eq!(map.len(), before.len());
-        assert_eq!(
-            map.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
-            before
-        );
+        assert_eq!(map.iter().map(|(k, &v)| (k, v)).collect::<Vec<_>>(), before);
         assert_eq!(map.get(old), Some(&10));
         assert_eq!(map.get(key), None);
     }
@@ -1141,7 +1211,7 @@ mod panic_and_drop_tests {
         oracle: &Oracle,
         tracker: &Tracker,
     ) {
-        let actual: Vec<_> = map.iter().map(|(&k, v)| (k, (v.id, v.payload))).collect();
+        let actual: Vec<_> = map.iter().map(|(k, v)| (k, (v.id, v.payload))).collect();
         let expected: Vec<_> = oracle.values().copied().collect();
         assert_eq!(map.len(), actual.len());
         assert_eq!(map.len(), oracle.len());
@@ -1150,12 +1220,11 @@ mod panic_and_drop_tests {
         for index in probe_indices().into_iter().chain([4096]) {
             let occupant = oracle.get(&index).copied();
             assert_eq!(
-                map.occupant(index).map(|(&k, v)| (k, (v.id, v.payload))),
+                map.occupant(index).map(|(k, v)| (k, (v.id, v.payload))),
                 occupant
             );
             assert_eq!(
-                map.occupant_mut(index)
-                    .map(|(&k, v)| (k, (v.id, v.payload))),
+                map.occupant_mut(index).map(|(k, v)| (k, (v.id, v.payload))),
                 occupant
             );
             for generation in 0..4 {
@@ -1174,7 +1243,7 @@ mod panic_and_drop_tests {
                     expected.map(|(_, v)| v)
                 );
                 assert_eq!(
-                    map.get_key_value(key).map(|(&k, v)| (k, (v.id, v.payload))),
+                    map.get_key_value(key).map(|(k, v)| (k, (v.id, v.payload))),
                     expected
                 );
             }

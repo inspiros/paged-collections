@@ -9,7 +9,7 @@ use super::atomic::{AtomicUsize, Ordering};
 use super::directory::{SharedDirectory, SharedPages};
 use super::lock::{ReadGuard, RwLock, WriteGuard};
 use crate::direct_map::PagedDirectMap;
-use crate::key::Key;
+use crate::key::{DirectKey, Key};
 use crate::page::{DEFAULT_PAGE, Flat};
 
 struct Page<K, V> {
@@ -446,7 +446,9 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V,
         self.len.store(0, Ordering::Relaxed);
         drop(pages);
     }
+}
 
+impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V, PAGE, D> {
     /// Moves entries into a plain map in slot order, scanning allocated slots.
     /// Each occupied entry is moved once; no values are cloned.
     pub fn into_inner(mut self) -> PagedDirectMap<K, V, PAGE, D> {
@@ -671,7 +673,7 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> Extend<(K, V)>
     }
 }
 
-impl<K: Key, V, const PAGE: usize, D: SharedDirectory> From<PagedDirectMap<K, V, PAGE, D>>
+impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> From<PagedDirectMap<K, V, PAGE, D>>
     for ConcurrentDirectMap<K, V, PAGE, D>
 {
     fn from(map: PagedDirectMap<K, V, PAGE, D>) -> Self {

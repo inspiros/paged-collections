@@ -37,6 +37,15 @@
 //! [`entry`](PagedDirectMap::entry) is occupied only by the key itself; a
 //! vacant entry's inserts evict another generation.
 //!
+//! # What a slot stores
+//!
+//! A slot holds the value and the key's [`DirectKey::Tag`]: the part of the
+//! key its slot index does not give. Plain integer keys have the tag `()`, so
+//! a slot of a `u32 -> u64` map is an `Option<((), u64)>` of 16 bytes, and
+//! one of a `u32 -> Box<T>` map takes only the pointer's 8 bytes. Iterators
+//! and lookups rebuild each key from its slot index and tag, so they yield
+//! keys by value (`(K, &V)`) rather than by reference.
+//!
 //! # Ordered queries
 //!
 //! Entries are ordered by slot index, so the map answers the questions an
@@ -58,11 +67,11 @@
 //!
 //! let map: PagedDirectMap<u32, char> =
 //!     [(2, 'a'), (5, 'b'), (70_000, 'c')].into_iter().collect();
-//! let keys: Vec<u32> = map.range(3..=70_000).map(|(&k, _)| k).collect();
+//! let keys: Vec<u32> = map.range(3..=70_000).map(|(k, _)| k).collect();
 //! assert_eq!(keys, [5, 70_000]);
-//! assert_eq!(map.next_occupant(6), Some((&70_000, &'c')));
-//! assert_eq!(map.prev_occupant(4), Some((&2, &'a')));
-//! assert_eq!(map.last_key_value(), Some((&70_000, &'c')));
+//! assert_eq!(map.next_occupant(6), Some((70_000, &'c')));
+//! assert_eq!(map.prev_occupant(4), Some((2, &'a')));
+//! assert_eq!(map.last_key_value(), Some((70_000, &'c')));
 //! ```
 //!
 //! ```
@@ -76,7 +85,7 @@
 //! assert_eq!(map.allocated_pages(), 2);
 //!
 //! // Integer keys iterate in key order, whatever the insertion order.
-//! let keys: Vec<u32> = map.keys().copied().collect();
+//! let keys: Vec<u32> = map.keys().collect();
 //! assert_eq!(keys, [7, 3_000_000]);
 //!
 //! map.remove(3_000_000);
@@ -89,15 +98,17 @@ use alloc::vec::{self, Vec};
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter::{Fuse, FusedIterator};
+use core::marker::PhantomData;
 use core::mem;
 use core::ops::{Bound, Index, RangeBounds};
 use core::slice;
 
-use crate::key::Key;
+use crate::key::{DirectKey, Key};
 use crate::page::{DEFAULT_PAGE, Directory, Flat, PageStore, split};
 
-/// One slot of a [`PagedDirectMap`] page: the entry held there, if any.
-pub type Slot<K, V> = Option<(K, V)>;
+/// One slot of a [`PagedDirectMap`] page: the tag of the key held there and
+/// its value, if any.
+pub type Slot<K, V> = Option<(<K as DirectKey>::Tag, V)>;
 
 type Store<K, V, const PAGE: usize, D> = <D as Directory>::Store<Slot<K, V>, PAGE>;
 type Pages<'a, K, V, const PAGE: usize, D> =
@@ -107,17 +118,19 @@ type PagesMut<'a, K, V, const PAGE: usize, D> =
 type IntoPages<K, V, const PAGE: usize, D> =
     <Store<K, V, PAGE, D> as PageStore<Slot<K, V>, PAGE>>::IntoPages;
 
-/// A map from [`Key`]s to values stored in place at each key's slot index.
+/// A map from [`DirectKey`]s to values stored in place at each key's slot
+/// index.
 ///
 /// - `PAGE` is the number of slots per page; it must be non-zero. Each slot
-///   takes `size_of::<Option<(K, V)>>()` bytes whether or not it is occupied.
+///   takes `size_of::<Option<(K::Tag, V)>>()` bytes whether or not it is
+///   occupied; see [what a slot stores](self#what-a-slot-stores).
 /// - `D` is the page directory: [`Flat`] (default),
 ///   [`Radix`](crate::page::Radix) for wide keys, or
 ///   [`Tree`](crate::page::Tree). See [`crate::page`].
 ///
 /// Entries are ordered by slot index. See the [module docs](self) for costs
 /// and for how methods treat a slot held by another generation of a key.
-pub struct PagedDirectMap<K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+pub struct PagedDirectMap<K: DirectKey, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
     // Invariant: `len` is the number of occupied slots across all pages.
     // Every mutation below keeps it even when a user closure, `V::drop` or an
     // allocation panics.
@@ -125,7 +138,7 @@ pub struct PagedDirectMap<K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory =
     len: usize,
 }
 
-impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     /// Number of slots per page.
     pub const PAGE_SIZE: usize = PAGE;
 
@@ -184,23 +197,27 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     /// The value for `key`, if it is in the map.
     #[inline]
     pub fn get(&self, key: K) -> Option<&V> {
-        self.get_key_value(key).map(|(_, value)| value)
+        match self.slot(key.index())? {
+            Some((tag, value)) if *tag == key.tag() => Some(value),
+            _ => None,
+        }
     }
 
     /// Mutable access to the value for `key`, if it is in the map.
     #[inline]
     pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
         match self.slot_mut(key.index())? {
-            Some((stored, value)) if *stored == key => Some(value),
+            Some((tag, value)) if *tag == key.tag() => Some(value),
             _ => None,
         }
     }
 
     /// The stored key equal to `key` and its value, if it is in the map.
     #[inline]
-    pub fn get_key_value(&self, key: K) -> Option<(&K, &V)> {
-        match self.slot(key.index())? {
-            Some((stored, value)) if *stored == key => Some((stored, value)),
+    pub fn get_key_value(&self, key: K) -> Option<(K, &V)> {
+        let index = key.index();
+        match self.slot(index)? {
+            Some((tag, value)) if *tag == key.tag() => Some((K::from_parts(index, *tag), value)),
             _ => None,
         }
     }
@@ -209,16 +226,16 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     ///
     /// With generational keys this finds whichever generation is present.
     #[inline]
-    pub fn occupant(&self, index: usize) -> Option<(&K, &V)> {
-        self.slot(index)?.as_ref().map(|(key, value)| (key, value))
+    pub fn occupant(&self, index: usize) -> Option<(K, &V)> {
+        let (tag, value) = self.slot(index)?.as_ref()?;
+        Some((K::from_parts(index, *tag), value))
     }
 
     /// The entry occupying slot `index`, with mutable access to its value.
     #[inline]
-    pub fn occupant_mut(&mut self, index: usize) -> Option<(&K, &mut V)> {
-        self.slot_mut(index)?
-            .as_mut()
-            .map(|(key, value)| (&*key, value))
+    pub fn occupant_mut(&mut self, index: usize) -> Option<(K, &mut V)> {
+        let (tag, value) = self.slot_mut(index)?.as_mut()?;
+        Some((K::from_parts(index, *tag), value))
     }
 
     /// Stores `value` for `key` and returns the value previously in `key`'s
@@ -235,14 +252,15 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     /// Panics if the page or the directory cannot be allocated. The entries
     /// are then unchanged, though the directory may have grown.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let tag = key.tag();
         let (slot, len) = self.slot_or_alloc(key.index());
         if let Some((stored, old)) = slot {
-            if *stored != key {
-                *stored = key;
+            if *stored != tag {
+                *stored = tag;
             }
             return Some(mem::replace(old, value));
         }
-        *slot = Some((key, value));
+        *slot = Some((tag, value));
         *len += 1;
         None
     }
@@ -257,12 +275,13 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     ///
     /// As [`insert`](Self::insert).
     pub fn replace(&mut self, key: K, value: V) -> Option<(K, V)> {
-        let (slot, len) = self.slot_or_alloc(key.index());
-        let old = slot.replace((key, value));
+        let index = key.index();
+        let (slot, len) = self.slot_or_alloc(index);
+        let old = slot.replace((key.tag(), value));
         if old.is_none() {
             *len += 1;
         }
-        old
+        old.map(|(tag, value)| (K::from_parts(index, tag), value))
     }
 
     /// Adds an entry if `key`'s slot is vacant and returns its value, or
@@ -278,7 +297,7 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
             return Err(value);
         }
         *len += 1;
-        let (_, value) = slot.insert((key, value));
+        let (_, value) = slot.insert((key.tag(), value));
         Ok(value)
     }
 
@@ -292,8 +311,8 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     ///
     /// As [`insert`](Self::insert).
     pub fn get_or_insert_with(&mut self, key: K, make: impl FnOnce() -> V) -> &mut V {
-        let index = key.index();
-        let held_by_key = matches!(self.slot(index), Some(Some((stored, _))) if *stored == key);
+        let (index, tag) = (key.index(), key.tag());
+        let held_by_key = matches!(self.slot(index), Some(Some((stored, _))) if *stored == tag);
         if !held_by_key {
             // `make` runs before anything is allocated or changed.
             let value = make();
@@ -303,7 +322,7 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
             }
             // Drop an evicted entry only once the slot is consistent:
             // `V::drop` may panic.
-            drop(slot.replace((key, value)));
+            drop(slot.replace((tag, value)));
         }
         // The page exists now, so this allocates nothing.
         let (slot, _) = self.slot_or_alloc(index);
@@ -321,22 +340,21 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     /// Removes `key` and returns the stored key and its value, if it was
     /// present.
     pub fn remove_entry(&mut self, key: K) -> Option<(K, V)> {
-        let slot = self.slot_mut(key.index())?;
-        if !matches!(slot, Some((stored, _)) if *stored == key) {
+        let index = key.index();
+        let slot = self.slot_mut(index)?;
+        if !matches!(slot, Some((stored, _)) if *stored == key.tag()) {
             return None;
         }
-        let entry = slot.take();
+        let (tag, value) = slot.take()?;
         self.len -= 1;
-        entry
+        Some((K::from_parts(index, tag), value))
     }
 
     /// Removes whichever entry occupies slot `index` and returns it.
     pub fn remove_occupant(&mut self, index: usize) -> Option<(K, V)> {
-        let entry = self.slot_mut(index)?.take();
-        if entry.is_some() {
-            self.len -= 1;
-        }
-        entry
+        let (tag, value) = self.slot_mut(index)?.take()?;
+        self.len -= 1;
+        Some((K::from_parts(index, tag), value))
     }
 
     /// Keeps only the entries for which `keep` returns `true`, visiting them
@@ -346,14 +364,15 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     /// kept and the map stays consistent.
     pub fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {
         let mut remaining = self.len;
-        for (_, page) in self.pages.pages_mut() {
-            for slot in page.iter_mut() {
+        for (number, page) in self.pages.pages_mut() {
+            for (offset, slot) in page.iter_mut().enumerate() {
                 if remaining == 0 {
                     return;
                 }
-                let Some((key, value)) = slot else { continue };
+                let Some((tag, value)) = slot else { continue };
                 remaining -= 1;
-                if !keep(key, value) {
+                let key = K::from_parts(number * PAGE + offset, *tag);
+                if !keep(&key, value) {
                     let removed = slot.take();
                     self.len -= 1;
                     drop(removed);
@@ -482,7 +501,7 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     ///
     /// For plain integer keys, the entry with the smallest key `>= index`.
     #[inline]
-    pub fn next_occupant(&self, index: usize) -> Option<(&K, &V)> {
+    pub fn next_occupant(&self, index: usize) -> Option<(K, &V)> {
         self.slot_range(index..).next()
     }
 
@@ -490,19 +509,19 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     ///
     /// For plain integer keys, the entry with the largest key `<= index`.
     #[inline]
-    pub fn prev_occupant(&self, index: usize) -> Option<(&K, &V)> {
+    pub fn prev_occupant(&self, index: usize) -> Option<(K, &V)> {
         self.slot_range(..=index).next_back()
     }
 
     /// The entry with the smallest slot index.
     #[inline]
-    pub fn first_key_value(&self) -> Option<(&K, &V)> {
+    pub fn first_key_value(&self) -> Option<(K, &V)> {
         self.iter().next()
     }
 
     /// The entry with the largest slot index.
     #[inline]
-    pub fn last_key_value(&self) -> Option<(&K, &V)> {
+    pub fn last_key_value(&self) -> Option<(K, &V)> {
         self.iter().next_back()
     }
 
@@ -537,12 +556,14 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     /// ```
     pub fn entry(&mut self, key: K) -> Entry<'_, K, V, PAGE, D> {
         let index = key.index();
-        if !matches!(self.slot(index), Some(Some((stored, _))) if *stored == key) {
-            return Entry::Vacant(VacantEntry { map: self, key });
-        }
+        let stored = match self.slot(index) {
+            Some(Some((stored, _))) if *stored == key.tag() => *stored,
+            _ => return Entry::Vacant(VacantEntry { map: self, key }),
+        };
         let (page, offset) = split::<PAGE>(index);
         match self.pages.get_mut(page) {
             Some(page) => Entry::Occupied(OccupiedEntry {
+                key: K::from_parts(index, stored),
                 slot: &mut page[offset],
                 len: &mut self.len,
             }),
@@ -561,13 +582,14 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE, D> {
     }
 }
 
-impl<K: Key, V, const PAGE: usize, D: Directory> Default for PagedDirectMap<K, V, PAGE, D> {
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> Default for PagedDirectMap<K, V, PAGE, D> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Key, V: Clone, const PAGE: usize, D: Directory> Clone for PagedDirectMap<K, V, PAGE, D>
+impl<K: DirectKey, V: Clone, const PAGE: usize, D: Directory> Clone
+    for PagedDirectMap<K, V, PAGE, D>
 where
     Store<K, V, PAGE, D>: Clone,
 {
@@ -579,7 +601,7 @@ where
     }
 }
 
-impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
+impl<K: DirectKey + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
     for PagedDirectMap<K, V, PAGE, D>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -589,7 +611,7 @@ impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::D
 
 /// Maps are equal when they hold the same entries. Allocated pages do not
 /// matter.
-impl<K: Key, V: PartialEq, const PAGE: usize, D: Directory> PartialEq
+impl<K: DirectKey, V: PartialEq, const PAGE: usize, D: Directory> PartialEq
     for PagedDirectMap<K, V, PAGE, D>
 {
     fn eq(&self, other: &Self) -> bool {
@@ -599,10 +621,10 @@ impl<K: Key, V: PartialEq, const PAGE: usize, D: Directory> PartialEq
     }
 }
 
-impl<K: Key, V: Eq, const PAGE: usize, D: Directory> Eq for PagedDirectMap<K, V, PAGE, D> {}
+impl<K: DirectKey, V: Eq, const PAGE: usize, D: Directory> Eq for PagedDirectMap<K, V, PAGE, D> {}
 
 /// Hashes the entries in slot-index order, consistent with `Eq`.
-impl<K: Key + Hash, V: Hash, const PAGE: usize, D: Directory> Hash
+impl<K: DirectKey + Hash, V: Hash, const PAGE: usize, D: Directory> Hash
     for PagedDirectMap<K, V, PAGE, D>
 {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -618,7 +640,7 @@ impl<K: Key + Hash, V: Hash, const PAGE: usize, D: Directory> Hash
 /// # Panics
 ///
 /// Panics if `key` is not in the map.
-impl<K: Key, V, const PAGE: usize, D: Directory> Index<K> for PagedDirectMap<K, V, PAGE, D> {
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> Index<K> for PagedDirectMap<K, V, PAGE, D> {
     type Output = V;
 
     fn index(&self, key: K) -> &V {
@@ -628,7 +650,9 @@ impl<K: Key, V, const PAGE: usize, D: Directory> Index<K> for PagedDirectMap<K, 
 
 /// Inserts each entry with [`insert`](PagedDirectMap::insert), so later
 /// entries overwrite earlier ones in the same slot.
-impl<K: Key, V, const PAGE: usize, D: Directory> Extend<(K, V)> for PagedDirectMap<K, V, PAGE, D> {
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> Extend<(K, V)>
+    for PagedDirectMap<K, V, PAGE, D>
+{
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         for (key, value) in iter {
             self.insert(key, value);
@@ -636,7 +660,7 @@ impl<K: Key, V, const PAGE: usize, D: Directory> Extend<(K, V)> for PagedDirectM
     }
 }
 
-impl<'a, K: Key + 'a, V: Copy + 'a, const PAGE: usize, D: Directory> Extend<(&'a K, &'a V)>
+impl<'a, K: DirectKey + 'a, V: Copy + 'a, const PAGE: usize, D: Directory> Extend<(&'a K, &'a V)>
     for PagedDirectMap<K, V, PAGE, D>
 {
     fn extend<I: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: I) {
@@ -644,7 +668,7 @@ impl<'a, K: Key + 'a, V: Copy + 'a, const PAGE: usize, D: Directory> Extend<(&'a
     }
 }
 
-impl<K: Key, V, const PAGE: usize, D: Directory> FromIterator<(K, V)>
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> FromIterator<(K, V)>
     for PagedDirectMap<K, V, PAGE, D>
 {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
@@ -654,10 +678,10 @@ impl<K: Key, V, const PAGE: usize, D: Directory> FromIterator<(K, V)>
     }
 }
 
-impl<'a, K: Key, V, const PAGE: usize, D: Directory> IntoIterator
+impl<'a, K: DirectKey, V, const PAGE: usize, D: Directory> IntoIterator
     for &'a PagedDirectMap<K, V, PAGE, D>
 {
-    type Item = (&'a K, &'a V);
+    type Item = (K, &'a V);
     type IntoIter = Iter<'a, K, V, PAGE, D>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -665,10 +689,10 @@ impl<'a, K: Key, V, const PAGE: usize, D: Directory> IntoIterator
     }
 }
 
-impl<'a, K: Key, V, const PAGE: usize, D: Directory> IntoIterator
+impl<'a, K: DirectKey, V, const PAGE: usize, D: Directory> IntoIterator
     for &'a mut PagedDirectMap<K, V, PAGE, D>
 {
-    type Item = (&'a K, &'a mut V);
+    type Item = (K, &'a mut V);
     type IntoIter = IterMut<'a, K, V, PAGE, D>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -676,7 +700,9 @@ impl<'a, K: Key, V, const PAGE: usize, D: Directory> IntoIterator
     }
 }
 
-impl<K: Key, V, const PAGE: usize, D: Directory> IntoIterator for PagedDirectMap<K, V, PAGE, D> {
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> IntoIterator
+    for PagedDirectMap<K, V, PAGE, D>
+{
     type Item = (K, V);
     type IntoIter = IntoIter<K, V, PAGE, D>;
 
@@ -685,93 +711,167 @@ impl<K: Key, V, const PAGE: usize, D: Directory> IntoIterator for PagedDirectMap
     }
 }
 
-// Iteration: a cursor flattens the page iterator into slots, like
-// `Iterator::flatten`, and stops once it has yielded `remaining` entries so
-// trailing empty slots are not scanned.
+// Iteration: a cursor flattens the page iterator into indexed slots, like
+// `Iterator::flatten`, rebuilds each entry's key from its slot index and tag,
+// and stops once it has yielded `remaining` entries so trailing empty slots
+// are not scanned.
 
-/// Turns a page from a page iterator into an iterator over its slots.
+/// The slots of one page (or part of one), each with its slot index.
+#[derive(Clone, Default)]
+struct Indexed<S> {
+    /// The slot index of the next slot from the front.
+    start: usize,
+    slots: S,
+}
+
+impl<S: ExactSizeIterator + DoubleEndedIterator> Iterator for Indexed<S> {
+    type Item = (usize, S::Item);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let slot = self.slots.next()?;
+        let index = self.start;
+        // Wraps only past a slot at `usize::MAX`, the last one there is.
+        self.start = index.wrapping_add(1);
+        Some((index, slot))
+    }
+}
+
+impl<S: ExactSizeIterator + DoubleEndedIterator> DoubleEndedIterator for Indexed<S> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let slot = self.slots.next_back()?;
+        Some((self.start.wrapping_add(self.slots.len()), slot))
+    }
+}
+
+/// Turns a page from a page iterator into an iterator over its indexed
+/// slots.
 trait PageSlots {
     type Slots: DoubleEndedIterator + Default;
     fn slots(self) -> Self::Slots;
 }
 
-impl<'a, T> PageSlots for &'a [T] {
-    type Slots = slice::Iter<'a, T>;
+/// The first slot index of page `number`. Only a store that breaks the page
+/// contract can make this wrap, which gives wrong keys but nothing worse.
+#[inline]
+fn page_start<const PAGE: usize>(number: usize) -> usize {
+    number.wrapping_mul(PAGE)
+}
+
+/// A part of a page cut by [`Trim`]: its first slot index and its slots.
+impl<'a, T> PageSlots for (usize, &'a [T]) {
+    type Slots = Indexed<slice::Iter<'a, T>>;
     fn slots(self) -> Self::Slots {
-        self.iter()
+        Indexed {
+            start: self.0,
+            slots: self.1.iter(),
+        }
     }
 }
 
-impl<'a, T> PageSlots for &'a mut [T] {
-    type Slots = slice::IterMut<'a, T>;
+impl<'a, T> PageSlots for (usize, &'a mut [T]) {
+    type Slots = Indexed<slice::IterMut<'a, T>>;
     fn slots(self) -> Self::Slots {
-        self.iter_mut()
+        Indexed {
+            start: self.0,
+            slots: self.1.iter_mut(),
+        }
     }
 }
 
+/// A whole page: its page number and its slots.
 impl<'a, T, const PAGE: usize> PageSlots for (usize, &'a [T; PAGE]) {
-    type Slots = slice::Iter<'a, T>;
+    type Slots = Indexed<slice::Iter<'a, T>>;
     fn slots(self) -> Self::Slots {
-        self.1.iter()
+        Indexed {
+            start: page_start::<PAGE>(self.0),
+            slots: self.1.iter(),
+        }
     }
 }
 
 impl<'a, T, const PAGE: usize> PageSlots for (usize, &'a mut [T; PAGE]) {
-    type Slots = slice::IterMut<'a, T>;
+    type Slots = Indexed<slice::IterMut<'a, T>>;
     fn slots(self) -> Self::Slots {
-        self.1.iter_mut()
+        Indexed {
+            start: page_start::<PAGE>(self.0),
+            slots: self.1.iter_mut(),
+        }
     }
 }
 
 impl<T, const PAGE: usize> PageSlots for (usize, Box<[T; PAGE]>) {
-    type Slots = vec::IntoIter<T>;
+    type Slots = Indexed<vec::IntoIter<T>>;
     fn slots(self) -> Self::Slots {
         let page: Box<[T]> = self.1;
-        Vec::from(page).into_iter()
+        Indexed {
+            start: page_start::<PAGE>(self.0),
+            slots: Vec::from(page).into_iter(),
+        }
     }
 }
 
-/// Turns a slot into the entry it holds, if any.
-trait SlotEntry {
+/// Turns the slot at a slot index into the entry it holds, if any, with the
+/// key of type `K` rebuilt.
+trait SlotEntry<K> {
     type Entry;
-    fn entry(self) -> Option<Self::Entry>;
+    fn entry(self, index: usize) -> Option<Self::Entry>;
 }
 
-impl<'a, K, V> SlotEntry for &'a Slot<K, V> {
-    type Entry = (&'a K, &'a V);
-    fn entry(self) -> Option<Self::Entry> {
-        self.as_ref().map(|(key, value)| (key, value))
+impl<'a, K: DirectKey, V: 'a> SlotEntry<K> for &'a Option<(K::Tag, V)> {
+    type Entry = (K, &'a V);
+    #[inline]
+    fn entry(self, index: usize) -> Option<Self::Entry> {
+        let (tag, value) = self.as_ref()?;
+        Some((K::from_parts(index, *tag), value))
     }
 }
 
-impl<'a, K, V> SlotEntry for &'a mut Slot<K, V> {
-    type Entry = (&'a K, &'a mut V);
-    fn entry(self) -> Option<Self::Entry> {
-        self.as_mut().map(|(key, value)| (&*key, value))
+impl<'a, K: DirectKey, V: 'a> SlotEntry<K> for &'a mut Option<(K::Tag, V)> {
+    type Entry = (K, &'a mut V);
+    #[inline]
+    fn entry(self, index: usize) -> Option<Self::Entry> {
+        let (tag, value) = self.as_mut()?;
+        Some((K::from_parts(index, *tag), value))
     }
 }
 
-impl<K, V> SlotEntry for Slot<K, V> {
+impl<K: DirectKey, V> SlotEntry<K> for Option<(K::Tag, V)> {
     type Entry = (K, V);
-    fn entry(self) -> Option<Self::Entry> {
-        self
+    #[inline]
+    fn entry(self, index: usize) -> Option<Self::Entry> {
+        let (tag, value) = self?;
+        Some((K::from_parts(index, tag), value))
     }
 }
 
-#[derive(Clone)]
-struct Cursor<P, S> {
+struct Cursor<K, P, S> {
     pages: Fuse<P>,
     front: S,
     back: S,
     remaining: usize,
+    key: PhantomData<fn() -> K>,
 }
 
-impl<P, S> Cursor<P, S>
+impl<K, P: Clone, S: Clone> Clone for Cursor<K, P, S> {
+    fn clone(&self) -> Self {
+        Self {
+            pages: self.pages.clone(),
+            front: self.front.clone(),
+            back: self.back.clone(),
+            remaining: self.remaining,
+            key: PhantomData,
+        }
+    }
+}
+
+impl<K, P, S, X> Cursor<K, P, S>
 where
     P: DoubleEndedIterator,
     P::Item: PageSlots<Slots = S>,
-    S: DoubleEndedIterator + Default,
-    S::Item: SlotEntry,
+    S: DoubleEndedIterator<Item = (usize, X)> + Default,
+    X: SlotEntry<K>,
 {
     #[inline]
     fn len(&self) -> usize {
@@ -784,12 +884,13 @@ where
             front: S::default(),
             back: S::default(),
             remaining,
+            key: PhantomData,
         }
     }
 
-    fn next(&mut self) -> Option<<S::Item as SlotEntry>::Entry> {
+    fn next(&mut self) -> Option<X::Entry> {
         while self.remaining > 0 {
-            let slot = match self.front.next() {
+            let (index, slot) = match self.front.next() {
                 Some(slot) => slot,
                 None => match self.pages.next() {
                     Some(page) => {
@@ -803,7 +904,7 @@ where
                     },
                 },
             };
-            if let Some(entry) = slot.entry() {
+            if let Some(entry) = slot.entry(index) {
                 self.remaining -= 1;
                 return Some(entry);
             }
@@ -814,9 +915,9 @@ where
         None
     }
 
-    fn next_back(&mut self) -> Option<<S::Item as SlotEntry>::Entry> {
+    fn next_back(&mut self) -> Option<X::Entry> {
         while self.remaining > 0 {
-            let slot = match self.back.next_back() {
+            let (index, slot) = match self.back.next_back() {
                 Some(slot) => slot,
                 None => match self.pages.next_back() {
                     Some(page) => {
@@ -829,7 +930,7 @@ where
                     },
                 },
             };
-            if let Some(entry) = slot.entry() {
+            if let Some(entry) = slot.entry(index) {
                 self.remaining -= 1;
                 return Some(entry);
             }
@@ -890,7 +991,8 @@ impl Span {
     }
 }
 
-/// Cuts a page from a page iterator down to its slots in `first..=last`.
+/// Cuts a page from a page iterator down to its slots in `first..=last`, with
+/// the slot index of the first one.
 trait Cut<const PAGE: usize> {
     type Part;
     fn cut(self, first: usize, last: usize) -> Self::Part;
@@ -909,16 +1011,20 @@ fn offsets<const PAGE: usize>(number: usize, first: usize, last: usize) -> core:
 }
 
 impl<'a, T, const PAGE: usize> Cut<PAGE> for (usize, &'a [T; PAGE]) {
-    type Part = &'a [T];
-    fn cut(self, first: usize, last: usize) -> &'a [T] {
-        &self.1[offsets::<PAGE>(self.0, first, last)]
+    type Part = (usize, &'a [T]);
+    fn cut(self, first: usize, last: usize) -> Self::Part {
+        let offsets = offsets::<PAGE>(self.0, first, last);
+        let start = page_start::<PAGE>(self.0).wrapping_add(offsets.start);
+        (start, &self.1[offsets])
     }
 }
 
 impl<'a, T, const PAGE: usize> Cut<PAGE> for (usize, &'a mut [T; PAGE]) {
-    type Part = &'a mut [T];
-    fn cut(self, first: usize, last: usize) -> &'a mut [T] {
-        &mut self.1[offsets::<PAGE>(self.0, first, last)]
+    type Part = (usize, &'a mut [T]);
+    fn cut(self, first: usize, last: usize) -> Self::Part {
+        let offsets = offsets::<PAGE>(self.0, first, last);
+        let start = page_start::<PAGE>(self.0).wrapping_add(offsets.start);
+        (start, &mut self.1[offsets])
     }
 }
 
@@ -958,15 +1064,15 @@ macro_rules! range_iterator {
         $name:ident, $pages:ident, $slots:ident, $item:ty
     ) => {
         $(#[$doc])*
-        pub struct $name<'a, K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat>(
-            Cursor<Trim<$pages<'a, K, V, PAGE, D>, PAGE>, slice::$slots<'a, Slot<K, V>>>,
+        pub struct $name<'a, K: DirectKey, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat>(
+            Cursor<K, Trim<$pages<'a, K, V, PAGE, D>, PAGE>, Indexed<slice::$slots<'a, Slot<K, V>>>>,
         )
         where
             K: 'a,
             V: 'a,
             D: 'a;
 
-        impl<'a, K, V, const PAGE: usize, D: Directory> Iterator for $name<'a, K, V, PAGE, D> {
+        impl<'a, K: DirectKey, V, const PAGE: usize, D: Directory> Iterator for $name<'a, K, V, PAGE, D> {
             type Item = $item;
 
             #[inline]
@@ -983,7 +1089,7 @@ macro_rules! range_iterator {
             }
         }
 
-        impl<'a, K, V, const PAGE: usize, D: Directory> DoubleEndedIterator
+        impl<'a, K: DirectKey, V, const PAGE: usize, D: Directory> DoubleEndedIterator
             for $name<'a, K, V, PAGE, D>
         {
             #[inline]
@@ -992,12 +1098,12 @@ macro_rules! range_iterator {
             }
         }
 
-        impl<'a, K, V, const PAGE: usize, D: Directory> FusedIterator
+        impl<'a, K: DirectKey, V, const PAGE: usize, D: Directory> FusedIterator
             for $name<'a, K, V, PAGE, D>
         {
         }
 
-        impl<'a, K, V, const PAGE: usize, D: Directory> fmt::Debug for $name<'a, K, V, PAGE, D> {
+        impl<'a, K: DirectKey, V, const PAGE: usize, D: Directory> fmt::Debug for $name<'a, K, V, PAGE, D> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.debug_struct(stringify!($name)).finish_non_exhaustive()
             }
@@ -1009,7 +1115,7 @@ range_iterator!(
     /// Iterator over the entries of a [`PagedDirectMap`] in a range of slot
     /// indices, from [`range`](PagedDirectMap::range) or
     /// [`slot_range`](PagedDirectMap::slot_range).
-    Range, Pages, Iter, (&'a K, &'a V)
+    Range, Pages, Iter, (K, &'a V)
 );
 
 range_iterator!(
@@ -1017,10 +1123,10 @@ range_iterator!(
     /// indices, with mutable values, from
     /// [`range_mut`](PagedDirectMap::range_mut) or
     /// [`slot_range_mut`](PagedDirectMap::slot_range_mut).
-    RangeMut, PagesMut, IterMut, (&'a K, &'a mut V)
+    RangeMut, PagesMut, IterMut, (K, &'a mut V)
 );
 
-impl<K, V, const PAGE: usize, D: Directory> Clone for Range<'_, K, V, PAGE, D> {
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> Clone for Range<'_, K, V, PAGE, D> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
@@ -1035,11 +1141,11 @@ macro_rules! entry_iterator {
         |$entry:pat_param| $map:expr
     ) => {
         $(#[$doc])*
-        pub struct $name<$($lt,)? K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat>($inner)
+        pub struct $name<$($lt,)? K: DirectKey, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat>($inner)
         where
             $(K: $lt, V: $lt, D: $lt)?;
 
-        impl<$($lt,)? K, V, const PAGE: usize, D: Directory> Iterator for $name<$($lt,)? K, V, PAGE, D>
+        impl<$($lt,)? K: DirectKey, V, const PAGE: usize, D: Directory> Iterator for $name<$($lt,)? K, V, PAGE, D>
         where
             $(K: $lt, V: $lt, D: $lt)?
         {
@@ -1057,7 +1163,7 @@ macro_rules! entry_iterator {
             }
         }
 
-        impl<$($lt,)? K, V, const PAGE: usize, D: Directory> DoubleEndedIterator
+        impl<$($lt,)? K: DirectKey, V, const PAGE: usize, D: Directory> DoubleEndedIterator
             for $name<$($lt,)? K, V, PAGE, D>
         where
             $(K: $lt, V: $lt, D: $lt)?
@@ -1068,7 +1174,7 @@ macro_rules! entry_iterator {
             }
         }
 
-        impl<$($lt,)? K, V, const PAGE: usize, D: Directory> ExactSizeIterator
+        impl<$($lt,)? K: DirectKey, V, const PAGE: usize, D: Directory> ExactSizeIterator
             for $name<$($lt,)? K, V, PAGE, D>
         where
             $(K: $lt, V: $lt, D: $lt)?
@@ -1079,14 +1185,14 @@ macro_rules! entry_iterator {
             }
         }
 
-        impl<$($lt,)? K, V, const PAGE: usize, D: Directory> FusedIterator
+        impl<$($lt,)? K: DirectKey, V, const PAGE: usize, D: Directory> FusedIterator
             for $name<$($lt,)? K, V, PAGE, D>
         where
             $(K: $lt, V: $lt, D: $lt)?
         {
         }
 
-        impl<$($lt,)? K, V, const PAGE: usize, D: Directory> fmt::Debug
+        impl<$($lt,)? K: DirectKey, V, const PAGE: usize, D: Directory> fmt::Debug
             for $name<$($lt,)? K, V, PAGE, D>
         where
             $(K: $lt, V: $lt, D: $lt)?
@@ -1104,8 +1210,8 @@ entry_iterator!(
     /// Iterator over the entries of a [`PagedDirectMap`] in slot-index
     /// order, from [`iter`](PagedDirectMap::iter).
     Iter<'a, K, V, PAGE, D>,
-    Cursor<Pages<'a, K, V, PAGE, D>, slice::Iter<'a, Slot<K, V>>>,
-    (&'a K, &'a V),
+    Cursor<K, Pages<'a, K, V, PAGE, D>, Indexed<slice::Iter<'a, Slot<K, V>>>>,
+    (K, &'a V),
     |entry| entry
 );
 
@@ -1113,8 +1219,8 @@ entry_iterator!(
     /// Iterator over the entries of a [`PagedDirectMap`] with mutable
     /// values, from [`iter_mut`](PagedDirectMap::iter_mut).
     IterMut<'a, K, V, PAGE, D>,
-    Cursor<PagesMut<'a, K, V, PAGE, D>, slice::IterMut<'a, Slot<K, V>>>,
-    (&'a K, &'a mut V),
+    Cursor<K, PagesMut<'a, K, V, PAGE, D>, Indexed<slice::IterMut<'a, Slot<K, V>>>>,
+    (K, &'a mut V),
     |entry| entry
 );
 
@@ -1122,7 +1228,7 @@ entry_iterator!(
     /// Owning iterator over the entries of a [`PagedDirectMap`] in
     /// slot-index order.
     IntoIter<K, V, PAGE, D>,
-    Cursor<IntoPages<K, V, PAGE, D>, vec::IntoIter<Slot<K, V>>>,
+    Cursor<K, IntoPages<K, V, PAGE, D>, Indexed<vec::IntoIter<Slot<K, V>>>>,
     (K, V),
     |entry| entry
 );
@@ -1132,7 +1238,7 @@ entry_iterator!(
     /// [`keys`](PagedDirectMap::keys).
     Keys<'a, K, V, PAGE, D>,
     Iter<'a, K, V, PAGE, D>,
-    &'a K,
+    K,
     |(key, _)| key
 );
 
@@ -1172,19 +1278,19 @@ entry_iterator!(
     |(_, value)| value
 );
 
-impl<K, V, const PAGE: usize, D: Directory> Clone for Iter<'_, K, V, PAGE, D> {
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> Clone for Iter<'_, K, V, PAGE, D> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<K, V, const PAGE: usize, D: Directory> Clone for Keys<'_, K, V, PAGE, D> {
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> Clone for Keys<'_, K, V, PAGE, D> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<K, V, const PAGE: usize, D: Directory> Clone for Values<'_, K, V, PAGE, D> {
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> Clone for Values<'_, K, V, PAGE, D> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
@@ -1198,7 +1304,7 @@ mod serde_impl {
     use serde::ser::{Serialize, Serializer};
 
     /// Serializes as a map from keys to values, in slot-index order.
-    impl<K: Key + Serialize, V: Serialize, const PAGE: usize, D: Directory> Serialize
+    impl<K: DirectKey + Serialize, V: Serialize, const PAGE: usize, D: Directory> Serialize
         for PagedDirectMap<K, V, PAGE, D>
     {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -1216,7 +1322,7 @@ mod serde_impl {
     /// [`Tree`](crate::page::Tree), or validate the keys first.
     impl<'de, K, V, const PAGE: usize, D> Deserialize<'de> for PagedDirectMap<K, V, PAGE, D>
     where
-        K: Key + Deserialize<'de>,
+        K: DirectKey + Deserialize<'de>,
         V: Deserialize<'de>,
         D: Directory,
     {
@@ -1225,7 +1331,7 @@ mod serde_impl {
 
             impl<'de, K, V, const PAGE: usize, D> Visitor<'de> for MapVisitor<K, V, PAGE, D>
             where
-                K: Key + Deserialize<'de>,
+                K: DirectKey + Deserialize<'de>,
                 V: Deserialize<'de>,
                 D: Directory,
             {
@@ -1254,7 +1360,7 @@ mod serde_impl {
 
 /// A view into one key's place in a [`PagedDirectMap`], from
 /// [`entry`](PagedDirectMap::entry).
-pub enum Entry<'a, K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+pub enum Entry<'a, K: DirectKey, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
     /// The key is in the map.
     Occupied(OccupiedEntry<'a, K, V>),
     /// The key is not in the map; its slot is empty or held by another
@@ -1263,19 +1369,21 @@ pub enum Entry<'a, K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> 
 }
 
 /// An [`Entry`] for a key that is in the map.
-pub struct OccupiedEntry<'a, K, V> {
-    // Invariant: `*slot` is `Some`, and `len` is the map's entry count.
+pub struct OccupiedEntry<'a, K: DirectKey, V> {
+    // Invariant: `*slot` is `Some`, `key` is the stored key (rebuilt from the
+    // slot's index and tag), and `len` is the map's entry count.
+    key: K,
     slot: &'a mut Slot<K, V>,
     len: &'a mut usize,
 }
 
 /// An [`Entry`] for a key that is not in the map.
-pub struct VacantEntry<'a, K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+pub struct VacantEntry<'a, K: DirectKey, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
     map: &'a mut PagedDirectMap<K, V, PAGE, D>,
     key: K,
 }
 
-impl<'a, K: Key, V, const PAGE: usize, D: Directory> Entry<'a, K, V, PAGE, D> {
+impl<'a, K: DirectKey, V, const PAGE: usize, D: Directory> Entry<'a, K, V, PAGE, D> {
     /// The entry's key: the stored key if occupied, else the key given to
     /// [`entry`](PagedDirectMap::entry).
     #[inline]
@@ -1351,9 +1459,9 @@ impl<'a, K: Key, V, const PAGE: usize, D: Directory> Entry<'a, K, V, PAGE, D> {
     }
 }
 
-impl<'a, K, V> OccupiedEntry<'a, K, V> {
+impl<'a, K: DirectKey, V> OccupiedEntry<'a, K, V> {
     #[inline]
-    fn pair(&self) -> &(K, V) {
+    fn pair(&self) -> &(K::Tag, V) {
         match &*self.slot {
             Some(pair) => pair,
             None => unreachable!("an occupied entry's slot is full"),
@@ -1361,7 +1469,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     }
 
     #[inline]
-    fn pair_mut(&mut self) -> &mut (K, V) {
+    fn pair_mut(&mut self) -> &mut (K::Tag, V) {
         match &mut *self.slot {
             Some(pair) => pair,
             None => unreachable!("an occupied entry's slot is full"),
@@ -1371,7 +1479,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     /// The stored key.
     #[inline]
     pub fn key(&self) -> &K {
-        &self.pair().0
+        &self.key
     }
 
     /// The value.
@@ -1410,16 +1518,16 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     /// Removes the entry and returns the stored key and its value.
     pub fn remove_entry(self) -> (K, V) {
         match self.slot.take() {
-            Some(pair) => {
+            Some((_, value)) => {
                 *self.len -= 1;
-                pair
+                (self.key, value)
             }
             None => unreachable!("an occupied entry's slot is full"),
         }
     }
 }
 
-impl<'a, K: Key, V, const PAGE: usize, D: Directory> VacantEntry<'a, K, V, PAGE, D> {
+impl<'a, K: DirectKey, V, const PAGE: usize, D: Directory> VacantEntry<'a, K, V, PAGE, D> {
     /// The key given to [`entry`](PagedDirectMap::entry).
     #[inline]
     pub fn key(&self) -> &K {
@@ -1435,7 +1543,7 @@ impl<'a, K: Key, V, const PAGE: usize, D: Directory> VacantEntry<'a, K, V, PAGE,
     /// The entry of another generation holding the key's slot, which an
     /// insert would evict.
     #[inline]
-    pub fn occupant(&self) -> Option<(&K, &V)> {
+    pub fn occupant(&self) -> Option<(K, &V)> {
         self.map.occupant(self.key.index())
     }
 
@@ -1460,12 +1568,12 @@ impl<'a, K: Key, V, const PAGE: usize, D: Directory> VacantEntry<'a, K, V, PAGE,
         }
         // Drop an evicted entry only once the slot is consistent: `V::drop`
         // may panic.
-        drop(slot.replace((key, value)));
-        OccupiedEntry { slot, len }
+        drop(slot.replace((key.tag(), value)));
+        OccupiedEntry { key, slot, len }
     }
 }
 
-impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
+impl<K: DirectKey + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
     for Entry<'_, K, V, PAGE, D>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1476,7 +1584,7 @@ impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::D
     }
 }
 
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for OccupiedEntry<'_, K, V> {
+impl<K: DirectKey + fmt::Debug, V: fmt::Debug> fmt::Debug for OccupiedEntry<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OccupiedEntry")
             .field("key", self.key())
@@ -1485,7 +1593,7 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for OccupiedEntry<'_, K, V> {
     }
 }
 
-impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
+impl<K: DirectKey + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
     for VacantEntry<'_, K, V, PAGE, D>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1513,10 +1621,20 @@ mod tests {
         }
     }
 
-    fn entries<K: Key, V: Clone, const PAGE: usize, D: Directory>(
+    impl DirectKey for Gen {
+        type Tag = u16;
+        fn tag(self) -> u16 {
+            (self.0 >> 16) as u16
+        }
+        fn from_parts(index: usize, tag: u16) -> Self {
+            Gen(index as u32 | u32::from(tag) << 16)
+        }
+    }
+
+    fn entries<K: DirectKey, V: Clone, const PAGE: usize, D: Directory>(
         map: &PagedDirectMap<K, V, PAGE, D>,
     ) -> Vec<(K, V)> {
-        map.iter().map(|(&k, v)| (k, v.clone())).collect()
+        map.iter().map(|(k, v)| (k, v.clone())).collect()
     }
 
     #[test]
@@ -1526,16 +1644,16 @@ mod tests {
         assert_eq!(map.len(), 4);
         assert_eq!(map.allocated_pages(), 3);
         assert_eq!(entries(&map), [(1, 10), (2, 20), (9, 90), (40, 400)]);
-        let back: Vec<u32> = map.keys().rev().copied().collect();
+        let back: Vec<u32> = map.keys().rev().collect();
         assert_eq!(back, [40, 9, 2, 1]);
 
         // Meeting in the middle yields each entry once.
         let mut it = map.iter();
         assert_eq!(it.len(), 4);
-        assert_eq!(it.next(), Some((&1, &10)));
-        assert_eq!(it.next_back(), Some((&40, &400)));
-        assert_eq!(it.next_back(), Some((&9, &90)));
-        assert_eq!(it.next(), Some((&2, &20)));
+        assert_eq!(it.next(), Some((1, &10)));
+        assert_eq!(it.next_back(), Some((40, &400)));
+        assert_eq!(it.next_back(), Some((9, &90)));
+        assert_eq!(it.next(), Some((2, &20)));
         assert_eq!(it.next(), None);
         assert_eq!(it.next_back(), None);
 
@@ -1549,7 +1667,7 @@ mod tests {
     fn same_order_with_tree_directory() {
         let keys = [u32::MAX - 1, 5, 1 << 31, 6];
         let map: PagedDirectMap<u32, (), 1024, Tree> = keys.iter().map(|&k| (k, ())).collect();
-        let got: Vec<u32> = map.keys().copied().collect();
+        let got: Vec<u32> = map.keys().collect();
         assert_eq!(got, [5, 6, 1 << 31, u32::MAX - 1]);
         assert_eq!(map.allocated_pages(), 3);
     }
@@ -1562,7 +1680,7 @@ mod tests {
         assert_eq!(map.insert(old, "old"), None);
         assert_eq!(map.try_insert(new, "x"), Err("x"));
         assert_eq!(map.get(new), None);
-        assert_eq!(map.occupant(3), Some((&old, &"old")));
+        assert_eq!(map.occupant(3), Some((old, &"old")));
         // `insert` evicts the other generation.
         assert_eq!(map.insert(new, "new"), Some("old"));
         assert_eq!(map.get(old), None);
@@ -1608,7 +1726,7 @@ mod tests {
         map.insert(old, "old");
         match map.entry(new) {
             Entry::Vacant(e) => {
-                assert_eq!(e.occupant(), Some((&old, &"old")));
+                assert_eq!(e.occupant(), Some((old, &"old")));
                 assert_eq!(*e.insert("new"), "new");
             }
             Entry::Occupied(_) => panic!("only `old` is present"),
@@ -1669,8 +1787,8 @@ mod tests {
         map.insert(20, 0);
         map.remove(20);
         let range = |r: (Bound<u32>, Bound<u32>)| -> Vec<u32> {
-            let got: Vec<u32> = map.range(r).map(|(&k, _)| k).collect();
-            let mut back: Vec<u32> = map.range(r).rev().map(|(&k, _)| k).collect();
+            let got: Vec<u32> = map.range(r).map(|(k, _)| k).collect();
+            let mut back: Vec<u32> = map.range(r).rev().map(|(k, _)| k).collect();
             back.reverse();
             assert_eq!(got, back);
             got
@@ -1694,23 +1812,23 @@ mod tests {
         {
             let mut it = map.range(40..=43);
             assert_eq!(it.size_hint(), (0, Some(4)));
-            assert_eq!(it.next(), Some((&40, &400)));
-            assert_eq!(it.next_back(), Some((&43, &430)));
-            assert_eq!(it.clone().next_back(), Some((&41, &410)));
-            assert_eq!(it.next(), Some((&41, &410)));
+            assert_eq!(it.next(), Some((40, &400)));
+            assert_eq!(it.next_back(), Some((43, &430)));
+            assert_eq!(it.clone().next_back(), Some((41, &410)));
+            assert_eq!(it.next(), Some((41, &410)));
             assert_eq!(it.next(), None);
             assert_eq!(it.next_back(), None);
         }
 
-        assert_eq!(map.next_occupant(0), Some((&1, &10)));
-        assert_eq!(map.next_occupant(9), Some((&9, &90)));
-        assert_eq!(map.next_occupant(10), Some((&40, &400)));
+        assert_eq!(map.next_occupant(0), Some((1, &10)));
+        assert_eq!(map.next_occupant(9), Some((9, &90)));
+        assert_eq!(map.next_occupant(10), Some((40, &400)));
         assert_eq!(map.next_occupant(44), None);
         assert_eq!(map.prev_occupant(0), None);
-        assert_eq!(map.prev_occupant(39), Some((&9, &90)));
-        assert_eq!(map.prev_occupant(usize::MAX), Some((&43, &430)));
-        assert_eq!(map.first_key_value(), Some((&1, &10)));
-        assert_eq!(map.last_key_value(), Some((&43, &430)));
+        assert_eq!(map.prev_occupant(39), Some((9, &90)));
+        assert_eq!(map.prev_occupant(usize::MAX), Some((43, &430)));
+        assert_eq!(map.first_key_value(), Some((1, &10)));
+        assert_eq!(map.last_key_value(), Some((43, &430)));
 
         for (_, value) in map.range_mut(2..41) {
             *value += 1;
@@ -1719,12 +1837,12 @@ mod tests {
             entries(&map),
             [(1, 10), (2, 21), (9, 91), (40, 401), (41, 410), (43, 430)]
         );
-        assert_eq!(map.slot_range_mut(40..).next_back(), Some((&43, &mut 430)));
+        assert_eq!(map.slot_range_mut(40..).next_back(), Some((43, &mut 430)));
 
         assert_eq!(map.pop_first(), Some((1, 10)));
         assert_eq!(map.pop_last(), Some((43, 430)));
         assert_eq!(map.len(), 4);
-        assert_eq!(map.first_key_value(), Some((&2, &21)));
+        assert_eq!(map.first_key_value(), Some((2, &21)));
         map.clear();
         assert_eq!(map.pop_first(), None);
         assert_eq!(map.pop_last(), None);
@@ -1745,8 +1863,8 @@ mod tests {
         map.insert(held, 1);
         map.insert(Gen(7), 2);
         let other = Gen(3);
-        assert_eq!(map.range(other..=other).next(), Some((&held, &1)));
-        assert_eq!(map.range(Gen(4 | 9 << 16)..).next(), Some((&Gen(7), &2)));
+        assert_eq!(map.range(other..=other).next(), Some((held, &1)));
+        assert_eq!(map.range(Gen(4 | 9 << 16)..).next(), Some((Gen(7), &2)));
     }
 
     #[cfg(feature = "std")]

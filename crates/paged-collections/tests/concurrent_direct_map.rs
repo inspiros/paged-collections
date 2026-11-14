@@ -15,7 +15,7 @@ use std::thread;
 
 use paged_collections::concurrent::{ConcurrentDirectMap, Entry, SharedDirectory};
 use paged_collections::direct_map::{Entry as PlainEntry, PagedDirectMap};
-use paged_collections::key::Key;
+use paged_collections::key::{DirectKey, Key};
 use paged_collections::page::{Flat, Radix};
 use proptest::prelude::*;
 
@@ -28,6 +28,21 @@ struct Gen {
 impl Key for Gen {
     fn index(self) -> usize {
         self.index
+    }
+}
+
+impl DirectKey for Gen {
+    type Tag = u8;
+
+    fn tag(self) -> Self::Tag {
+        self.generation
+    }
+
+    fn from_parts(index: usize, tag: Self::Tag) -> Self {
+        Self {
+            index,
+            generation: tag,
+        }
     }
 }
 
@@ -98,7 +113,7 @@ fn sequential_model_for<D: SharedDirectory>(
                 }
                 (Entry::Vacant(a), PlainEntry::Vacant(b)) => {
                     prop_assert_eq!(a.key(), b.key());
-                    prop_assert_eq!(a.occupant(), b.occupant());
+                    prop_assert_eq!(a.occupant().map(|(&k, v)| (k, v)), b.occupant());
                     prop_assert_eq!(*a.insert(value), *b.insert(value));
                 }
                 _ => prop_assert!(false, "entry occupancy differs"),
@@ -108,7 +123,7 @@ fn sequential_model_for<D: SharedDirectory>(
                     prop_assert_eq!(*a.into_ref(), *b.into_mut());
                 }
                 (Entry::Vacant(a), PlainEntry::Vacant(b)) => {
-                    prop_assert_eq!(a.occupant(), b.occupant());
+                    prop_assert_eq!(a.occupant().map(|(&k, v)| (k, v)), b.occupant());
                     prop_assert_eq!(a.into_key(), b.into_key());
                 }
                 _ => prop_assert!(false, "entry occupancy differs"),
@@ -158,7 +173,7 @@ fn sequential_model_for<D: SharedDirectory>(
                 plain.reset();
             }
         }
-        let expected: Vec<_> = plain.iter().map(|(&k, &v)| (k, v)).collect();
+        let expected: Vec<_> = plain.iter().map(|(k, &v)| (k, v)).collect();
         prop_assert_eq!(contents(&map), expected);
         prop_assert_eq!(map.len(), plain.len());
         prop_assert_eq!(map.is_empty(), plain.is_empty());
@@ -173,13 +188,13 @@ fn sequential_model_for<D: SharedDirectory>(
             }),
         );
         map.range_for_each(bounds, |&k, &v| actual_range.push((k, v)));
-        let expected_range: Vec<_> = plain.range(bounds).map(|(&k, &v)| (k, v)).collect();
+        let expected_range: Vec<_> = plain.range(bounds).map(|(k, &v)| (k, v)).collect();
         prop_assert_eq!(actual_range, expected_range);
     }
     let expected: Vec<_> = plain.into_iter().collect();
     let plain = map.into_inner();
     prop_assert_eq!(
-        &plain.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
+        &plain.iter().map(|(k, &v)| (k, v)).collect::<Vec<_>>(),
         &expected
     );
     let map = ConcurrentDirectMap::from(plain);

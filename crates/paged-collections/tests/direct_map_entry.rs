@@ -8,7 +8,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use paged_collections::direct_map::{Entry, PagedDirectMap};
-use paged_collections::key::Key;
+use paged_collections::key::{DirectKey, Key};
 use paged_collections::page::{Directory, Flat, Radix, Tree};
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestCaseResult};
@@ -41,6 +41,21 @@ struct Gen {
 impl Key for Gen {
     fn index(self) -> usize {
         usize::from(self.index)
+    }
+}
+
+impl DirectKey for Gen {
+    type Tag = u8;
+
+    fn tag(self) -> Self::Tag {
+        self.generation
+    }
+
+    fn from_parts(index: usize, tag: Self::Tag) -> Self {
+        Self {
+            index: index as u16,
+            generation: tag,
+        }
     }
 }
 
@@ -134,7 +149,7 @@ fn check_entry<const PAGE: usize, D: Directory>(
             Entry::Vacant(entry) => {
                 prop_assert!(occupant.is_none_or(|(stored, _)| stored != key));
                 prop_assert_eq!(*entry.key(), key);
-                prop_assert_eq!(entry.occupant().map(|(&k, &v)| (k, v)), occupant);
+                prop_assert_eq!(entry.occupant().map(|(k, &v)| (k, v)), occupant);
                 prop_assert_eq!(entry.into_key(), key);
             }
         }
@@ -154,11 +169,11 @@ fn check_state<const PAGE: usize, D: Directory>(
     prop_assert_eq!(map.is_empty(), model.is_empty());
     prop_assert_eq!(map.allocated_pages(), pages.len());
     prop_assert_eq!(
-        map.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
+        map.iter().map(|(k, &v)| (k, v)).collect::<Vec<_>>(),
         model.values().copied().collect::<Vec<_>>()
     );
     prop_assert_eq!(
-        map.occupant(key.index()).map(|(&k, &v)| (k, v)),
+        map.occupant(key.index()).map(|(k, &v)| (k, v)),
         model.get(&key.index()).copied()
     );
     for generation in 0..4 {
@@ -174,7 +189,7 @@ fn check_state<const PAGE: usize, D: Directory>(
     Ok(())
 }
 
-fn check_order<K: Key + Debug, V, const PAGE: usize, D: Directory>(
+fn check_order<K: DirectKey + Debug, V, const PAGE: usize, D: Directory>(
     map: &PagedDirectMap<K, V, PAGE, D>,
     model: &BTreeMap<usize, (K, u32)>,
     probe: K,
@@ -183,24 +198,22 @@ fn check_order<K: Key + Debug, V, const PAGE: usize, D: Directory>(
     prop_assert_eq!(map.len(), model.len());
     prop_assert_eq!(map.is_empty(), model.is_empty());
     prop_assert_eq!(
-        map.iter()
-            .map(|(&k, v)| (k, payload(v)))
-            .collect::<Vec<_>>(),
+        map.iter().map(|(k, v)| (k, payload(v))).collect::<Vec<_>>(),
         model.values().copied().collect::<Vec<_>>()
     );
     prop_assert_eq!(
         map.iter()
             .rev()
-            .map(|(&k, v)| (k, payload(v)))
+            .map(|(k, v)| (k, payload(v)))
             .collect::<Vec<_>>(),
         model.values().rev().copied().collect::<Vec<_>>()
     );
     prop_assert_eq!(
-        map.first_key_value().map(|(&k, v)| (k, payload(v))),
+        map.first_key_value().map(|(k, v)| (k, payload(v))),
         model.first_key_value().map(|(_, &entry)| entry)
     );
     prop_assert_eq!(
-        map.last_key_value().map(|(&k, v)| (k, payload(v))),
+        map.last_key_value().map(|(k, v)| (k, payload(v))),
         model.last_key_value().map(|(_, &entry)| entry)
     );
     let index = probe.index();
@@ -212,11 +225,11 @@ fn check_order<K: Key + Debug, V, const PAGE: usize, D: Directory>(
         usize::MAX,
     ] {
         prop_assert_eq!(
-            map.next_occupant(index).map(|(&k, v)| (k, payload(v))),
+            map.next_occupant(index).map(|(k, v)| (k, payload(v))),
             model.range(index..).next().map(|(_, &entry)| entry)
         );
         prop_assert_eq!(
-            map.prev_occupant(index).map(|(&k, v)| (k, payload(v))),
+            map.prev_occupant(index).map(|(k, v)| (k, payload(v))),
             model.range(..=index).next_back().map(|(_, &entry)| entry)
         );
     }
@@ -248,14 +261,14 @@ fn check_order<K: Key + Debug, V, const PAGE: usize, D: Directory>(
             .collect();
         prop_assert_eq!(
             map.range(bounds)
-                .map(|(&k, v)| (k, payload(v)))
+                .map(|(k, v)| (k, payload(v)))
                 .collect::<Vec<_>>(),
             expected.clone()
         );
         prop_assert_eq!(
             map.range(bounds)
                 .rev()
-                .map(|(&k, v)| (k, payload(v)))
+                .map(|(k, v)| (k, payload(v)))
                 .collect::<Vec<_>>(),
             expected.into_iter().rev().collect::<Vec<_>>()
         );
@@ -305,7 +318,7 @@ fn apply_step<const PAGE: usize, D: Directory>(
         }
         Op::VacantInsert | Op::VacantInsertEntry => {
             if let Entry::Vacant(entry) = map.entry(key) {
-                prop_assert_eq!(entry.occupant().map(|(&k, &v)| (k, v)), old);
+                prop_assert_eq!(entry.occupant().map(|(k, &v)| (k, v)), old);
                 if matches!(op, Op::VacantInsert) {
                     let stored = entry.insert(value);
                     prop_assert_eq!(*stored, value);
@@ -377,7 +390,7 @@ fn apply_step<const PAGE: usize, D: Directory>(
                     }
                     Entry::Vacant(entry) => {
                         prop_assert!(exact.is_none());
-                        prop_assert_eq!(entry.occupant().map(|(&k, &v)| (k, v)), old);
+                        prop_assert_eq!(entry.occupant().map(|(k, &v)| (k, v)), old);
                     }
                 }
             }
@@ -612,7 +625,7 @@ fn panicking_entry_drops<const PAGE: usize, D: Directory>() -> TestCaseResult {
                 let Entry::Vacant(entry) = map.entry(new) else {
                     panic!("another generation must be vacant");
                 };
-                assert_eq!(entry.occupant().map(|(&k, v)| (k, v.id)), Some((old, 1)));
+                assert_eq!(entry.occupant().map(|(k, v)| (k, v.id)), Some((old, 1)));
                 if mode == 0 {
                     entry.insert(make(2, false));
                 } else {
@@ -630,7 +643,7 @@ fn panicking_entry_drops<const PAGE: usize, D: Directory>() -> TestCaseResult {
         prop_assert_eq!(drops.get(), [0, 1, 0, 0, 0]);
         model.insert(new.index(), (new, 2));
         prop_assert_eq!(map.allocated_pages(), pages.len());
-        prop_assert_eq!(map.occupant(3).map(|(&k, v)| (k, v.id)), Some((new, 2)));
+        prop_assert_eq!(map.occupant(3).map(|(k, v)| (k, v.id)), Some((new, 2)));
         if old != new {
             prop_assert!(map.get(old).is_none());
         }
@@ -693,6 +706,18 @@ impl Eq for Tagged {}
 impl Key for Tagged {
     fn index(self) -> usize {
         self.identity.index()
+    }
+}
+
+impl DirectKey for Tagged {
+    type Tag = Self;
+
+    fn tag(self) -> Self {
+        self
+    }
+
+    fn from_parts(_: usize, key: Self) -> Self {
+        key
     }
 }
 
@@ -810,6 +835,21 @@ impl Key for Wide {
     }
 }
 
+impl DirectKey for Wide {
+    type Tag = u8;
+
+    fn tag(self) -> Self::Tag {
+        self.generation
+    }
+
+    fn from_parts(index: usize, tag: Self::Tag) -> Self {
+        Self {
+            index,
+            generation: tag,
+        }
+    }
+}
+
 fn check_wide_state<const PAGE: usize, D: Directory>(
     map: &PagedDirectMap<Wide, u32, PAGE, D>,
     model: &BTreeMap<usize, (Wide, u32)>,
@@ -818,7 +858,7 @@ fn check_wide_state<const PAGE: usize, D: Directory>(
 ) -> TestCaseResult {
     prop_assert_eq!(map.allocated_pages(), pages.len());
     prop_assert_eq!(
-        map.occupant(key.index).map(|(&k, &v)| (k, v)),
+        map.occupant(key.index).map(|(k, &v)| (k, v)),
         model.get(&key.index).copied()
     );
     for generation in 0..4 {
@@ -891,7 +931,7 @@ fn wide_entries<const PAGE: usize, D: Directory>(
         let Entry::Vacant(entry) = map.entry(new) else {
             return Err(TestCaseError::fail("new wide generation was occupied"));
         };
-        prop_assert_eq!(entry.occupant().map(|(&k, &v)| (k, v)), Some(model[&index]));
+        prop_assert_eq!(entry.occupant().map(|(k, &v)| (k, v)), Some(model[&index]));
         prop_assert_eq!(*entry.insert(value), value);
         model.insert(index, (new, value));
         // Query with the evicted generation: bounds still use only its index.
