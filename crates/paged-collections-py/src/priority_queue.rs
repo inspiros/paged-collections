@@ -125,14 +125,27 @@ macro_rules! priority_queue {
                 // survive; conversion callbacks retain their own side effects.
                 let mut pairs = Vec::new();
                 if let Some(items) = items {
-                    let items = match items.cast::<PyDict>() {
-                        Ok(d) => d.items().into_any(),
-                        Err(_) => items.clone(),
-                    };
-                    for item in items.try_iter()? {
-                        let item = item?;
-                        let (k, p): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
-                        pairs.push((insert_key(&k)?, p.extract::<$t>()?.check()?));
+                    // As with dict(items), a keys attribute selects the
+                    // mapping protocol, including on dict subclasses. An
+                    // exact dict cannot override it, so read a snapshot of
+                    // its items: conversion callbacks may resize it.
+                    if let Ok(d) = items.cast_exact::<PyDict>() {
+                        for item in d.items().iter() {
+                            let (k, p): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
+                            pairs.push((insert_key(&k)?, p.extract::<$t>()?.check()?));
+                        }
+                    } else if let Some(keys) = items.getattr_opt("keys")? {
+                        for k in keys.call0()?.try_iter()? {
+                            let k = k?;
+                            let p = items.get_item(&k)?;
+                            pairs.push((insert_key(&k)?, p.extract::<$t>()?.check()?));
+                        }
+                    } else {
+                        for item in items.try_iter()? {
+                            let item = item?;
+                            let (k, p): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
+                            pairs.push((insert_key(&k)?, p.extract::<$t>()?.check()?));
+                        }
                     }
                 }
                 let mut replacement = Self::empty(min);

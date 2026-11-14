@@ -1,5 +1,5 @@
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from typing import Any, ClassVar, Generic, TypeVar, overload
+from typing import Any, ClassVar, Generic, Protocol, TypeVar, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -10,6 +10,7 @@ MAX_GENERATION: int
 MAX_INDICES: int
 
 _T = TypeVar("_T")
+_T_co = TypeVar("_T_co", covariant=True)
 _S = TypeVar("_S", bound=np.generic)
 _K = TypeVar("_K", bound=np.generic)
 _D = TypeVar("_D")
@@ -444,13 +445,22 @@ class PagedDequeIterator(Iterator[Any]):
     def __next__(self) -> Any: ...
     def __length_hint__(self) -> int: ...
 
+class _SupportsKeysAndGetItem(Protocol[_T_co]):
+    def keys(self) -> Iterable[int]: ...
+    def __getitem__(self, key: int, /) -> _T_co: ...
+
 class _PriorityQueue(Generic[_T]):
     # Shared API of the priority queues. Not a runtime class.
     dtype: ClassVar[str]
     page_size: ClassVar[int]
     def __init__(
         self,
-        items: Mapping[int, _T] | Iterable[tuple[int, _T]] | None = None,
+        items: (
+            Mapping[int, _T]
+            | _SupportsKeysAndGetItem[_T]
+            | Iterable[tuple[int, _T]]
+            | None
+        ) = None,
         min: bool = False,
     ) -> None: ...
     @property

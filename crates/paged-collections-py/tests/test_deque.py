@@ -125,6 +125,86 @@ def test_basic_api():
     assert pc.PagedDeque[int] is not None
 
 
+@pytest.mark.parametrize("method", ["extend", "extendleft", "iadd"])
+@pytest.mark.parametrize("maxlen", [None, 0, 1, 3, 8])
+def test_self_extension_honors_subclass_iterator(method, maxlen):
+    def outcome(base):
+        calls = []
+
+        class IterSub(base):
+            def __iter__(self):
+                calls.append(list(base.__iter__(self)))
+                self.append(3)  # The callback must run without a borrow.
+                return iter([4, 5])
+
+        d = IterSub([1, 2], maxlen=maxlen)
+        alias = d
+        if method == "iadd":
+            d += d
+        else:
+            getattr(d, method)(d)
+        assert d is alias
+        assert len(calls) == 1
+        # Inspect storage through the base iterator, not the override.
+        return list(base.__iter__(d)), calls
+
+    assert outcome(pc.PagedDeque) == outcome(collections.deque)
+
+
+@pytest.mark.parametrize("method", ["extend", "extendleft", "iadd"])
+@pytest.mark.parametrize("maxlen", [None, 0, 3])
+def test_self_extension_snapshots_before_mutating(method, maxlen):
+    def outcome(base):
+        calls = []
+
+        class IterSub(base):
+            def __iter__(self):
+                calls.append(True)
+                yield 4
+                raise LookupError("iterator failed")
+
+        d = IterSub([1, 2], maxlen=maxlen)
+        with pytest.raises(LookupError, match="iterator failed"):
+            if method == "iadd":
+                d += d
+            else:
+                getattr(d, method)(d)
+        assert calls == [True]
+        return list(base.__iter__(d))
+
+    assert outcome(pc.PagedDeque) == outcome(collections.deque)
+
+
+@pytest.mark.parametrize("method", ["extend", "extendleft", "iadd"])
+@pytest.mark.parametrize("maxlen", [None, 0, 1, 3, 8])
+def test_exact_self_extension_matches_deque(method, maxlen):
+    def outcome(cls):
+        d = cls([1, 2], maxlen=maxlen)
+        if method == "iadd":
+            d += d
+        else:
+            getattr(d, method)(d)
+        return list(d)
+
+    assert outcome(pc.PagedDeque) == outcome(collections.deque)
+
+
+@pytest.mark.parametrize("maxlen", [None, 30, 40])
+def test_repr_shows_all_elements_like_deque(maxlen):
+    d = pc.PagedDeque(range(30), maxlen=maxlen)
+    ref = collections.deque(range(30), maxlen=maxlen)
+    assert repr(d).replace("PagedDeque", "deque") == repr(ref)
+
+
+@pytest.mark.parametrize("maxlen", [None, 40])
+def test_recursive_repr_matches_deque(maxlen):
+    d = pc.PagedDeque(range(25), maxlen=maxlen)
+    ref = collections.deque(range(25), maxlen=maxlen)
+    d.append(d)
+    ref.append(ref)
+    assert repr(d).replace("PagedDeque", "deque") == repr(ref)
+
+
 def test_pages_and_capacity():
     d = pc.PagedDeque(range(5000))
     assert d.allocated_pages >= 5
@@ -198,7 +278,7 @@ def test_pickle_copy_and_subclass():
 
     self_ref = pc.PagedDeque()
     self_ref.append(self_ref)
-    assert "PagedDeque(...)" in repr(self_ref)
+    assert repr(self_ref) == "PagedDeque([[...]])"
     for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
         r = pickle.loads(pickle.dumps(self_ref, protocol))
         assert r[0] is r
@@ -384,6 +464,49 @@ def test_richcompare_honors_subclass_iterators_and_bool_results():
     assert len(a) == 0
 
 
+@pytest.mark.parametrize("op", [operator.eq, operator.ne, operator.lt, operator.le, operator.gt, operator.ge])
+def test_self_comparison_with_subclass_iterator_matches_deque(op):
+    # CPython answers d == d and d != d by identity without iterating, but
+    # the ordering operators iterate, through a subclass's __iter__.
+    def outcome(base):
+        calls = []
+
+        class Element:
+            def __eq__(self, other):
+                calls.append("eq")
+                return False
+
+            def __lt__(self, other):
+                calls.append("lt")
+                return True
+
+            __le__ = __gt__ = __ge__ = __lt__
+
+        class IterSub(base):
+            def __iter__(self):
+                calls.append("iter")
+                # Each iterator yields a distinct, non-reflexive element.
+                return iter([Element()])
+
+        d = IterSub([0])
+        return op(d, d), calls
+
+    expected = outcome(collections.deque)
+    assert expected[1] == ([] if op in (operator.eq, operator.ne) else ["iter", "iter", "eq", "lt"])
+    assert outcome(pc.PagedDeque) == expected
+
+
+@pytest.mark.parametrize("op", [operator.eq, operator.ne, operator.lt, operator.le, operator.gt, operator.ge])
+@pytest.mark.parametrize("shared", [False, True])
+def test_richcompare_nan_element_identity_matches_deque(op, shared):
+    a = float("nan")
+    b = a if shared else float("nan")
+    d, other = pc.PagedDeque([a]), pc.PagedDeque([b])
+    ref, ref_other = collections.deque([a]), collections.deque([b])
+    assert op(d, d) == op(ref, ref)
+    assert op(d, other) == op(ref, ref_other)
+
+
 @pytest.mark.parametrize("n", [10**100, -(10**100)])
 def test_strict_integer_overflow_and_saturated_search(n):
     d = pc.PagedDeque([1, 2, 3])
@@ -526,18 +649,26 @@ def test_maxlen_requires_an_actual_integer():
 
 
 def test_gc_finalizers_during_comparison():
-    # On 3.10/3.11 allocation can collect immediately; later interpreters
-    # may defer collection until returning to Python. Both must be reentrant.
-    d = pc.PagedDeque([1])
+    # Collect explicitly inside __eq__: a collection after == returns does
+    # not exercise comparison reentry, especially on Python 3.12+.
+    d = pc.PagedDeque()
     other = pc.PagedDeque([1])
     effects = []
 
     class Cycle:
         def __del__(self):
+            assert effects == ["eq"]
             d.append(2)
-            effects.append(True)
+            effects.append("del")
 
-    thresholds = gc.get_threshold()
+    class Equal:
+        def __eq__(self, other):
+            effects.append("eq")
+            gc.collect()
+            effects.append("collected")
+            return True
+
+    d.append(Equal())
     enabled = gc.isenabled()
     with no_unraisable():
         try:
@@ -546,17 +677,11 @@ def test_gc_finalizers_during_comparison():
             cycle = Cycle()
             cycle.self = cycle
             del cycle
-            gc.set_threshold(1, 1, 1)
-            gc.enable()
-            try:
+            with pytest.raises(RuntimeError, match="mutated during iteration"):
                 d == other
-            except RuntimeError as exc:
-                assert "mutated during iteration" in str(exc)
-            gc.collect()
-            assert effects == [True]
-            assert list(d) == [1, 2]
+            assert effects == ["eq", "del", "collected"]
+            assert len(d) == 2 and d[1] == 2
         finally:
-            gc.set_threshold(*thresholds)
             if enabled:
                 gc.enable()
             else:

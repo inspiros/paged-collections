@@ -118,6 +118,15 @@ fn repr_guarded(
     name: &str,
     f: impl FnOnce() -> PyResult<String>,
 ) -> PyResult<String> {
+    repr_guarded_with(obj, || format!("{name}(...)"), f)
+}
+
+/// A guarded repr with a collection-specific recursion placeholder.
+fn repr_guarded_with(
+    obj: &Bound<'_, PyAny>,
+    recursive: impl FnOnce() -> String,
+    f: impl FnOnce() -> PyResult<String>,
+) -> PyResult<String> {
     /// Leaves the repr of `obj` on drop, also when `f` unwinds.
     struct Leave<'a, 'py>(&'a Bound<'py, PyAny>);
     impl Drop for Leave<'_, '_> {
@@ -134,7 +143,7 @@ fn repr_guarded(
             let _leave = Leave(obj);
             f()
         }
-        n if n > 0 => Ok(format!("{name}(...)")),
+        n if n > 0 => Ok(recursive()),
         _ => Err(PyErr::fetch(obj.py())),
     }
 }

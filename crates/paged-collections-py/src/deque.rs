@@ -118,6 +118,15 @@ impl PagedDeque {
     fn snapshot(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
         self.deque.iter().map(|v| v.clone_ref(py)).collect()
     }
+    /// Snapshot self-extension before pushing anything. Like PySequence_List
+    /// in deque_extend, list(self) honors a subclass's iteration protocol.
+    fn self_snapshot(slf: &Bound<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
+        if slf.as_any().is_exact_instance_of::<Self>() {
+            Ok(slf.try_borrow()?.snapshot(slf.py()))
+        } else {
+            slf.py().get_type::<PyList>().call1((slf,))?.extract()
+        }
+    }
     fn push_py(slf: &Bound<'_, Self>, value: Py<PyAny>, front: bool) -> PyResult<()> {
         // Keep ownership outside the borrow, including all error paths.
         let mut value = Some(value);
@@ -375,6 +384,8 @@ impl PagedDeque {
         let a_len = slf.try_borrow()?.deque.len();
         let b_len = other.try_borrow()?.deque.len();
         if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+            // CPython 3.12 answers `d == d` and `d != d` by identity, without
+            // iterating, even for a subclass that overrides `__iter__`.
             if slf.is(other) {
                 return matches!(op, CompareOp::Eq).into_py_any(py);
             }
@@ -392,6 +403,11 @@ impl PagedDeque {
             match (x, y) {
                 (Some(x), Some(y)) => {
                     if !equal_objects(&x, &y)? {
+                        // Equality was already tested. Do not call an
+                        // element's __eq__ again for == or !=.
+                        if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+                            return matches!(op, CompareOp::Ne).into_py_any(py);
+                        }
                         return x.rich_compare(&y, op)?.is_truthy()?.into_py_any(py);
                     }
                 }
@@ -451,6 +467,16 @@ impl PagedDeque {
     }
 
     fn extend(slf: &Bound<'_, Self>, iterable: &Bound<'_, PyAny>) -> PyResult<()> {
+        if iterable.is(slf) {
+            let vals = Self::self_snapshot(slf)?;
+            let consume_only = slf.try_borrow()?.maxlen == Some(0);
+            if !consume_only {
+                for v in vals {
+                    Self::push_py(slf, v, false)?;
+                }
+            }
+            return Ok(());
+        }
         let consume_only = slf.try_borrow()?.maxlen == Some(0);
         if consume_only {
             for value in iterable.try_iter()? {
@@ -458,22 +484,25 @@ impl PagedDeque {
             }
             return Ok(());
         }
-        if iterable.is(slf) {
-            let vals = slf.try_borrow()?.snapshot(slf.py());
-            for v in vals {
-                Self::push_py(slf, v, false)?;
-            }
-        } else {
-            // Like deque.extend, a failing iterator leaves earlier values in.
-            // The iterator advances only with no borrow held.
-            for value in iterable.try_iter()? {
-                Self::push_py(slf, value?.unbind(), false)?;
-            }
+        // Like deque.extend, a failing iterator leaves earlier values in.
+        // The iterator advances only with no borrow held.
+        for value in iterable.try_iter()? {
+            Self::push_py(slf, value?.unbind(), false)?;
         }
         Ok(())
     }
 
     fn extendleft(slf: &Bound<'_, Self>, iterable: &Bound<'_, PyAny>) -> PyResult<()> {
+        if iterable.is(slf) {
+            let vals = Self::self_snapshot(slf)?;
+            let consume_only = slf.try_borrow()?.maxlen == Some(0);
+            if !consume_only {
+                for v in vals {
+                    Self::push_py(slf, v, true)?;
+                }
+            }
+            return Ok(());
+        }
         let consume_only = slf.try_borrow()?.maxlen == Some(0);
         if consume_only {
             for value in iterable.try_iter()? {
@@ -481,15 +510,8 @@ impl PagedDeque {
             }
             return Ok(());
         }
-        if iterable.is(slf) {
-            let vals = slf.try_borrow()?.snapshot(slf.py());
-            for v in vals {
-                Self::push_py(slf, v, true)?;
-            }
-        } else {
-            for value in iterable.try_iter()? {
-                Self::push_py(slf, value?.unbind(), true)?;
-            }
+        for value in iterable.try_iter()? {
+            Self::push_py(slf, value?.unbind(), true)?;
         }
         Ok(())
     }
@@ -678,31 +700,24 @@ impl PagedDeque {
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
         let name = slf.get_type().name()?.to_string();
-        crate::repr_guarded(slf.as_any(), &name, || {
-            let (vals, more, maxlen) = {
-                let this = slf.try_borrow()?;
-                (
-                    this.deque
-                        .iter()
-                        .take(crate::REPR_ITEMS)
-                        .map(|v| v.clone_ref(slf.py()))
-                        .collect::<Vec<_>>(),
-                    this.deque.len() > crate::REPR_ITEMS,
-                    this.maxlen,
-                )
-            };
-            let mut parts = vals
-                .iter()
-                .map(|v| Ok(v.bind(slf.py()).repr()?.to_string()))
-                .collect::<PyResult<Vec<_>>>()?;
-            if more {
-                parts.push("...".to_owned());
-            }
-            Ok(match maxlen {
-                Some(m) => format!("{name}([{}], maxlen={m})", parts.join(", ")),
-                None => format!("{name}([{}])", parts.join(", ")),
-            })
-        })
+        crate::repr_guarded_with(
+            slf.as_any(),
+            || "[...]".to_owned(),
+            || {
+                let (vals, maxlen) = {
+                    let this = slf.try_borrow()?;
+                    (this.snapshot(slf.py()), this.maxlen)
+                };
+                let parts = vals
+                    .iter()
+                    .map(|v| Ok(v.bind(slf.py()).repr()?.to_string()))
+                    .collect::<PyResult<Vec<_>>>()?;
+                Ok(match maxlen {
+                    Some(m) => format!("{name}([{}], maxlen={m})", parts.join(", ")),
+                    None => format!("{name}([{}])", parts.join(", ")),
+                })
+            },
+        )
     }
 
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {

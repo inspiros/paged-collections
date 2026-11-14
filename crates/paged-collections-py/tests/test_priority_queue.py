@@ -1,6 +1,8 @@
 """PriorityQueue and PriorityQueueF64 against a dict model."""
 
 import copy
+from collections import UserDict
+from collections.abc import Mapping
 from contextlib import contextmanager
 import gc
 import math
@@ -9,6 +11,7 @@ import random
 import subprocess
 import sys
 import textwrap
+from types import MappingProxyType
 
 import pytest
 
@@ -100,6 +103,110 @@ def test_basic(cls):
         q.peek()
     assert not q
     assert cls.page_size == 1024
+
+
+def test_constructor_accepts_mapping_inputs(cls):
+    class Priorities(Mapping):
+        def __iter__(self):
+            return iter([5, 7])
+
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, key):
+            return {5: 1, 7: 3}[key]
+
+    for items in (Priorities(), UserDict({5: 1, 7: 3}), MappingProxyType({5: 1, 7: 3})):
+        q = cls(items, min=True)
+        assert dict(q.items()) == dict(items)
+        assert q.is_min and q.peek() == (5, 1)
+
+
+@pytest.mark.parametrize("dict_subclass", [False, True])
+def test_constructor_uses_keys_and_getitem_like_dict(cls, dict_subclass):
+    calls = []
+
+    class Priorities(dict if dict_subclass else object):
+        def keys(self):
+            calls.append("keys")
+            return iter([5, 7])
+
+        def __getitem__(self, key):
+            calls.append(("getitem", key))
+            return {5: 1, 7: 3}[key]
+
+        def __iter__(self):
+            raise AssertionError("mapping must use keys(), not __iter__")
+
+        def items(self):
+            raise AssertionError("mapping need not provide items()")
+
+    items = Priorities()
+    expected = dict(items)
+    assert calls == ["keys", ("getitem", 5), ("getitem", 7)]
+    calls.clear()
+    q = cls(items)
+    assert dict(q.items()) == expected
+    assert calls == ["keys", ("getitem", 5), ("getitem", 7)]
+
+
+@pytest.mark.parametrize("keys", [None, 0])
+def test_constructor_keys_attribute_selects_mapping(cls, keys):
+    class Pairs:
+        def __iter__(self):
+            return iter([(1, 1)])
+
+    items = Pairs()
+    items.keys = keys
+    with pytest.raises(TypeError):
+        cls(items)
+
+
+@pytest.mark.parametrize("failure", ["keys", "getitem", "priority"])
+def test_bad_mapping_init_preserves_state(cls, failure):
+    calls = []
+
+    class Priorities:
+        def keys(self):
+            calls.append("keys")
+            if failure == "keys":
+                raise LookupError("keys failed")
+            return [2, 3]
+
+        def __getitem__(self, key):
+            calls.append(key)
+            if key == 3:
+                if failure == "getitem":
+                    raise LookupError("getitem failed")
+                return object()
+            return key
+
+    q = cls({1: 1}, min=True)
+    error = TypeError if failure == "priority" else LookupError
+    with pytest.raises(error):
+        q.__init__(Priorities(), min=False)
+    assert calls == (["keys"] if failure == "keys" else ["keys", 2, 3])
+    assert q.items() == [(1, 1)] and q.is_min
+
+
+def test_mapping_callbacks_are_unborrowed(cls):
+    q = cls({99: 1})
+    calls = []
+
+    class Priorities:
+        def keys(self):
+            calls.append("keys")
+            q.clear()
+            return [1, 2]
+
+        def __getitem__(self, key):
+            calls.append(key)
+            q.push(99, key)
+            return key
+
+    q.__init__(Priorities(), min=True)
+    assert calls == ["keys", 1, 2]
+    assert dict(q.items()) == {1: 1, 2: 2} and q.is_min
 
 
 def test_dtypes():
@@ -317,16 +424,23 @@ def test_f64_nan_updates_init_and_signed_zero(is_min):
     assert q == pc.PriorityQueueF64([(1, 0.0), (2, -0.0), (3, math.inf), (4, -math.inf)], min=is_min)
 
 
-@pytest.mark.parametrize("method", ["keys", "items", "sorted", "__iter__", "__repr__", "__reduce__"])
+@pytest.mark.skipif(
+    sys.version_info >= (3, 12),
+    reason="Later interpreters may defer allocation-triggered GC until returning to Python",
+)
+@pytest.mark.parametrize("method", ["keys", "items", "sorted", "__iter__", "__reduce__"])
 def test_gc_finalizers_during_python_allocation(cls, method):
+    # These methods allocate GC-tracked Python objects. repr only creates
+    # strings, so it cannot reliably trigger synchronous cyclic GC.
     q = cls([(1, 1)])
-    effects = []
+    calls = 0
     call = getattr(q, method)
 
     class Cycle:
         def __del__(self):
+            nonlocal calls
             q.push(2, 2)
-            effects.append(True)
+            calls += 1
 
     thresholds = gc.get_threshold()
     enabled = gc.isenabled()
@@ -339,12 +453,91 @@ def test_gc_finalizers_during_python_allocation(cls, method):
             del cycle
             gc.set_threshold(1, 1, 1)
             gc.enable()
-            call()
-            gc.collect()
-            assert effects == [True]
+            result = call()
+            # No cleanup collection (or allocating assertion) before this:
+            # the finalizer must have run inside the native call itself.
+            assert calls == 1
+            assert result is not None
             assert dict(q.items()) == {1: 1, 2: 2}
         finally:
             gc.set_threshold(*thresholds)
+            if enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
+
+def test_gc_finalizers_during_constructor_conversion(cls):
+    q = cls({99: 1})
+    effects = []
+
+    class Cycle:
+        def __del__(self):
+            assert effects == ["convert"]
+            q.push(2, 2)
+            effects.append("del")
+
+    class Priority:
+        def __index__(self):
+            effects.append("convert")
+            gc.collect()
+            assert dict(q.items()) == {99: 1, 2: 2}
+            effects.append("collected")
+            return 3
+
+        def __float__(self):
+            return float(self.__index__())
+
+    enabled = gc.isenabled()
+    with no_unraisable():
+        try:
+            gc.collect()
+            gc.disable()
+            cycle = Cycle()
+            cycle.self = cycle
+            del cycle
+            q.__init__([(1, Priority())], min=True)
+            assert effects == ["convert", "del", "collected"]
+            assert q.items() == [(1, 3)] and q.is_min
+        finally:
+            if enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
+
+def test_gc_finalizers_during_reduce_callback(cls):
+    effects = []
+
+    class Queue(cls):
+        def __getstate__(self):
+            effects.append("getstate")
+            gc.collect()
+            effects.append("collected")
+            return None
+
+    q = Queue({1: 1})
+
+    class Cycle:
+        def __del__(self):
+            assert effects == ["getstate"]
+            q.push(2, 2)
+            effects.append("del")
+
+    enabled = gc.isenabled()
+    with no_unraisable():
+        try:
+            gc.collect()
+            gc.disable()
+            cycle = Cycle()
+            cycle.self = cycle
+            del cycle
+            reduced = q.__reduce__()
+            assert effects == ["getstate", "del", "collected"]
+            assert dict(q.items()) == {1: 1, 2: 2}
+            # The constructor arguments were snapshotted before __getstate__.
+            assert reduced[1][2] == [(1, 1)]
+        finally:
             if enabled:
                 gc.enable()
             else:
