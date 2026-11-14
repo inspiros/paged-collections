@@ -78,6 +78,7 @@
 
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 use core::fmt;
 use core::iter::{Enumerate, FusedIterator};
 use core::ops::{Index, IndexMut};
@@ -764,6 +765,130 @@ impl<T, const PAGE: usize> Hive<T, PAGE> {
             Slot::Occupied { version, .. } => Some(Id::new(index, generation_of(*version))),
             Slot::Vacant { .. } => None,
         }
+    }
+
+    /// The id of the element at `value`'s address, if `value` is an element
+    /// of this hive: the inverse of [`get`](Self::get).
+    ///
+    /// Takes O(pages) time: it compares the address with each allocated
+    /// page's slot range, then checks that the slot found is occupied and
+    /// holds exactly that element. A reference to anything else, including
+    /// a field inside an element or an element of another hive, gives
+    /// `None`. Uses address comparison only; no pointer is dereferenced.
+    ///
+    /// ```
+    /// use paged_collections::hive::Hive;
+    ///
+    /// let mut hive: Hive<String> = Hive::new();
+    /// let id = hive.insert("x".to_owned());
+    /// let element: &String = hive.values().next().unwrap();
+    /// assert_eq!(hive.id_of(element), Some(id));
+    /// assert_eq!(hive.id_of(&"x".to_owned()), None);
+    /// ```
+    pub fn id_of(&self, value: &T) -> Option<Id> {
+        let address = core::ptr::from_ref(value).addr();
+        let size = core::mem::size_of::<Slot<T>>();
+        for (p, page) in self.pages.iter().enumerate() {
+            let start = page.slots.as_ptr().addr();
+            let Some(offset) = address.checked_sub(start).map(|bytes| bytes / size) else {
+                continue;
+            };
+            let Some(slot) = page.slots.get(offset) else {
+                continue;
+            };
+            return match slot {
+                Slot::Occupied { version, value: v } if core::ptr::eq(v, value) => {
+                    Some(Id::new((p * PAGE + offset) as u32, generation_of(*version)))
+                }
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// The live ids, ordered by their elements with `compare` (a stable
+    /// sort: equal elements keep slot order). Moves no element; see
+    /// [`sort_by`](Self::sort_by) to reorder the elements themselves.
+    pub fn sorted_ids_by(&self, mut compare: impl FnMut(&T, &T) -> Ordering) -> Vec<Id> {
+        let mut pairs: Vec<(Id, &T)> = self.iter().collect();
+        pairs.sort_by(|a, b| compare(a.1, b.1));
+        pairs.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// The live ids, ordered by their elements' keys (a stable sort).
+    pub fn sorted_ids_by_key<K: Ord>(&self, mut key: impl FnMut(&T) -> K) -> Vec<Id> {
+        self.sorted_ids_by(|a, b| key(a).cmp(&key(b)))
+    }
+
+    /// The live ids, ordered by their elements (a stable sort).
+    ///
+    /// ```
+    /// use paged_collections::hive::Hive;
+    ///
+    /// let mut hive: Hive<u32> = Hive::new();
+    /// let (a, b, c) = (hive.insert(3), hive.insert(1), hive.insert(2));
+    /// assert_eq!(hive.sorted_ids(), [b, c, a]);
+    /// ```
+    pub fn sorted_ids(&self) -> Vec<Id>
+    where
+        T: Ord,
+    {
+        self.sorted_ids_by(T::cmp)
+    }
+
+    /// Sorts the elements in place with `compare`, so iteration (slot
+    /// order) yields them sorted. A stable sort; O(n log n) comparisons,
+    /// O(n) swaps and O(n) extra memory.
+    ///
+    /// **Ids name slots, not elements:** after sorting, each live id names
+    /// whatever element moved into its slot. No id becomes stale and no
+    /// generation changes, so the hive cannot detect ids held across a sort.
+    /// Use [`sorted_ids_by`](Self::sorted_ids_by) to keep ids attached to
+    /// their elements. Elements move, so their addresses change too (the
+    /// set of occupied slots does not). If `compare` panics, no element has
+    /// moved yet.
+    ///
+    /// ```
+    /// use paged_collections::hive::Hive;
+    ///
+    /// let mut hive: Hive<u32> = [3, 1, 2].into_iter().collect();
+    /// let first = hive.ids().next().unwrap();
+    /// hive.sort();
+    /// assert_eq!(hive.values().copied().collect::<Vec<_>>(), [1, 2, 3]);
+    /// assert_eq!(hive[first], 1); // the id now names the smallest element
+    /// ```
+    pub fn sort_by(&mut self, mut compare: impl FnMut(&T, &T) -> Ordering) {
+        let mut values: Vec<&mut T> = self.values_mut().collect();
+        // `order[k]` is the position of the element that belongs at `k`.
+        let mut order: Vec<usize> = (0..values.len()).collect();
+        order.sort_by(|&a, &b| compare(&*values[a], &*values[b]));
+        // Apply the permutation one cycle at a time: the element for
+        // position `k` sits at `order[k]`; follow the cycle with swaps.
+        for start in 0..order.len() {
+            let mut k = start;
+            while order[k] != start {
+                let from = order[k];
+                let (low, high) = (k.min(from), k.max(from));
+                let (left, right) = values.split_at_mut(high);
+                core::mem::swap(&mut *left[low], &mut *right[0]);
+                order[k] = k;
+                k = from;
+            }
+            order[k] = k;
+        }
+    }
+
+    /// Sorts the elements in place by key; see [`sort_by`](Self::sort_by).
+    pub fn sort_by_key<K: Ord>(&mut self, mut key: impl FnMut(&T) -> K) {
+        self.sort_by(|a, b| key(a).cmp(&key(b)));
+    }
+
+    /// Sorts the elements in place; see [`sort_by`](Self::sort_by).
+    pub fn sort(&mut self)
+    where
+        T: Ord,
+    {
+        self.sort_by(T::cmp);
     }
 
     /// Removes and returns the element of `id`; `None`, and nothing changes,
