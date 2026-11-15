@@ -270,8 +270,7 @@ SparseMap(page_size=300)           # ValueError: not compiled in
 
 Rust needs page sizes at compile time, so every size in the list is compiled
 into the extension, and each one adds code and build time. To build a wheel
-with other sizes, set these variables when building from source (from
-`crates/paged-collections-py`):
+with other sizes, set these variables when building from source:
 
 ```bash
 PAGED_COLLECTIONS_PAGE_SIZES=64,1024,16384 PAGED_COLLECTIONS_DEFAULT_PAGE_SIZE=1024 maturin build --release
@@ -284,8 +283,12 @@ be one of them. A pickle made with a size the reading build lacks raises
 ## Layout
 
 ```text
-crates/paged-collections      Rust library (no_std + alloc)
-crates/paged-collections-py   PyO3 bindings, built with maturin
+pyproject.toml                    Python package (maturin), at the repository root
+python/paged_collections/         Python sources and type stubs
+tests/                            Python tests
+crates/paged-collections/         Rust library (no_std + alloc)
+crates/paged-collections-python/  PyO3 bindings (the `_core` extension)
+crates/bench/                     Benchmarks (not a default member)
 ```
 
 ## Development
@@ -298,7 +301,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo build -p paged-collections --no-default-features
 ```
 
-Python (from `crates/paged-collections-py`):
+Python (from the repository root):
 
 ```bash
 uv sync

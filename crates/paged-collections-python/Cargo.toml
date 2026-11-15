@@ -1,5 +1,5 @@
 [package]
-name = "paged-collections-py"
+name = "paged-collections-python"
 description = "Python bindings for paged-collections"
 version.workspace = true
 edition.workspace = true

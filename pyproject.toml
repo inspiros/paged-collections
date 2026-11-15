@@ -5,9 +5,10 @@ build-backend = "maturin"
 [project]
 name = "paged-collections"
 description = "Paged sparse sets, maps and stable-address containers, implemented in Rust"
-readme = "../../README.md"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Hoang-Nhat Tran" }]
 classifiers = [
     "Programming Language :: Rust",
@@ -24,20 +25,33 @@ Repository = "https://github.com/inspiros/paged-collections"
 dev = ["maturin>=1.16,<2", "pytest>=8"]
 
 [tool.maturin]
+manifest-path = "crates/paged-collections-python/Cargo.toml"
 python-source = "python"
 module-name = "paged_collections._core"
 features = ["pyo3/extension-module"]
+# The sdist carries the whole workspace so builds from it match the repo.
+include = [
+    { path = "Cargo.toml", format = "sdist" },
+    { path = "Cargo.lock", format = "sdist" },
+    { path = "crates/paged-collections/**/*", format = "sdist" },
+    { path = "crates/paged-collections-python/**/*", format = "sdist" },
+]
+exclude = ["target/**/*"]
 
 [tool.uv]
 # Rebuild the extension when the Rust sources change, not only pyproject.toml.
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "Cargo.toml" },
-    { file = "src/**/*.rs" },
-    { file = "../paged-collections/Cargo.toml" },
-    { file = "../paged-collections/src/**/*.rs" },
-    { file = "../../Cargo.toml" },
-    { file = "../../Cargo.lock" },
+    { file = "Cargo.lock" },
+    { file = "crates/paged-collections/Cargo.toml" },
+    { file = "crates/paged-collections/src/**/*.rs" },
+    { file = "crates/paged-collections-python/Cargo.toml" },
+    { file = "crates/paged-collections-python/build.rs" },
+    { file = "crates/paged-collections-python/src/**/*.rs" },
+    # build.rs reads these; a changed size list must rebuild the extension.
+    { env = "PAGED_COLLECTIONS_PAGE_SIZES" },
+    { env = "PAGED_COLLECTIONS_DEFAULT_PAGE_SIZE" },
 ]
 
 [tool.pytest.ini_options]
