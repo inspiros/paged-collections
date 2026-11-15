@@ -158,7 +158,7 @@ def test_batch_insert_validation_is_atomic(keys, error):
     [
         (np.array([1.0]), TypeError),
         (np.array([True]), TypeError),
-        (np.array([1], dtype=object), TypeError),
+        (np.array([1.0], dtype=object), TypeError),
         (np.array([[1]], dtype=np.int32), ValueError),
     ],
 )
@@ -177,6 +177,38 @@ def test_batch_lookup_ignores_out_of_range_and_counts_duplicates_once():
     assert s.discard_many(keys) == 2
     assert list(s) == [2]
     assert s.discard_many(np.array([2**64 - 1], dtype=np.uint64)) == 0
+
+
+@pytest.mark.parametrize("huge", [2**63, 2**64, 2**200, -2**200])
+@pytest.mark.parametrize("form", ["list", "tuple", "object", "object-strided"])
+def test_lookup_batches_with_arbitrary_size_ints(huge, form):
+    keys = [1, huge, 1, 3]
+    if form == "tuple":
+        keys = tuple(keys)
+    elif form == "object":
+        keys = np.array(keys, dtype=object)
+    elif form == "object-strided":
+        keys = np.array([x for key in keys for x in (key, None)], dtype=object)[::2]
+    s = SparseSet([1, 2])
+    np.testing.assert_array_equal(s.contains_many(keys), [True, False, True, False])
+    with pytest.raises((OverflowError, TypeError)):
+        s.add_many(keys)
+    assert sorted(s) == [1, 2]
+    assert s.discard_many(keys) == 1
+    assert list(s) == [2]
+
+
+@pytest.mark.parametrize("bad", [1.5, None, "1", object()])
+@pytest.mark.parametrize("array", [False, True])
+def test_lookup_batch_fallback_rejects_nonintegers_atomically(bad, array):
+    keys = [1, 2**200, bad]
+    if array:
+        keys = np.array(keys, dtype=object)
+    s = SparseSet([1, 2])
+    for method in (s.contains_many, s.discard_many):
+        with pytest.raises(TypeError):
+            method(keys)
+        assert list(s) == [1, 2]
 
 
 def test_dense_order_swap_removal_sort_and_detached_array():

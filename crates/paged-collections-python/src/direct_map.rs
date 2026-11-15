@@ -6,7 +6,7 @@ use paged_collections::direct_map::PagedDirectMap;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyInt, PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 use std::ops::Bound as SlotBound;
 
@@ -17,11 +17,9 @@ use crate::typed_map::optional_default;
 
 const KEY_LIMIT: u64 = 1_u64 << 32;
 
-/// A Python int as a nonnegative slot index, saturated at the key limit;
-/// `None` denotes a negative int. Check the type before extracting so
-/// oversized ints are clamped, while non-ints still raise `TypeError`.
+/// An index-protocol object as a slot index, saturated at the key limit;
+/// `None` denotes a negative int. Non-integers raise `TypeError`.
 fn query_index(index: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
-    let index = index.cast::<PyInt>()?;
     // `operator.index` returns an exact `int` copy of an `int` subclass, so
     // an overridden `__lt__` cannot change the sign test below.
     let index = index
@@ -580,7 +578,7 @@ impl DirectMap {
         default: &Bound<'py, PyTuple>,
     ) -> PyResult<Bound<'py, PyList>> {
         let default = optional_default(default, "get_many")?;
-        let batch = KeyBatch::<Key>::new(keys)?;
+        let batch = KeyBatch::<Key>::lookup(keys)?;
         let mut out = Vec::with_capacity(batch.len());
         let mut missing = None;
         {
@@ -606,7 +604,7 @@ impl DirectMap {
         py: Python<'py>,
         keys: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyArray1<bool>>> {
-        let batch = KeyBatch::<Key>::new(keys)?;
+        let batch = KeyBatch::<Key>::lookup(keys)?;
         let mut out = Vec::with_capacity(batch.len());
         {
             let this = slf.try_borrow()?;
@@ -618,7 +616,7 @@ impl DirectMap {
     /// Remove every key in ``keys`` that is present and return how many were
     /// removed. Absent and out-of-range keys are ignored.
     fn discard_many(slf: &Bound<'_, Self>, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
-        let batch = KeyBatch::<Key>::new(keys)?;
+        let batch = KeyBatch::<Key>::lookup(keys)?;
         let mut keys = Vec::with_capacity(batch.len());
         batch.for_each(|k| keys.extend(k));
         let removed: Vec<Py<PyAny>> = {
@@ -691,7 +689,9 @@ macro_rules! typed_direct_map {
             "`` values, with O(1) insert, delete and lookup.\n\n",
             "Values live in pages allocated for the key ranges in use. Entries are ",
             "always visited in ascending key order. Ordered queries find nearby ",
-            "entries or entries in a half-open range; array results are copies."
+            "entries or entries in a half-open range; array results are copies.\n\n",
+            "Typed containers store values, not objects, so NaN != NaN as in NumPy; ",
+            "a typed map containing NaN does not compare equal even to itself."
         )]
         #[pyclass(module = "paged_collections._core", name = $pyname, subclass)]
         pub(crate) struct $name {
@@ -1034,7 +1034,7 @@ macro_rules! typed_direct_map {
                 keys: &Bound<'py, PyAny>,
                 default: Option<$t>,
             ) -> PyResult<Bound<'py, PyArray1<$t>>> {
-                let batch = KeyBatch::<Key>::new(keys)?;
+                let batch = KeyBatch::<Key>::lookup(keys)?;
                 let mut out = Vec::with_capacity(batch.len());
                 let mut missing = None;
                 {
@@ -1060,7 +1060,7 @@ macro_rules! typed_direct_map {
                 py: Python<'py>,
                 keys: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, PyArray1<bool>>> {
-                let batch = KeyBatch::<Key>::new(keys)?;
+                let batch = KeyBatch::<Key>::lookup(keys)?;
                 let mut out = Vec::with_capacity(batch.len());
                 {
                     let this = slf.try_borrow()?;
@@ -1072,7 +1072,7 @@ macro_rules! typed_direct_map {
             /// Remove every key in ``keys`` that is present and return how
             /// many were removed. Absent and out-of-range keys are ignored.
             fn discard_many(slf: &Bound<'_, Self>, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
-                let batch = KeyBatch::<Key>::new(keys)?;
+                let batch = KeyBatch::<Key>::lookup(keys)?;
                 let mut keys = Vec::with_capacity(batch.len());
                 batch.for_each(|k| keys.extend(k));
                 let mut this = slf.try_borrow_mut()?;

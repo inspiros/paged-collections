@@ -36,6 +36,10 @@ pub(crate) trait PyKey: paged_collections::key::Key + Copy + Eq + Ord + 'static 
     /// converted element by element (ids need all 64 bits).
     const SEQUENCE_FALLBACK: bool = false;
 
+    /// Whether lookup batches accept object arrays and integer sequences
+    /// which NumPy cannot represent in an integer dtype.
+    const LOOKUP_FALLBACK: bool = false;
+
     fn to_bits(self) -> Self::Bits;
 
     /// The key with these bits, if they are valid.
@@ -66,6 +70,7 @@ pub(crate) trait PyKey: paged_collections::key::Key + Copy + Eq + Ord + 'static 
 impl PyKey for u32 {
     type Bits = u32;
     const INVALID: &'static str = "out of range for uint32";
+    const LOOKUP_FALLBACK: bool = true;
 
     fn to_bits(self) -> u32 {
         self
@@ -177,6 +182,16 @@ enum Keys<'py, K: PyKey> {
 impl<'py, K: PyKey> KeyBatch<'py, K> {
     /// Converts `obj` (a 1-D array or sequence of integers) to keys.
     pub(crate) fn new(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
+        Self::convert(obj, false)
+    }
+
+    /// Lookup batches also accept arbitrary-size Python ints, treating
+    /// integers outside the key domain as absent.
+    pub(crate) fn lookup(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
+        Self::convert(obj, K::LOOKUP_FALLBACK)
+    }
+
+    fn convert(obj: &Bound<'py, PyAny>, lookup: bool) -> PyResult<Self> {
         let source = as_ndarray(obj)?;
         if source.ndim() != 1 {
             return Err(PyValueError::new_err(format!(
@@ -198,12 +213,13 @@ impl<'py, K: PyKey> KeyBatch<'py, K> {
             }
         }
         let dtype = source.dtype();
-        // NumPy infers float64 (or object) for a sequence that mixes ints
-        // above `i64::MAX` with others, so a plain sequence of ids is read
-        // element by element instead, as Python ints.
-        if K::SEQUENCE_FALLBACK
+        // NumPy can infer float64 or object for arbitrary-size Python ints.
+        // Read the original integers rather than their rounded float copies.
+        // Explicit float arrays remain invalid, even for lookups.
+        if ((K::SEQUENCE_FALLBACK || lookup)
             && matches!(dtype.kind(), b'f' | b'O')
-            && obj.cast::<PyUntypedArray>().is_err()
+            && obj.cast::<PyUntypedArray>().is_err())
+            || (lookup && dtype.kind() == b'O')
         {
             return Self::from_sequence(obj);
         }
@@ -229,7 +245,7 @@ impl<'py, K: PyKey> KeyBatch<'py, K> {
         Ok(Self { source, keys })
     }
 
-    /// Reads a 1-D sequence (not an array) element by element through
+    /// Reads a 1-D sequence or object array element by element through
     /// `operator.index`; `TypeError` for any element that is not an integer.
     fn from_sequence(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
         let source = obj

@@ -176,9 +176,19 @@ assert_eq!(plain.len(), 4);
 
 ## Python
 
-Keys are integers in `0 <= key < 2**32`. `SparseSet` holds keys,
-`SparseMap` maps keys to any objects, and `SparseMapF64`, `SparseMapI64` and
-the other typed maps (or `sparse_map(dtype)`) store numbers unboxed:
+Keys are integers in `0 <= key < 2**32`. Batch lookups (`contains_many`,
+`discard_many`, and `get_many`) treat out-of-range integers as absent, even
+in Python sequences or object arrays containing arbitrarily large ints.
+`get_many` uses its default or raises `KeyError` for an absent key. Float key
+arrays are rejected, and batch insertion still rejects out-of-range keys.
+
+`SparseSet` holds keys, `SparseMap` maps keys to any objects, and
+`SparseMapF64`, `SparseMapI64` and the other typed maps (or
+`sparse_map(dtype)`) store numbers unboxed.
+Typed containers store values, not objects, so NaN != NaN as in NumPy:
+a typed list or map containing NaN does not compare equal even to itself.
+
+For example:
 
 ```python
 import numpy as np
@@ -211,8 +221,9 @@ never call the subclass's `__init__`.
 
 `DirectMap` and its typed variants (or `direct_map(dtype)`) store values in
 pages at their key's slot and always visit entries in ascending key order.
-They support nearest-entry and half-open range queries. Array results are
-copies, and structural changes are always allowed.
+They support nearest-entry and half-open range queries whose bounds accept
+any object with `__index__`, including NumPy integer scalars. Array results
+are copies, and structural changes are always allowed.
 
 ```python
 from paged_collections import direct_map
@@ -226,8 +237,11 @@ ordered.popitem()                 # (2048, 3.0)
 `IdAllocator` issues generational ids as Python ints packed as
 `generation << 32 | index`. Freed indices are reused last freed first with
 the next generation, so a stale id is never alive again; pickles and copies
-keep the whole allocation history. Store whole `uint64` ids in `IdMap` (or
-`id_map(dtype)` for typed values): inserting a new generation replaces the
+keep the whole allocation history. Calling `__init__()` again clears live
+ids while preserving that history. Allocator arguments and the `id_*` helpers
+accept objects with `__index__`, including NumPy integer scalars. Store
+whole `uint64` ids in `IdMap` (or `id_map(dtype)` for typed values):
+inserting a new generation replaces the
 entry at that index, and stale ids no longer find it.
 
 ```python

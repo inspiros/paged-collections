@@ -439,7 +439,7 @@ macro_rules! object_map {
                 default: &Bound<'py, PyTuple>,
             ) -> PyResult<Bound<'py, PyList>> {
                 let default = optional_default(default, "get_many")?;
-                let batch = KeyBatch::<$K>::new(keys)?;
+                let batch = KeyBatch::<$K>::lookup(keys)?;
                 let mut out = Vec::with_capacity(batch.len());
                 let mut missing = None;
                 {
@@ -465,7 +465,7 @@ macro_rules! object_map {
                 py: Python<'py>,
                 keys: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, PyArray1<bool>>> {
-                let batch = KeyBatch::<$K>::new(keys)?;
+                let batch = KeyBatch::<$K>::lookup(keys)?;
                 let mut out = Vec::with_capacity(batch.len());
                 {
                     let this = slf.try_borrow()?;
@@ -477,7 +477,7 @@ macro_rules! object_map {
             /// Remove every key in ``keys`` that is present and return how many were
             /// removed. Absent and out-of-range keys are ignored.
             fn discard_many(slf: &Bound<'_, Self>, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
-                let batch = KeyBatch::<$K>::new(keys)?;
+                let batch = KeyBatch::<$K>::lookup(keys)?;
                 let mut keys = Vec::with_capacity(batch.len());
                 batch.for_each(|k| keys.extend(k));
                 let removed: Vec<Py<PyAny>> = {

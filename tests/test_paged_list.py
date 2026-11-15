@@ -253,6 +253,90 @@ def test_search_bounds_and_conversion(list_cls):
             a.remove(object())
 
 
+@pytest.mark.parametrize("probe", [False, True, 0, 1, 1.0, 3, 3.0, 3.5, 2**70,
+                                   np.int64(3), np.float64(3.0)])
+def test_typed_search_matches_python_equality(typed_cls, probe):
+    a = typed_cls(data(typed_cls, [0, 1, 3, 1, 3]))
+    expected = list(a)
+    assert (probe in a) == (probe in expected)
+    assert a.count(probe) == expected.count(probe)
+    for start, stop in [(0, 100), (1, 4), (-3, -1), (4, 1)]:
+        if probe in expected[start:stop]:
+            assert a.index(probe, start, stop) == expected.index(probe, start, stop)
+        else:
+            with pytest.raises(ValueError):
+                a.index(probe, start, stop)
+    if probe in expected:
+        assert a.remove(probe) is None
+        expected.remove(probe)
+    else:
+        with pytest.raises(ValueError):
+            a.remove(probe)
+    assert list(a) == expected
+
+
+@pytest.mark.parametrize("cls, stored, probe", [
+    (pc.PagedListF64, float(2**53), 2**53 + 1),
+    (pc.PagedListF32, 1.0, 1.0 + 2**-30),
+    (pc.PagedListI64, 3, 3.5),
+    (pc.PagedListI64, 3, 2**70),
+    (pc.PagedListU64, 2**64 - 1, float(2**64)),
+])
+def test_typed_search_does_not_round_probe(cls, stored, probe):
+    a = cls([stored])
+    assert probe not in a and a.count(probe) == 0
+    with pytest.raises(ValueError):
+        a.index(probe)
+    with pytest.raises(ValueError):
+        a.remove(probe)
+    assert list(a) == [stored]
+
+
+@pytest.mark.parametrize("method", ["__contains__", "index", "count", "remove"])
+def test_typed_search_custom_equality_and_reentrancy(typed_cls, method):
+    a = typed_cls(data(typed_cls, [0]))
+    target = scalar(typed_cls, 1)
+
+    class Probe:
+        appended = False
+
+        def __eq__(self, other):
+            if not self.appended:
+                self.appended = True
+                a.append(target)
+            return other == target
+
+    result = getattr(a, method)(Probe())
+    assert result == {"__contains__": True, "index": 1, "count": 1, "remove": None}[method]
+    assert list(a) == (data(typed_cls, [0]) if method == "remove" else
+                       data(typed_cls, [0, 1]))
+
+
+def test_typed_search_uses_equality_instead_of_conversion(typed_cls):
+    a = typed_cls(data(typed_cls, [1]))
+
+    class Probe:
+        def __index__(self):
+            raise AssertionError("search must not convert the probe")
+
+        __float__ = __index__
+
+        def __eq__(self, other):
+            raise RuntimeError("probe equality")
+
+    for method in (a.__contains__, a.index, a.count, a.remove):
+        with pytest.raises(RuntimeError, match="probe equality"):
+            method(Probe())
+
+    class UnequalInt(int):
+        def __eq__(self, other):
+            return False
+
+    probe = UnequalInt(1)
+    assert (probe in a) == (probe in list(a))
+    assert a.count(probe) == list(a).count(probe)
+
+
 def test_typed_numpy_batches(typed_cls, key_batch):
     a = typed_cls(data(typed_cls, range(12)))
     indices = key_batch.astype(key_batch.dtype, copy=True)
@@ -415,6 +499,8 @@ def test_float_sort_nan_stability(cls):
     assert nan not in a
     assert a.count(nan) == 0
     assert a != a.copy()  # typed comparisons use numeric ==, including NaN
+    assert a != a
+    assert "NaN != NaN as in NumPy" in cls.__doc__
     with pytest.raises(ValueError):
         a.index(nan)
     a = cls(vals)

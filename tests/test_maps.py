@@ -207,7 +207,7 @@ def test_batch_key_validation_is_atomic(map_cls, keys, error):
 @pytest.mark.parametrize(
     "keys, error",
     [(np.array([1.0]), TypeError), (np.array([True]), TypeError),
-     (np.array([1], dtype=object), TypeError), ([[1]], ValueError)],
+     (np.array([1.0], dtype=object), TypeError), ([[1]], ValueError)],
 )
 def test_batch_lookup_rejects_wrong_kind_or_shape(map_cls, method, keys, error):
     m = map_cls([1], _values(map_cls, [1]))
@@ -215,6 +215,51 @@ def test_batch_lookup_rejects_wrong_kind_or_shape(map_cls, method, keys, error):
     with pytest.raises(error):
         getattr(m, method)(keys)
     assert m.items() == before
+
+
+@pytest.mark.parametrize("huge", [2**63, 2**64, 2**200, -2**200])
+@pytest.mark.parametrize("form", ["list", "tuple", "object"])
+def test_lookup_batches_with_arbitrary_size_ints(map_cls, huge, form):
+    keys = [1, huge, 1]
+    if form == "tuple":
+        keys = tuple(keys)
+    elif form == "object":
+        keys = np.array(keys, dtype=object)
+    value, default = _values(map_cls, [1, 0])
+    m = map_cls([1, 2], [value, default])
+    before = m.items()
+    np.testing.assert_array_equal(m.contains_many(keys), [True, False, True])
+    _assert_values(m, m.get_many(keys, default), [value, default, value])
+    with pytest.raises(KeyError) as error:
+        m.get_many(keys)
+    assert error.value.args == (huge,)
+    with pytest.raises((OverflowError, TypeError)):
+        m.set_many(keys, [value] * 3)
+    assert m.items() == before
+    assert m.discard_many(keys) == 1
+    assert m.items() == [(2, default)]
+
+
+@pytest.mark.parametrize("method", ["get_many", "contains_many", "discard_many"])
+@pytest.mark.parametrize("bad", [1.5, None, "1", object()])
+def test_lookup_batch_fallback_rejects_nonintegers_atomically(map_cls, method, bad):
+    value = _values(map_cls, [1])[0]
+    m = map_cls([1], [value])
+    keys = np.array([1, 2**200, bad], dtype=object)
+    with pytest.raises(TypeError):
+        getattr(m, method)(keys)
+    assert m.items() == [(1, value)]
+
+
+@pytest.mark.parametrize("family", ["SparseMap", "IdMap", "DirectMap"])
+@pytest.mark.parametrize("suffix", ["F32", "F64"])
+def test_typed_maps_nan_has_no_identity_shortcut(family, suffix):
+    cls = getattr(pc, family + suffix)
+    key = pc.make_id(1, 1) if family == "IdMap" else 1
+    m = cls([key], [float("nan")])
+    assert m != m and not (m == m)
+    assert m != m.copy()
+    assert "NaN != NaN as in NumPy" in cls.__doc__
 
 
 def test_get_many_defaults_and_plain_integer_keyerror(map_cls):

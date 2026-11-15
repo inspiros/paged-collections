@@ -4,15 +4,13 @@ use numpy::{PyArray1, PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods
 use paged_collections::id_alloc::{Id, IdAllocator as Allocator, MAX_INDICES};
 use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyInt, PyTuple};
+use pyo3::types::{PyDict, PyTuple};
 use std::num::NonZeroU32;
 
 use crate::convert::{KeyBatch, TypedValue, as_ndarray};
 
-/// Normalize an int subclass before extracting or comparing it, just as
-/// `direct_map::query_index` does. Objects with only `__index__` are not ints.
+/// Accept the index protocol and normalize int subclasses before comparisons.
 fn python_int<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-    let obj = obj.cast::<PyInt>()?;
     obj.py().import("operator")?.call_method1("index", (obj,))
 }
 
@@ -68,6 +66,7 @@ fn exhausted() -> PyErr {
 /// Allocates generational ids, packed as ``generation << 32 | index``.
 /// Freed indices are reused last freed first, with a new generation.
 /// Iteration and ``ids()`` visit live ids in index order; arrays are copies.
+/// Calling ``__init__()`` again clears live ids but preserves their history.
 ///
 /// The optional ``_state`` constructor argument is internal pickle state:
 /// a pair of uint32 arrays or lists holding versions and the free list.
@@ -128,7 +127,10 @@ impl IdAllocator {
     #[pyo3(signature = (_state = None))]
     fn __init__(&mut self, _state: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
         let allocator = match _state {
-            None => Allocator::new(),
+            None => {
+                self.clear();
+                return Ok(());
+            }
             Some(state) => {
                 let parts = state.cast::<PyTuple>().map_err(|_| {
                     PyValueError::new_err("_state must be a (versions, free) tuple")
@@ -154,11 +156,10 @@ impl IdAllocator {
         self.allocator.len()
     }
 
-    fn __contains__(&self, id: &Bound<'_, PyAny>) -> bool {
-        query_id(id)
-            .ok()
-            .flatten()
-            .is_some_and(|id| self.allocator.is_alive(id))
+    fn __contains__(slf: &Bound<'_, Self>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let id = query_id(id).ok().flatten();
+        let this = slf.try_borrow()?;
+        Ok(id.is_some_and(|id| this.allocator.is_alive(id)))
     }
 
     fn __iter__(slf: &Bound<'_, Self>) -> PyResult<IdAllocatorIterator> {
@@ -237,45 +238,47 @@ impl IdAllocator {
 
     /// Issue ``n`` ids as a uint64 array, or change nothing on failure.
     fn alloc_many<'py>(
-        &mut self,
-        py: Python<'py>,
+        slf: &Bound<'py, Self>,
         n: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyArray1<u64>>> {
         let n = python_int(n)?;
         if n.lt(0)? {
             return Err(PyValueError::new_err("n must be nonnegative"));
         }
-        let available = self.allocator.free_len() as u64
-            + (u64::from(MAX_INDICES) - self.allocator.index_bound() as u64);
         let n = n.extract::<u64>().map_err(|_| exhausted())?;
+        let mut this = slf.try_borrow_mut()?;
+        let available = this.allocator.free_len() as u64
+            + (u64::from(MAX_INDICES) - this.allocator.index_bound() as u64);
         if n > available {
             return Err(exhausted());
         }
         let n = n as usize; // At most MAX_INDICES, even on 32-bit targets.
         let mut ids = Vec::new();
         ids.try_reserve(n).map_err(crate::reserve_error)?;
-        self.allocator
+        this.allocator
             .try_reserve(n)
             .map_err(crate::reserve_error)?;
         for _ in 0..n {
             ids.push(
-                self.allocator
+                this.allocator
                     .try_alloc()
                     .expect("batch capacity checked")
                     .to_bits(),
             );
         }
         if n != 0 {
-            self.changed();
+            this.changed();
         }
-        Ok(PyArray1::from_vec(py, ids))
+        Ok(PyArray1::from_vec(slf.py(), ids))
     }
 
     /// Free a live id; return whether it was freed.
-    fn free(&mut self, id: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let freed = query_id(id)?.is_some_and(|id| self.allocator.free(id));
+    fn free(slf: &Bound<'_, Self>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let id = query_id(id)?;
+        let mut this = slf.try_borrow_mut()?;
+        let freed = id.is_some_and(|id| this.allocator.free(id));
         if freed {
-            self.changed();
+            this.changed();
         }
         Ok(freed)
     }
@@ -288,8 +291,10 @@ impl IdAllocator {
         Ok(slf.try_borrow_mut()?.free_batch(batch))
     }
 
-    fn is_alive(&self, id: &Bound<'_, PyAny>) -> PyResult<bool> {
-        Ok(query_id(id)?.is_some_and(|id| self.allocator.is_alive(id)))
+    fn is_alive(slf: &Bound<'_, Self>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let id = query_id(id)?;
+        let this = slf.try_borrow()?;
+        Ok(id.is_some_and(|id| this.allocator.is_alive(id)))
     }
 
     fn is_alive_many<'py>(
@@ -306,11 +311,11 @@ impl IdAllocator {
     }
 
     /// The live id at an index, or None outside the u32 domain.
-    fn occupant(&self, index: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
-        Ok(python_int(index)?
-            .extract::<u32>()
-            .ok()
-            .and_then(|index| self.allocator.occupant(index))
+    fn occupant(slf: &Bound<'_, Self>, index: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+        let index = python_int(index)?.extract::<u32>().ok();
+        let this = slf.try_borrow()?;
+        Ok(index
+            .and_then(|index| this.allocator.occupant(index))
             .map(Id::to_bits))
     }
 

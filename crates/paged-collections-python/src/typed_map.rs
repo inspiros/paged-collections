@@ -109,7 +109,9 @@ macro_rules! typed_map {
             "take NumPy arrays or sequences. ``keys_view()`` and ``values_view()`` return ",
             "zero-copy arrays; while any view is alive, only values of keys already present ",
             "can be written, and methods that would resize or reorder the map raise ",
-            "``BufferError``."
+            "``BufferError``.\n\n",
+            "Typed containers store values, not objects, so NaN != NaN as in NumPy; ",
+            "a typed map containing NaN does not compare equal even to itself."
         )]
         #[pyclass(module = "paged_collections._core", name = $pyname, subclass)]
         pub(crate) struct $name {
@@ -399,7 +401,7 @@ macro_rules! typed_map {
                 keys: &Bound<'py, PyAny>,
                 default: Option<$t>,
             ) -> PyResult<Bound<'py, PyArray1<$t>>> {
-                let batch = KeyBatch::<$K>::new(keys)?;
+                let batch = KeyBatch::<$K>::lookup(keys)?;
                 let mut out = Vec::with_capacity(batch.len());
                 let mut missing = None;
                 batch.for_each(|k| match (k.and_then(|k| self.map.get(k)), default) {
@@ -422,7 +424,7 @@ macro_rules! typed_map {
                 py: Python<'py>,
                 keys: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, PyArray1<bool>>> {
-                let batch = KeyBatch::<$K>::new(keys)?;
+                let batch = KeyBatch::<$K>::lookup(keys)?;
                 let mut out = Vec::with_capacity(batch.len());
                 batch.for_each(|k| out.push(k.is_some_and(|k| self.map.contains_key(k))));
                 Ok(PyArray1::from_vec(py, out))
@@ -431,7 +433,7 @@ macro_rules! typed_map {
             /// Remove every key in ``keys`` that is present and return how
             /// many were removed. Absent and out-of-range keys are ignored.
             fn discard_many(&mut self, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
-                let batch = KeyBatch::<$K>::new(keys)?;
+                let batch = KeyBatch::<$K>::lookup(keys)?;
                 let mut present = Vec::new();
                 batch.for_each(|k| present.extend(k.filter(|&k| self.map.contains_key(k))));
                 if present.is_empty() {

@@ -85,11 +85,14 @@ def test_invalid_bits_are_not_alive(id):
 
 
 class IndexOnly:
+    def __init__(self, value=2**32):
+        self.value = value
+
     def __index__(self):
-        return make_id(0, 1)
+        return self.value
 
 
-@pytest.mark.parametrize("bad", [1.0, "1", None, [], object(), IndexOnly(), np.uint64(2**32)])
+@pytest.mark.parametrize("bad", [1.0, "1", None, [], object()])
 def test_scalar_type_checks(bad):
     a = IdAllocator()
     a.alloc()
@@ -101,6 +104,52 @@ def test_scalar_type_checks(bad):
         with pytest.raises(TypeError):
             make_id(*args)
     assert len(a) == 1
+
+
+@pytest.mark.parametrize("wrap", [IndexOnly, np.int64, np.uint64])
+def test_index_protocol_and_numpy_scalars(wrap):
+    a = IdAllocator()
+    assert a.reserve(wrap(2)) is None
+    ids = a.alloc_many(wrap(2))
+    bits = int(ids[0])
+    id = wrap(bits)
+    assert id in a and a.is_alive(id)
+    assert a.occupant(wrap(0)) == bits
+    assert id_index(id) == 0 and id_generation(id) == 1
+    assert make_id(wrap(0), wrap(1)) == bits
+    assert id_indices([id]).tolist() == [0]
+    assert a.is_alive_many([id]).tolist() == [True]
+    assert a.free_many([id]) == 1
+    assert not a.free(id)
+    assert [a.free(i) for i in ids] == [False, True]
+
+
+def test_index_protocol_keeps_bool_behavior():
+    a = IdAllocator()
+    first = a.alloc_many(True)[0]
+    assert a.occupant(False) == first and a.occupant(True) is None
+    assert make_id(False, True) == first
+    assert not a.is_alive(True) and not a.free(False)
+    with pytest.raises(ValueError):
+        id_index(True)
+
+
+@pytest.mark.parametrize("method", ["alloc_many", "free", "is_alive", "occupant", "__contains__"])
+def test_index_protocol_runs_before_allocator_borrow(method):
+    a = IdAllocator()
+    id = a.alloc()
+
+    class Index:
+        def __index__(self):
+            a.clear()
+            return 0 if method in ("alloc_many", "occupant") else id
+
+    result = getattr(a, method)(Index())
+    if method == "alloc_many":
+        assert result.size == 0
+    else:
+        assert result is (None if method == "occupant" else False)
+    assert len(a) == 0
 
 
 def test_int_subclass_overrides_are_ignored():
@@ -172,7 +221,7 @@ def test_alloc_many_validation_and_exhaustion_precheck():
         with pytest.raises(OverflowError, match="^IdAllocator is exhausted$"):
             a.alloc_many(n)
         assert a == before
-    for bad in (1.0, "1", None, IndexOnly()):
+    for bad in (1.0, "1", None):
         with pytest.raises(TypeError):
             a.alloc_many(bad)
         assert a == before
@@ -314,11 +363,30 @@ def test_clear_reserve_shrink_and_reinit():
     assert a.alloc() == make_id(4, 2)
     assert not any(a.is_alive(id) for id in ids)
     assert a.__init__() is None
-    assert a == IdAllocator()
-    assert (a.index_bound, a.free_len, a.retired_len) == (0, 0, 0)
-    assert a.alloc() == ids[0]  # Reinitializing starts a new allocation history.
+    assert (a.index_bound, a.free_len, a.retired_len) == (5, 5, 0)
+    assert a.alloc() == make_id(4, 3)
+    assert not any(a.is_alive(id) for id in ids)
     obj = IdAllocator.__new__(IdAllocator, "ignored", arbitrary=True)
     assert not obj and obj.index_bound == 0
+
+
+def test_reinit_never_revives_stale_ids_or_retired_slots():
+    a = IdAllocator()
+    stale = a.alloc()
+    a.free(stale)
+    a.__init__()
+    live = a.alloc()
+    assert live != stale and not a.is_alive(stale)
+    a.__init__()
+    assert a.alloc() not in (stale, live)
+    assert not a.is_alive(live)
+
+    retired = IdAllocator(_state=([0, 2**32 - 1], []))
+    last = make_id(1, MAX_GENERATION)
+    retired.__init__()
+    assert (retired.index_bound, retired.retired_len) == (2, 2)
+    assert retired.alloc() == make_id(2, 1)
+    assert not retired.is_alive(last)
 
 
 @pytest.mark.parametrize("additional", [sys.maxsize, sys.maxsize // 4])

@@ -9,7 +9,7 @@ use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyIndexError, PyMemoryError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::slice::PySliceIndices;
-use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySlice, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 
 use crate::convert::{TypedValue, as_ndarray, cast_to, value_batch};
@@ -849,7 +849,9 @@ macro_rules! typed_list {
         #[doc = concat!("A list of ``", stringify!($t), "`` stored in pages of configurable size. ",
             "Appending never moves existing elements; slices are copies. ",
             "Zero-copy NumPy access is per page via ``page_view``. While views exist, ",
-            "appending and value writes are allowed; removing or moving elements raises BufferError.")]
+            "appending and value writes are allowed; removing or moving elements raises BufferError.\n\n",
+            "Typed containers store values, not objects, so NaN != NaN as in NumPy; ",
+            "a typed list containing NaN does not compare equal even to itself.")]
         #[pyclass(module = "paged_collections._core", name = $pyname, subclass)]
         pub(crate) struct $name {
             list: ListInner<ValueCell<$t>>,
@@ -869,8 +871,35 @@ macro_rules! typed_list {
                 Ok(())
             }
             fn snapshot(&self) -> Vec<$t> { self.list.iter().map(ValueCell::get).collect() }
-            fn find(&self, value: $t, start: usize, stop: usize) -> Option<usize> {
+            fn find_typed(&self, value: $t, start: usize, stop: usize) -> Option<usize> {
                 (start..stop.min(self.list.len())).find(|&i| self.list.get(i).unwrap().get() == value)
+            }
+            /// Only built-in numbers can bypass Python equality. Subclasses
+            /// and other probes may override equality or numeric conversion.
+            fn probe(value: &Bound<'_, PyAny>) -> PyResult<Option<$t>> {
+                if !(value.is_exact_instance_of::<PyInt>()
+                    || value.is_exact_instance_of::<PyFloat>()
+                    || value.is_exact_instance_of::<PyBool>()) {
+                    return Ok(None);
+                }
+                let Ok(converted) = value.extract::<$t>() else { return Ok(None); };
+                // Round-trip equality catches narrowing (f32) and rounding a
+                // large int to a float without invoking any user callbacks.
+                Ok(converted.into_bound_py_any(value.py())?.eq(value)?.then_some(converted))
+            }
+            fn find(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>, start: usize, stop: usize) -> PyResult<Option<usize>> {
+                if let Some(value) = Self::probe(value)? {
+                    return Ok(slf.try_borrow()?.find_typed(value, start, stop));
+                }
+                let mut i = start;
+                while i < stop {
+                    let item = slf.try_borrow()?.list.get(i).map(ValueCell::get);
+                    let Some(item) = item else { break; };
+                    // Release the collection borrow before calling __eq__.
+                    if item.into_bound_py_any(slf.py())?.eq(value)? { return Ok(Some(i)); }
+                    i += 1;
+                }
+                Ok(None)
             }
         }
         #[pymethods]
@@ -957,32 +986,39 @@ macro_rules! typed_list {
             fn __iter__(slf: &Bound<'_, Self>) -> PyResult<$iter> { $iter::new(slf, false) }
             fn __reversed__(slf: &Bound<'_, Self>) -> PyResult<$iter> { $iter::new(slf, true) }
             fn __contains__(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<bool> {
-                let Ok(value) = value.extract::<$t>() else { return Ok(false); };
-                let this = slf.try_borrow()?;
-                Ok(this.find(value, 0, this.list.len()).is_some())
+                Ok(Self::find(slf, value, 0, usize::MAX)?.is_some())
             }
             #[pyo3(signature = (value, start=0, stop=isize::MAX))]
             fn index(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>,
                 #[pyo3(from_py_with = signed_index)] start: isize,
                 #[pyo3(from_py_with = signed_index)] stop: isize) -> PyResult<usize> {
-                let found = match value.extract::<$t>() {
-                    Ok(v) => { let this = slf.try_borrow()?;
-                        this.find(v, bound(start, this.list.len()), bound(stop, this.list.len())) },
-                    Err(_) => None,
-                };
+                let len = slf.try_borrow()?.list.len();
+                let start = bound(start, len);
+                let stop = if stop < 0 { bound(stop, len) } else { stop as usize };
+                let found = Self::find(slf, value, start, stop)?;
                 match found { Some(i) => Ok(i), None => Err(PyValueError::new_err(format!("{} is not in {}", value.repr()?, $pyname))) }
             }
             fn count(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<usize> {
-                let Ok(value) = value.extract::<$t>() else { return Ok(0); };
-                Ok(slf.try_borrow()?.list.iter().filter(|v| v.get() == value).count())
+                if let Some(value) = Self::probe(value)? {
+                    return Ok(slf.try_borrow()?.list.iter().filter(|v| v.get() == value).count());
+                }
+                let mut count = 0;
+                let mut i = 0;
+                loop {
+                    let item = slf.try_borrow()?.list.get(i).map(ValueCell::get);
+                    let Some(item) = item else { break; };
+                    count += usize::from(item.into_bound_py_any(slf.py())?.eq(value)?);
+                    i += 1;
+                }
+                Ok(count)
             }
             fn remove(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-                let value = value.extract::<$t>().ok();
+                slf.try_borrow()?.exports.check($pyname)?;
+                let found = Self::find(slf, value, 0, usize::MAX)?;
                 let mut this = slf.try_borrow_mut()?;
                 this.exports.check($pyname)?;
-                let found = value.and_then(|v| this.find(v, 0, this.list.len()));
                 match found {
-                    Some(i) => { this.list.remove(i); Ok(()) },
+                    Some(i) => { if i < this.list.len() { this.list.remove(i); } Ok(()) },
                     None => Err(PyValueError::new_err(concat!($pyname, ".remove(x): x not in ", $pyname))),
                 }
             }

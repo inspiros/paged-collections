@@ -294,6 +294,73 @@ def test_query_types(direct_cls, bad):
             getattr(m, method)(None)
 
 
+@pytest.mark.parametrize("wrap", [np.int64, np.uint64, np.uint32])
+def test_ordered_queries_accept_numpy_integer_scalars(direct_cls, wrap):
+    values = _values(direct_cls, [0, 1, 2])
+    m = direct_cls([0, 1, 3], values)
+    assert m.next_occupant(wrap(1)) == (1, values[1])
+    assert m.prev_occupant(wrap(2)) == (1, values[1])
+    assert m.items_range(wrap(1), wrap(3)) == [(1, values[1])]
+    np.testing.assert_array_equal(m.keys_range(wrap(1), wrap(3)), [1])
+    _assert_values(m, m.values_range(wrap(1), wrap(3)), [values[1]])
+    assert [m.next_occupant(key) for key in m.keys()] == m.items()
+
+
+def test_ordered_queries_accept_index_protocol_and_keep_bool_behavior(direct_cls):
+    class Index:
+        def __init__(self, value):
+            self.value = value
+
+        def __index__(self):
+            return self.value
+
+    values = _values(direct_cls, [0, 1, 2])
+    m = direct_cls([0, 1, 3], values)
+    assert m.next_occupant(Index(1)) == m.next_occupant(True) == (1, values[1])
+    assert m.prev_occupant(Index(2)) == (1, values[1])
+    assert m.prev_occupant(False) == (0, values[0])
+    assert m.items_range(Index(1), Index(3)) == [(1, values[1])]
+    np.testing.assert_array_equal(m.keys_range(Index(1), Index(3)), [1])
+    _assert_values(m, m.values_range(Index(1), Index(3)), [values[1]])
+    assert m.items_range(Index(-2**200), Index(2**200)) == m.items()
+    assert m.next_occupant(Index(2**200)) is None
+    assert m.prev_occupant(Index(-2**200)) is None
+
+
+@pytest.mark.parametrize("huge", [2**63, 2**64, 2**200, -2**200])
+@pytest.mark.parametrize("form", ["list", "tuple", "object"])
+def test_lookup_batches_with_arbitrary_size_ints(direct_cls, huge, form):
+    keys = [1, huge, 1]
+    if form == "tuple":
+        keys = tuple(keys)
+    elif form == "object":
+        keys = np.array(keys, dtype=object)
+    value, default = _values(direct_cls, [1, 0])
+    m = direct_cls([1, 2], [value, default])
+    before = m.items()
+    np.testing.assert_array_equal(m.contains_many(keys), [True, False, True])
+    _assert_values(m, m.get_many(keys, default), [value, default, value])
+    with pytest.raises(KeyError) as error:
+        m.get_many(keys)
+    assert error.value.args == (huge,)
+    with pytest.raises((OverflowError, TypeError)):
+        m.set_many(keys, [value] * 3)
+    assert m.items() == before
+    assert m.discard_many(keys) == 1
+    assert m.items() == [(2, default)]
+
+
+@pytest.mark.parametrize("method", ["get_many", "contains_many", "discard_many"])
+@pytest.mark.parametrize("bad", [1.5, None, "1", object()])
+def test_lookup_batch_fallback_rejects_nonintegers_atomically(direct_cls, method, bad):
+    value = _values(direct_cls, [1])[0]
+    m = direct_cls([1], [value])
+    keys = np.array([1, 2**200, bad], dtype=object)
+    with pytest.raises(TypeError):
+        getattr(m, method)(keys)
+    assert m.items() == [(1, value)]
+
+
 def test_batches(direct_cls):
     a, b, c, d = _values(direct_cls, [1, 2, 3, 4])
     m = direct_cls([9, 1], [a, b])

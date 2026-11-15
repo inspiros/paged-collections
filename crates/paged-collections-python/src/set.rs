@@ -206,7 +206,7 @@ impl SparseSet {
     /// Remove every key in ``keys`` that is present and return how many were
     /// removed. Absent and out-of-range keys are ignored.
     fn discard_many(&mut self, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
-        let batch = KeyBatch::new(keys)?;
+        let batch = KeyBatch::lookup(keys)?;
         let mut present = Vec::new();
         batch.for_each(|k| present.extend(k.filter(|&k| self.set.contains(k))));
         if present.is_empty() {
@@ -225,7 +225,7 @@ impl SparseSet {
         py: Python<'py>,
         keys: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyArray1<bool>>> {
-        let batch = KeyBatch::new(keys)?;
+        let batch = KeyBatch::lookup(keys)?;
         let mut out = Vec::with_capacity(batch.len());
         batch.for_each(|k| out.push(k.is_some_and(|k| self.set.contains(k))));
         Ok(PyArray1::from_vec(py, out))
