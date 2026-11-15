@@ -113,7 +113,11 @@ impl DirectMap {
         }
     }
 
-    fn set_batch(&mut self, keys: &Bound<'_, PyAny>, values: &Bound<'_, PyAny>) -> PyResult<usize> {
+    fn set_batch(
+        slf: &Bound<'_, Self>,
+        keys: &Bound<'_, PyAny>,
+        values: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
         let keys = KeyBatch::new(keys)?.to_insert_keys()?;
         let values: Vec<Py<PyAny>> = values
             .try_iter()?
@@ -126,11 +130,33 @@ impl DirectMap {
                 keys.len()
             )));
         }
-        let new = paged!(DirectInner, &mut self.map, map => write_batch(map, keys, values));
-        if new > 0 {
-            self.changed();
-        }
+        let mut removed = Vec::with_capacity(keys.len());
+        let new = {
+            let mut this = slf.try_borrow_mut()?;
+            let before = this.map.len();
+            for (key, value) in keys.into_iter().zip(values) {
+                removed.extend(this.map.insert(key, value));
+            }
+            let new = this.map.len() - before;
+            if new > 0 {
+                this.changed();
+            }
+            new
+        };
+        drop(removed);
         Ok(new)
+    }
+
+    // Preserve allocated pages and defer finalizers until the caller releases its borrow.
+    fn remove_all(&mut self) -> Vec<Py<PyAny>> {
+        let keys: Vec<_> = self.map.keys().collect();
+        let removed = keys
+            .into_iter()
+            .filter_map(|k| self.map.remove(k))
+            .collect();
+        self.map.clear();
+        self.changed();
+        removed
     }
 
     fn remove_present(&mut self, key: Key) -> PyResult<Py<PyAny>> {
@@ -152,18 +178,21 @@ impl DirectMap {
 
     #[pyo3(signature = (keys = None, values = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
     fn __init__(
-        &mut self,
+        slf: &Bound<'_, Self>,
         keys: Option<&Bound<'_, PyAny>>,
         values: Option<&Bound<'_, PyAny>>,
         #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
     ) -> PyResult<()> {
-        if self.map.page_size() != page_size {
-            self.map.set_page_size(page_size)?;
-            self.changed();
+        {
+            let mut this = slf.try_borrow_mut()?;
+            if this.map.page_size() != page_size {
+                this.map.set_page_size(page_size)?;
+                this.changed();
+            }
         }
         match (keys, values) {
             (None, None) => Ok(()),
-            (Some(keys), Some(values)) => self.set_batch(keys, values).map(drop),
+            (Some(keys), Some(values)) => Self::set_batch(slf, keys, values).map(drop),
             _ => Err(PyTypeError::new_err(
                 "give both keys and values, or neither",
             )),
@@ -185,24 +214,37 @@ impl DirectMap {
             .ok_or_else(|| PyKeyError::new_err(key.clone().unbind()))
     }
 
-    fn __setitem__(&mut self, key: &Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<()> {
+    fn __setitem__(
+        slf: &Bound<'_, Self>,
+        key: &Bound<'_, PyAny>,
+        value: Py<PyAny>,
+    ) -> PyResult<()> {
         let key = insert_key(key)?;
-        if let Some(slot) = self.map.get_mut(key) {
-            // The old value is dropped here; its `__del__` cannot reach this
-            // map, which is borrowed.
-            *slot = value;
-        } else {
-            self.map.insert(key, value);
-            self.changed();
-        }
+        let old = {
+            let mut this = slf.try_borrow_mut()?;
+            if this.map.contains_key(key) {
+                this.map.insert(key, value)
+            } else {
+                let old = this.map.insert(key, value);
+                this.changed();
+                old
+            }
+        };
+        drop(old);
         Ok(())
     }
 
-    fn __delitem__(&mut self, key: &Bound<'_, PyAny>) -> PyResult<()> {
-        match lookup_key(key).filter(|&k| self.map.contains_key(k)) {
-            Some(k) => self.remove_present(k).map(drop),
-            None => Err(PyKeyError::new_err(key.clone().unbind())),
-        }
+    fn __delitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>) -> PyResult<()> {
+        let lookup = lookup_key(key);
+        let removed = {
+            let mut this = slf.try_borrow_mut()?;
+            match lookup.filter(|&k| this.map.contains_key(k)) {
+                Some(k) => this.remove_present(k)?,
+                None => return Err(PyKeyError::new_err(key.clone().unbind())),
+            }
+        };
+        drop(removed);
+        Ok(())
     }
 
     fn __iter__(slf: &Bound<'_, Self>) -> PyResult<DirectMapIterator> {
@@ -211,15 +253,25 @@ impl DirectMap {
 
     /// Equal when both hold the same keys with equal values (compared with
     /// ``is`` first, then ``==``, as ``dict`` does).
-    fn __eq__(&self, py: Python<'_>, other: PyRef<'_, Self>) -> PyResult<bool> {
-        if self.map.len() != other.map.len() {
-            return Ok(false);
-        }
-        for (key, value) in self.map.iter() {
-            let Some(other_value) = other.map.get(key) else {
+    fn __eq__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<bool> {
+        let py = slf.py();
+        let pairs = {
+            let this = slf.try_borrow()?;
+            let other = other.try_borrow()?;
+            if this.map.len() != other.map.len() {
                 return Ok(false);
-            };
-            if !value.is(other_value) && !value.bind(py).eq(other_value.bind(py))? {
+            }
+            let mut pairs = Vec::with_capacity(this.map.len());
+            for (key, value) in this.map.iter() {
+                let Some(other_value) = other.map.get(key) else {
+                    return Ok(false);
+                };
+                pairs.push((value.clone_ref(py), other_value.clone_ref(py)));
+            }
+            pairs
+        };
+        for (value, other_value) in pairs {
+            if !value.is(&other_value) && !value.bind(py).eq(other_value.bind(py))? {
                 return Ok(false);
             }
         }
@@ -230,11 +282,14 @@ impl DirectMap {
         let py = slf.py();
         let name = slf.get_type().name()?.to_string();
         crate::repr_guarded(slf.as_any(), &name, || {
-            let this = slf.try_borrow()?;
-            let items = repr_items(this.map.iter().map(|(k, v)| (k, v.bind(py).clone())), py)?;
+            let (items, page_size) = {
+                let this = slf.try_borrow()?;
+                (this.items(py), this.map.page_size())
+            };
+            let items = repr_items(items.into_iter().map(|(k, v)| (k, v.into_bound(py))), py)?;
             Ok(format!(
                 "{name}({{{items}}}{})",
-                crate::page_size_repr(slf.try_borrow()?.map.page_size())
+                crate::page_size_repr(page_size)
             ))
         })
     }
@@ -265,37 +320,47 @@ impl DirectMap {
 
     /// Return the value for ``key``, or ``default`` if it is absent.
     #[pyo3(signature = (key, default = None))]
-    fn get(&self, py: Python<'_>, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> Py<PyAny> {
-        match lookup_key(key).and_then(|k| self.map.get(k)) {
+    fn get(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let lookup = lookup_key(key);
+        let this = slf.try_borrow()?;
+        Ok(match lookup.and_then(|k| this.map.get(k)) {
             Some(value) => value.clone_ref(py),
             None => default.unwrap_or_else(|| py.None()),
-        }
+        })
     }
 
     /// Remove ``key`` and return its value. If it is absent, return
     /// ``default`` if given, else raise ``KeyError``.
     #[pyo3(signature = (key, *default))]
     fn pop<'py>(
-        &mut self,
+        slf: &Bound<'py, Self>,
         py: Python<'py>,
         key: &Bound<'py, PyAny>,
         default: &Bound<'py, PyTuple>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let default = optional_default(default, "pop")?;
-        match lookup_key(key).filter(|&k| self.map.contains_key(k)) {
-            Some(k) => Ok(self.remove_present(k)?.into_bound(py)),
+        let lookup = lookup_key(key);
+        let mut this = slf.try_borrow_mut()?;
+        match lookup.filter(|&k| this.map.contains_key(k)) {
+            Some(k) => Ok(this.remove_present(k)?.into_bound(py)),
             None => default.ok_or_else(|| PyKeyError::new_err(key.clone().unbind())),
         }
     }
 
     /// Remove and return the entry with the largest key; raise
     /// ``KeyError`` if the map is empty.
-    fn popitem(&mut self) -> PyResult<(Key, Py<PyAny>)> {
-        let item = self
+    fn popitem(slf: &Bound<'_, Self>) -> PyResult<(Key, Py<PyAny>)> {
+        let mut this = slf.try_borrow_mut()?;
+        let item = this
             .map
             .pop_last()
             .ok_or_else(|| PyKeyError::new_err("popitem(): DirectMap is empty"))?;
-        self.changed();
+        this.changed();
         Ok(item)
     }
 
@@ -317,23 +382,25 @@ impl DirectMap {
 
     /// Remove and return the entry with the smallest key; raise
     /// ``KeyError`` if the map is empty.
-    fn pop_first(&mut self) -> PyResult<(Key, Py<PyAny>)> {
-        let item = self
+    fn pop_first(slf: &Bound<'_, Self>) -> PyResult<(Key, Py<PyAny>)> {
+        let mut this = slf.try_borrow_mut()?;
+        let item = this
             .map
             .pop_first()
             .ok_or_else(|| PyKeyError::new_err("pop_first(): DirectMap is empty"))?;
-        self.changed();
+        this.changed();
         Ok(item)
     }
 
     /// Remove and return the entry with the largest key; raise
     /// ``KeyError`` if the map is empty.
-    fn pop_last(&mut self) -> PyResult<(Key, Py<PyAny>)> {
-        let item = self
+    fn pop_last(slf: &Bound<'_, Self>) -> PyResult<(Key, Py<PyAny>)> {
+        let mut this = slf.try_borrow_mut()?;
+        let item = this
             .map
             .pop_last()
             .ok_or_else(|| PyKeyError::new_err("pop_last(): DirectMap is empty"))?;
-        self.changed();
+        this.changed();
         Ok(item)
     }
 
@@ -421,19 +488,24 @@ impl DirectMap {
     /// is absent.
     #[pyo3(signature = (key, default = None))]
     fn setdefault(
-        &mut self,
+        slf: &Bound<'_, Self>,
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
         default: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let key = insert_key(key)?;
-        if let Some(value) = self.map.get(key) {
-            return Ok(value.clone_ref(py));
-        }
-        let default = default.unwrap_or_else(|| py.None());
-        self.map.insert(key, default.clone_ref(py));
-        self.changed();
-        Ok(default)
+        let (value, old) = {
+            let mut this = slf.try_borrow_mut()?;
+            if let Some(value) = this.map.get(key) {
+                return Ok(value.clone_ref(py));
+            }
+            let default = default.unwrap_or_else(|| py.None());
+            let old = this.map.insert(key, default.clone_ref(py));
+            this.changed();
+            (default, old)
+        };
+        drop(old);
+        Ok(value)
     }
 
     /// Insert the pairs of ``other``: a mapping, or an iterable of
@@ -451,17 +523,21 @@ impl DirectMap {
         };
         for pair in pairs.try_iter()? {
             let (key, value): (Bound<'_, PyAny>, Py<PyAny>) = pair?.extract()?;
-            slf.try_borrow_mut()?.__setitem__(&key, value)?;
+            Self::__setitem__(slf, &key, value)?;
         }
         Ok(())
     }
 
     /// Remove every entry. Pages stay allocated for reuse.
-    fn clear(&mut self) -> PyResult<()> {
-        if !self.map.is_empty() {
-            self.map.clear();
-            self.changed();
-        }
+    fn clear(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let removed = {
+            let mut this = slf.try_borrow_mut()?;
+            if this.map.is_empty() {
+                return Ok(());
+            }
+            this.remove_all()
+        };
+        drop(removed);
         Ok(())
     }
 
@@ -486,31 +562,38 @@ impl DirectMap {
     ///
     /// The batch is validated first: a bad key or a length mismatch raises
     /// and leaves the map unchanged.
-    fn set_many(&mut self, keys: &Bound<'_, PyAny>, values: &Bound<'_, PyAny>) -> PyResult<usize> {
-        self.set_batch(keys, values)
+    fn set_many(
+        slf: &Bound<'_, Self>,
+        keys: &Bound<'_, PyAny>,
+        values: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
+        Self::set_batch(slf, keys, values)
     }
 
     /// Return a list of the values of ``keys``. A missing key takes
     /// ``default`` if given, else raises ``KeyError``.
     #[pyo3(signature = (keys, *default))]
     fn get_many<'py>(
-        &self,
+        slf: &Bound<'py, Self>,
         py: Python<'py>,
         keys: &Bound<'py, PyAny>,
         default: &Bound<'py, PyTuple>,
     ) -> PyResult<Bound<'py, PyList>> {
         let default = optional_default(default, "get_many")?;
-        let batch = KeyBatch::new(keys)?;
+        let batch = KeyBatch::<Key>::new(keys)?;
         let mut out = Vec::with_capacity(batch.len());
         let mut missing = None;
-        batch.for_each(|k| match (k.and_then(|k| self.map.get(k)), &default) {
-            (Some(value), _) => out.push(value.bind(py).clone()),
-            (None, Some(value)) => out.push(value.clone()),
-            (None, None) => {
-                missing.get_or_insert(out.len());
-                out.push(py.None().into_bound(py));
-            }
-        });
+        {
+            let this = slf.try_borrow()?;
+            batch.for_each(|k| match (k.and_then(|k| this.map.get(k)), &default) {
+                (Some(value), _) => out.push(value.bind(py).clone()),
+                (None, Some(value)) => out.push(value.clone()),
+                (None, None) => {
+                    missing.get_or_insert(out.len());
+                    out.push(py.None().into_bound(py));
+                }
+            });
+        }
         match missing {
             Some(pos) => Err(PyKeyError::new_err(batch.item(pos)?.unbind())),
             None => PyList::new(py, out),
@@ -519,33 +602,45 @@ impl DirectMap {
 
     /// Return a boolean array: whether each key in ``keys`` is present.
     fn contains_many<'py>(
-        &self,
+        slf: &Bound<'py, Self>,
         py: Python<'py>,
         keys: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyArray1<bool>>> {
-        let batch = KeyBatch::new(keys)?;
+        let batch = KeyBatch::<Key>::new(keys)?;
         let mut out = Vec::with_capacity(batch.len());
-        batch.for_each(|k| out.push(k.is_some_and(|k| self.map.contains_key(k))));
+        {
+            let this = slf.try_borrow()?;
+            batch.for_each(|k| out.push(k.is_some_and(|k| this.map.contains_key(k))));
+        }
         Ok(PyArray1::from_vec(py, out))
     }
 
     /// Remove every key in ``keys`` that is present and return how many were
     /// removed. Absent and out-of-range keys are ignored.
-    fn discard_many(&mut self, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
-        let batch = KeyBatch::new(keys)?;
-        let mut present = Vec::new();
-        batch.for_each(|k| present.extend(k.filter(|&k| self.map.contains_key(k))));
-        if present.is_empty() {
-            return Ok(0);
-        }
-        // Collect the removed values and drop them after the loop, so the
-        // map is consistent before any `__del__` runs.
-        let removed: Vec<Py<PyAny>> = present
-            .into_iter()
-            .filter_map(|k| self.map.remove(k))
-            .collect();
-        self.changed();
-        Ok(removed.len())
+    fn discard_many(slf: &Bound<'_, Self>, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let batch = KeyBatch::<Key>::new(keys)?;
+        let mut keys = Vec::with_capacity(batch.len());
+        batch.for_each(|k| keys.extend(k));
+        let removed: Vec<Py<PyAny>> = {
+            let mut this = slf.try_borrow_mut()?;
+            let present: Vec<_> = keys
+                .into_iter()
+                .filter(|&k| this.map.contains_key(k))
+                .collect();
+            if present.is_empty() {
+                return Ok(0);
+            }
+            let removed = present
+                .into_iter()
+                .filter_map(|k| this.map.remove(k))
+                .collect();
+            this.changed();
+            removed
+        };
+        // Finalizers run only after the batch is complete and the borrow is released.
+        let count = removed.len();
+        drop(removed);
+        Ok(count)
     }
 
     /// Release unused memory; frees every page if the map is empty.
@@ -567,9 +662,10 @@ impl DirectMap {
         Ok(())
     }
 
-    fn __clear__(&mut self) {
-        self.map.clear();
-        self.changed();
+    fn __clear__(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let removed = slf.try_borrow_mut()?.remove_all();
+        drop(removed);
+        Ok(())
     }
 
     /// Slots per page for this instance.
@@ -625,15 +721,16 @@ macro_rules! typed_direct_map {
             }
 
             fn set_batch(
-                &mut self,
+                slf: &Bound<'_, Self>,
                 keys: &Bound<'_, PyAny>,
                 values: &Bound<'_, PyAny>,
             ) -> PyResult<usize> {
                 let keys = KeyBatch::new(keys)?.to_insert_keys()?;
                 let values = value_batch::<$t>(values, keys.len())?;
-                let new = paged!(DirectInner, &mut self.map, map => write_batch(map, keys, values));
+                let mut this = slf.try_borrow_mut()?;
+                let new = paged!(DirectInner, &mut this.map, map => write_batch(map, keys, values));
                 if new > 0 {
-                    self.changed();
+                    this.changed();
                 }
                 Ok(new)
             }
@@ -657,18 +754,21 @@ macro_rules! typed_direct_map {
 
             #[pyo3(signature = (keys = None, values = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
             fn __init__(
-                &mut self,
+                slf: &Bound<'_, Self>,
                 keys: Option<&Bound<'_, PyAny>>,
                 values: Option<&Bound<'_, PyAny>>,
                 #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
             ) -> PyResult<()> {
-                if self.map.page_size() != page_size {
-                    self.map.set_page_size(page_size)?;
-                    self.changed();
+                {
+                    let mut this = slf.try_borrow_mut()?;
+                    if this.map.page_size() != page_size {
+                        this.map.set_page_size(page_size)?;
+                        this.changed();
+                    }
                 }
                 match (keys, values) {
                     (None, None) => Ok(()),
-                    (Some(keys), Some(values)) => self.set_batch(keys, values).map(drop),
+                    (Some(keys), Some(values)) => Self::set_batch(slf, keys, values).map(drop),
                     _ => Err(PyTypeError::new_err("give both keys and values, or neither")),
                 }
             }
@@ -918,33 +1018,36 @@ macro_rules! typed_direct_map {
             /// The batch is validated first: a bad key or value raises and
             /// leaves the map unchanged.
             fn set_many(
-                &mut self,
+                slf: &Bound<'_, Self>,
                 keys: &Bound<'_, PyAny>,
                 values: &Bound<'_, PyAny>,
             ) -> PyResult<usize> {
-                self.set_batch(keys, values)
+                Self::set_batch(slf, keys, values)
             }
 
             /// Return an array of the values of ``keys``. A missing key takes
             /// ``default`` if given, else raises ``KeyError``.
             #[pyo3(signature = (keys, default = None))]
             fn get_many<'py>(
-                &self,
+                slf: &Bound<'py, Self>,
                 py: Python<'py>,
                 keys: &Bound<'py, PyAny>,
                 default: Option<$t>,
             ) -> PyResult<Bound<'py, PyArray1<$t>>> {
-                let batch = KeyBatch::new(keys)?;
+                let batch = KeyBatch::<Key>::new(keys)?;
                 let mut out = Vec::with_capacity(batch.len());
                 let mut missing = None;
-                batch.for_each(|k| match (k.and_then(|k| self.map.get(k)), default) {
-                    (Some(value), _) => out.push(*value),
-                    (None, Some(value)) => out.push(value),
-                    (None, None) => {
-                        missing.get_or_insert(out.len());
-                        out.push(<$t>::default());
-                    }
-                });
+                {
+                    let this = slf.try_borrow()?;
+                    batch.for_each(|k| match (k.and_then(|k| this.map.get(k)), default) {
+                        (Some(value), _) => out.push(*value),
+                        (None, Some(value)) => out.push(value),
+                        (None, None) => {
+                            missing.get_or_insert(out.len());
+                            out.push(<$t>::default());
+                        }
+                    });
+                }
                 match missing {
                     Some(pos) => Err(PyKeyError::new_err(batch.item(pos)?.unbind())),
                     None => Ok(PyArray1::from_vec(py, out)),
@@ -953,30 +1056,35 @@ macro_rules! typed_direct_map {
 
             /// Return a boolean array: whether each key in ``keys`` is present.
             fn contains_many<'py>(
-                &self,
+                slf: &Bound<'py, Self>,
                 py: Python<'py>,
                 keys: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, PyArray1<bool>>> {
-                let batch = KeyBatch::new(keys)?;
+                let batch = KeyBatch::<Key>::new(keys)?;
                 let mut out = Vec::with_capacity(batch.len());
-                batch.for_each(|k| out.push(k.is_some_and(|k| self.map.contains_key(k))));
+                {
+                    let this = slf.try_borrow()?;
+                    batch.for_each(|k| out.push(k.is_some_and(|k| this.map.contains_key(k))));
+                }
                 Ok(PyArray1::from_vec(py, out))
             }
 
             /// Remove every key in ``keys`` that is present and return how
             /// many were removed. Absent and out-of-range keys are ignored.
-            fn discard_many(&mut self, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
-                let batch = KeyBatch::new(keys)?;
-                let mut present = Vec::new();
-                batch.for_each(|k| present.extend(k.filter(|&k| self.map.contains_key(k))));
+            fn discard_many(slf: &Bound<'_, Self>, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
+                let batch = KeyBatch::<Key>::new(keys)?;
+                let mut keys = Vec::with_capacity(batch.len());
+                batch.for_each(|k| keys.extend(k));
+                let mut this = slf.try_borrow_mut()?;
+                let present: Vec<_> = keys.into_iter().filter(|&k| this.map.contains_key(k)).collect();
                 if present.is_empty() {
                     return Ok(0);
                 }
                 let removed = present
                     .into_iter()
-                    .filter(|&k| self.map.remove(k).is_some())
+                    .filter(|&k| this.map.remove(k).is_some())
                     .count();
-                self.changed();
+                this.changed();
                 Ok(removed)
             }
 

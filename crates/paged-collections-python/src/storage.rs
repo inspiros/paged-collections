@@ -91,9 +91,6 @@ impl<K: PyKey, V> MapInner<K, V> {
     pub(crate) fn get(&self, key: K) -> Option<&V> {
         paged!(Self, self, inner => inner.get(key))
     }
-    pub(crate) fn get_mut(&mut self, key: K) -> Option<&mut V> {
-        paged!(Self, self, inner => inner.get_mut(key))
-    }
     pub(crate) fn remove(&mut self, key: K) -> Option<V> {
         paged!(Self, self, inner => inner.remove(key))
     }
