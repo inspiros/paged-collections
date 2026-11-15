@@ -16,7 +16,9 @@ use core::ptr;
 
 use super::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, UnsafeCell, spin_loop};
 use super::free_stack::FreeStack;
+use super::recycle::PageStack;
 use super::spine::Spine;
+use crate::hive::{Hive, RawPage, RawSlot};
 use crate::id_alloc::{Id, MAX_INDICES, generation_of, live_version};
 use crate::page::DEFAULT_PAGE;
 
@@ -40,8 +42,13 @@ struct Slot<T> {
 
 impl<T> Slot<T> {
     fn new() -> Self {
+        Self::with_state(0)
+    }
+
+    /// A vacant slot at `version` (even), for a recycled page.
+    fn with_state(version: u32) -> Self {
         Self {
-            state: AtomicU64::new(0),
+            state: AtomicU64::new(u64::from(version)),
             next: AtomicU32::new(0),
             value: UnsafeCell::new(MaybeUninit::uninit()),
         }
@@ -78,7 +85,8 @@ fn retry(spins: &mut u32) {
 /// Taking a value waits for its guards. A forgotten guard pins its slot until
 /// exclusive access or destruction. There is no mutable access while shared.
 ///
-/// Pages stay allocated until destruction. Shared iteration is weakly
+/// Pages stay allocated until [`shrink_to_fit`](Self::shrink_to_fit) frees
+/// the empty ones; shared inserts reuse freed pages later. Shared iteration is weakly
 /// consistent: it may miss concurrent insertions or removals. `len` is
 /// approximate during shared operations and exact when they have finished.
 /// Exclusive scans take O([`index_bound`](Self::index_bound)) time.
@@ -93,6 +101,8 @@ fn retry(spins: &mut u32) {
 pub struct ConcurrentHive<T, const PAGE: usize = DEFAULT_PAGE> {
     pages: Spine<Page<T>, CHUNKS>,
     free: FreeStack,
+    /// Pages freed by `shrink_to_fit`, below the reservation bound.
+    recycled: PageStack,
     len: AtomicUsize,
 }
 
@@ -148,6 +158,7 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
         Self {
             pages: Spine::new(),
             free: FreeStack::new(),
+            recycled: PageStack::new(),
             len: AtomicUsize::new(0),
         }
     }
@@ -180,11 +191,39 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
         }
     }
 
+    /// Reinstalls a page freed by `shrink_to_fit`, with every usable slot
+    /// vacant at the page's floor. Pushes all its slots but the first to the
+    /// free stack and returns the first, for the caller to claim by CAS.
+    ///
+    /// The popper is the page's only installer: the free stack holds none of
+    /// its indices (it was rebuilt when the page was freed) and fresh
+    /// reservation never goes below the bound. Its slots are unreachable
+    /// until pushed (a guessed id finds a vacant state), so this thread owns
+    /// them while pushing.
+    fn recycle(&self) -> Option<u32> {
+        let (page, floor) = self.recycled.pop()?;
+        let base = page * PAGE;
+        let limit = PAGE.min(MAX_INDICES as usize - base);
+        let installed = self.pages.get_or_insert_with(page, || {
+            Box::new(Page {
+                slots: (0..PAGE)
+                    .map(|offset| Slot::with_state(if offset < limit { floor } else { 0 }))
+                    .collect(),
+            })
+        });
+        for offset in (1..limit).rev() {
+            self.free
+                .push((base + offset) as u32, &installed.slots[offset].next);
+        }
+        Some(base as u32)
+    }
+
     fn claim(&self) -> Option<(Busy<'_, T, PAGE>, u32)> {
         loop {
-            let reused = self
+            let popped = self
                 .free
                 .pop(|index| &self.slot(index).expect("free index has a page").next);
+            let reused = popped.or_else(|| self.recycle());
             let index = match reused {
                 Some(index) => index,
                 None => self.free.fresh(MAX_INDICES)?,
@@ -215,10 +254,12 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
         }
     }
 
-    fn publish(&self, mut owner: Busy<'_, T, PAGE>, live: u32, value: T) -> Id {
-        owner.slot.value.with_mut(|cell| {
-            // SAFETY: the claim CAS gave owner sole BUSY ownership of this
-            // uninitialized cell. MaybeUninit<T> has T's layout/alignment.
+    // The caller owns this empty cell through a claim or exclusive conversion.
+    fn write_value(&self, slot: &Slot<T>, live: u32, value: T) {
+        slot.value.with_mut(|cell| {
+            // SAFETY: the claim CAS or exclusive construction grants sole
+            // ownership of this uninitialized cell. MaybeUninit<T> has T's
+            // layout/alignment.
             unsafe { ptr::write(cell.cast::<T>(), value) };
         });
         // Relaxed accounting precedes publication so even a guessed id removed
@@ -226,7 +267,11 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
         self.len.fetch_add(1, Ordering::Relaxed);
         // Release publishes the initialized value and preceding accounting;
         // every successful reader/remover CAS acquires that publication.
-        owner.slot.state.store(u64::from(live), Ordering::Release);
+        slot.state.store(u64::from(live), Ordering::Release);
+    }
+
+    fn publish(&self, mut owner: Busy<'_, T, PAGE>, live: u32, value: T) -> Id {
+        self.write_value(owner.slot, live, value);
         owner.armed = false;
         Id::new(owner.index, generation_of(live))
     }
@@ -587,6 +632,145 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
         }
     }
 
+    /// Frees every page that holds no value, under exclusive access. Takes
+    /// O([`index_bound`](Self::index_bound)) time.
+    ///
+    /// Marked values are finalized and forgotten guard counts reset first.
+    /// A page is then freed if it lies wholly below the reservation bound and
+    /// all its slots are vacant and reusable (a page with a retired slot is
+    /// kept). It remembers its highest version, so ids it issued stay dead:
+    /// shared inserts reuse freed pages, lowest first, after the free slots
+    /// of the remaining pages, with generations above every earlier one.
+    /// The free slots are relinked in index order. The page directory's own
+    /// small arrays stay allocated.
+    ///
+    /// ```
+    /// use paged_collections::concurrent::ConcurrentHive;
+    ///
+    /// let mut hive = ConcurrentHive::<u32, 4>::new();
+    /// let ids: Vec<_> = (0..12).map(|v| hive.insert(v)).collect();
+    /// for &id in &ids[..8] {
+    ///     hive.remove(id);
+    /// }
+    /// hive.shrink_to_fit(); // frees the first two pages
+    /// assert_eq!(*hive.get(ids[8]).unwrap(), 8);
+    /// let new = hive.insert(99); // reuses a freed page
+    /// assert!(new.index() < 8 && !ids.contains(&new));
+    /// assert!(hive.get(ids[0]).is_none());
+    /// ```
+    pub fn shrink_to_fit(&mut self) {
+        self.normalize();
+        let bound = self.index_bound() as usize;
+        let mut freed = self.recycled.pending().to_vec();
+        let installed: Vec<usize> = self.pages.iter().map(|(number, _)| number).collect();
+        for number in installed {
+            let base = number * PAGE;
+            let end = (base + PAGE).min(MAX_INDICES as usize);
+            if end > bound {
+                continue;
+            }
+            let page = self.pages.get(number).expect("page was just listed");
+            let mut floor = 0;
+            let empty = page.slots[..end - base].iter().all(|slot| {
+                // Relaxed: exclusive access, and normalization left no flags.
+                let word = slot.state.load(Ordering::Relaxed);
+                debug_assert_eq!(word & !VERSION, 0, "normalized slot has flags");
+                let version = word as u32;
+                floor = floor.max(version);
+                // Live (odd) or retired (zero below the bound) slots stay.
+                version & 1 == 0 && version != 0
+            });
+            if empty {
+                // The page's cells are all vacant: dropping it drops no T.
+                drop(self.pages.remove(number));
+                freed.push((number, floor));
+            }
+        }
+        // The free stack linked through freed slots: relink the rest,
+        // pushed from the top so the lowest index pops first.
+        self.free.reset();
+        for index in (0..bound as u32).rev() {
+            if let Some(slot) = self.slot(index) {
+                // Relaxed: exclusive access rules out concurrent changes.
+                let version = slot.state.load(Ordering::Relaxed) as u32;
+                if version & 1 == 0 && version != 0 {
+                    self.free.push(index, &slot.next);
+                }
+            }
+        }
+        self.recycled.set(freed);
+    }
+
+    /// Moves into a plain [`Hive`], preserving live ids and stale-id history.
+    /// Takes O([`index_bound`](Self::index_bound)) time; pages and reuse order
+    /// may change.
+    ///
+    /// Marked values are finalized and not carried over. Forgotten guards are
+    /// released: their counts are reset before any live value is moved.
+    /// Every slot below the bound is represented explicitly: zero states
+    /// become retired vacancies, even versions become reusable vacancies,
+    /// and odd versions keep their values. A page freed by
+    /// [`shrink_to_fit`](Self::shrink_to_fit) becomes an empty raw page with
+    /// its floor; other floors are zero. Offsets beyond the bound have never
+    /// issued ids and need no history.
+    ///
+    /// Raw-page validation cannot fail by construction: all versions have
+    /// the required parity, all pages fit `PAGE`, and indices are below
+    /// [`MAX_INDICES`]. Allocation or a marked value's destructor may panic;
+    /// allocation may also abort. Values already moved are owned by the raw
+    /// pages; this hive's empty cells cannot drop them again, including if
+    /// allocation unwinds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use paged_collections::concurrent::ConcurrentHive;
+    ///
+    /// let hive = ConcurrentHive::<String, 4>::new();
+    /// let id = hive.insert(String::from("hello"));
+    /// let plain = hive.into_hive();
+    /// assert_eq!(plain.get(id).map(String::as_str), Some("hello"));
+    /// assert_eq!(plain.len(), 1);
+    /// ```
+    pub fn into_hive(mut self) -> Hive<T, PAGE> {
+        self.normalize();
+        let bound = self.index_bound() as usize;
+        let mut pages = Vec::with_capacity(bound.div_ceil(PAGE));
+        for base in (0..bound).step_by(PAGE) {
+            if let Some(floor) = self.recycled.floor_of(base / PAGE) {
+                // A freed page: every slot restarts above its floor.
+                pages.push(RawPage {
+                    floor,
+                    slots: Vec::new(),
+                });
+                continue;
+            }
+            let end = base + PAGE.min(bound - base);
+            let mut slots = Vec::with_capacity(end - base);
+            for index in base..end {
+                let version = self.slot(index as u32).map_or(0, |slot| {
+                    // Acquire is conservative: normalization and exclusive
+                    // ownership rule out concurrent flags or guard counts.
+                    let word = slot.state.load(Ordering::Acquire);
+                    debug_assert!(word & !VERSION == 0);
+                    word as u32
+                });
+                slots.push(if version & 1 != 0 {
+                    let id = Id::new(index as u32, generation_of(version));
+                    RawSlot::Occupied {
+                        version,
+                        value: self.take(id).expect("normalized live value"),
+                    }
+                } else {
+                    RawSlot::Vacant { version }
+                });
+            }
+            pages.push(RawPage { floor: 0, slots });
+        }
+        Hive::try_from_raw_pages(pages)
+            .expect("concurrent hive raw pages are valid by construction")
+    }
+
     #[cfg(all(test, loom))]
     pub(super) fn inject_busy_hint(&self, index: u32) {
         let slot = self.slot(index).unwrap();
@@ -599,6 +783,78 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
 impl<T, const PAGE: usize> Default for ConcurrentHive<T, PAGE> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Moves a plain hive into shared storage without changing live ids.
+/// Takes O(the source hive's index bound) time; pages and reuse order may change.
+///
+/// The new reservation bound ends after the last explicit raw slot or the
+/// last page with a nonzero floor, whichever is later. The untouched suffix
+/// of floor-zero pages is left to fresh reservation. Omitted offsets below
+/// this bound become reusable vacancies at their page floor. For floor-zero
+/// holes only, generation 1 is spent and the vacancy starts at version 2:
+/// a popped zero state must always mean retired. Nonzero floors retain their
+/// exact next generation, `floor / 2 + 1`. Explicit retired zeros are never
+/// pushed. Thus no previously issued dead id can revive.
+///
+/// Versions are copied before draining values, since draining advances the
+/// source versions. Occupied states are published only after their values
+/// have moved; unwinding during allocation cannot expose uninitialized cells
+/// to this hive's destructor.
+impl<T, const PAGE: usize> From<Hive<T, PAGE>> for ConcurrentHive<T, PAGE> {
+    fn from(mut hive: Hive<T, PAGE>) -> Self {
+        let mut out = Self::new();
+        // Copy only floors and versions; no borrowed value escapes raw_pages.
+        let metadata: Vec<(u32, Vec<u32>)> = hive
+            .raw_pages()
+            .map(|raw| {
+                let versions = raw
+                    .slots
+                    .into_iter()
+                    .map(|slot| match slot {
+                        RawSlot::Occupied { version, .. } | RawSlot::Vacant { version } => version,
+                    })
+                    .collect();
+                (raw.floor, versions)
+            })
+            .collect();
+        let mut bound = 0;
+        for (page, (floor, versions)) in metadata.iter().enumerate() {
+            let base = page * PAGE;
+            if *floor != 0 {
+                // Include the entire usable page: omitted offsets inherit
+                // this floor even when no raw slot remains after shrinking.
+                bound = base + PAGE.min(MAX_INDICES as usize - base);
+            } else if !versions.is_empty() {
+                bound = base + versions.len();
+            }
+        }
+        out.free.set_next_fresh(bound as u32);
+        for index in 0..bound {
+            let (floor, versions) = &metadata[index / PAGE];
+            let version = versions
+                .get(index % PAGE)
+                .copied()
+                .unwrap_or((*floor).max(2));
+            let slot = out.ensure_slot(index as u32);
+            if version & 1 == 0 {
+                // Relaxed suffices during exclusive construction. Nonzero
+                // vacancies are reusable; explicit zero states stay retired.
+                slot.state.store(u64::from(version), Ordering::Relaxed);
+                if version != 0 {
+                    out.free.push(index as u32, &slot.next);
+                }
+            }
+            // Occupied metadata stays at empty state zero until its value
+            // is moved below; no panic can make Drop read uninitialized T.
+        }
+        for (id, value) in hive.drain() {
+            let live = live_version(id.generation()).expect("Hive issues valid generations");
+            let slot = out.slot(id.index()).expect("copied slot has a page");
+            out.write_value(slot, live, value);
+        }
+        out
     }
 }
 

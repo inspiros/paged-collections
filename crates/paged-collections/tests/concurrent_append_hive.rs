@@ -602,3 +602,91 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn id_of_inverts_get_across_pages_and_removals() {
+    let mut hive = ConcurrentAppendHive::<u64, 4>::new();
+    let ids: Vec<_> = (0..11).map(|v| hive.insert(v)).collect();
+    for &id in &ids {
+        assert_eq!(hive.id_of(hive.get(id).unwrap()), Some(id));
+    }
+    let copy = hive[ids[3]];
+    assert_eq!(hive.id_of(&copy), None);
+    assert_eq!(hive.remove(ids[3]), Some(3));
+    let reused = hive.insert(30);
+    assert_eq!(hive.id_of(&hive[reused]), Some(reused));
+    let other = ConcurrentAppendHive::<u64, 4>::new();
+    let foreign = other.insert(5);
+    assert_eq!(hive.id_of(&other[foreign]), None);
+}
+
+/// Random inserts, removals, shrinks and Hive round trips against an
+/// oracle: live ids keep their values, no issued id is ever issued again,
+/// and dead ids stay dead.
+fn shrink_model(ops: Vec<(u8, u8)>) {
+    let mut hive = ConcurrentAppendHive::<u32, 4>::new();
+    let mut live: std::collections::BTreeMap<Id, u32> = std::collections::BTreeMap::new();
+    let mut issued: BTreeSet<Id> = BTreeSet::new();
+    let mut next = 0;
+    for (op, pick) in ops {
+        match op % 8 {
+            0..=3 => {
+                let id = hive.insert(next);
+                assert!(issued.insert(id), "{id:?} issued twice");
+                live.insert(id, next);
+                next += 1;
+            }
+            4 | 5 => {
+                if let Some(&id) = live.keys().nth(usize::from(pick) % live.len().max(1)) {
+                    assert!(hive.remove(id).is_some());
+                    live.remove(&id);
+                }
+            }
+            6 => hive.shrink_to_fit(),
+            _ => hive = ConcurrentAppendHive::from(hive.into_hive()),
+        }
+        assert_eq!(hive.len(), live.len());
+        for id in &issued {
+            assert_eq!(hive.get(*id).copied(), live.get(id).copied(), "{id:?}");
+        }
+        assert_eq!(hive.iter().count(), live.len());
+    }
+    hive.shrink_to_fit();
+    let mut plain = hive.into_hive();
+    for id in &issued {
+        assert_eq!(plain.get(*id).copied(), live.get(id).copied());
+    }
+    for v in 0..20 {
+        assert!(!issued.contains(&plain.insert(v)));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: if cfg!(miri) { 4 } else { 256 }, ..ProptestConfig::default() })]
+    #[test]
+    fn shrink_to_fit_frees_reuses_and_never_revives(ops in prop::collection::vec((any::<u8>(), any::<u8>()), 0..120)) {
+        shrink_model(ops);
+    }
+}
+
+#[test]
+fn shrink_to_fit_frees_empty_pages_below_the_bound_only() {
+    let mut hive = ConcurrentAppendHive::<u32, 4>::new();
+    let ids: Vec<_> = (0..10).map(|v| hive.insert(v)).collect();
+    for &id in &ids {
+        assert!(hive.remove(id).is_some());
+    }
+    // Pages 0 and 1 are empty and below the bound (10); page 2 holds it.
+    hive.shrink_to_fit();
+    hive.shrink_to_fit(); // idempotent: freed pages stay queued once
+    let again: Vec<_> = (0..10).map(|v| hive.insert(v + 100)).collect();
+    let indices: BTreeSet<u32> = again.iter().map(|id| id.index()).collect();
+    // Page 2's two free slots (8, 9) first, then freed pages 0 and 1.
+    assert_eq!(indices, (0..10).collect());
+    assert_eq!(again[0].index(), 8);
+    assert_eq!(again[2].index(), 0);
+    for (id, old) in again.iter().zip(&ids) {
+        assert!(!ids.contains(id), "{id:?} revived ({old:?})");
+    }
+    assert_eq!(hive.index_bound(), 10);
+}

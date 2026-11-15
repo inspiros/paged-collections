@@ -175,6 +175,29 @@ impl<P, const CHUNKS: usize> Spine<P, CHUNKS> {
         })
     }
 
+    /// Takes page `page` out of the directory under exclusive access. Its
+    /// chunk stays allocated. A later shared `get_or_insert_with` may install
+    /// a new page there.
+    pub(crate) fn remove(&mut self, page: usize) -> Option<Box<P>> {
+        let (k, offset) = Self::location(page)?;
+        // Relaxed suffices: exclusive access rules out readers/installers.
+        let chunk = self.chunks[k].load(Ordering::Relaxed);
+        if chunk.is_null() {
+            return None;
+        }
+        // SAFETY: an installed chunk has BASE << k initialized cells, offset
+        // is within it, and &mut self excludes every other access.
+        let cell = unsafe { &*chunk.wrapping_add(offset) };
+        // Relaxed suffices under the directory's exclusive borrow.
+        let raw = cell.swap(ptr::null_mut(), Ordering::Relaxed);
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null cell uniquely owns one Box<P>; the swap above
+        // unlinked it, and exclusive access ends every borrow of it.
+        Some(unsafe { Box::from_raw(raw) })
+    }
+
     /// Frees every page and chunk. If a page's destructor panics, the
     /// remaining pages of that chunk are leaked (safe, not unsound).
     pub(crate) fn clear(&mut self) {

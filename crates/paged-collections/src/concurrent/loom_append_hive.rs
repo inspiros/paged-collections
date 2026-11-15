@@ -231,3 +231,61 @@ fn stale_stack_hint_cannot_claim_a_busy_factory_slot() {
         assert_eq!(hive.len(), 2);
     });
 }
+
+/// Interleavings of the recycled-page model where both inserts landed in the
+/// recycled page (the second popped the slot the first one pushed), and where
+/// the second went to a fresh page instead. Both must be reached.
+static RECYCLED_BOTH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RECYCLED_FRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[test]
+fn inserts_reuse_a_freed_page_without_reviving_its_ids() {
+    model(|| {
+        let mut hive = ConcurrentAppendHive::<Value, 2>::new();
+        let ids: alloc::vec::Vec<_> = (0..4).map(|tag| hive.insert(Value::new(tag))).collect();
+        hive.remove(ids[0]);
+        hive.remove(ids[1]);
+        hive.shrink_to_fit(); // frees page 0; page 1 stays full
+        let hive = Arc::new(hive);
+        let writer = hive.clone();
+        let stale = ids[0];
+        let a = thread::spawn(move || {
+            let id = writer.insert(Value::new(10));
+            writer.get(id).unwrap().check(10);
+            assert!(writer.get(stale).is_none());
+            id
+        });
+        thread::yield_now();
+        let b = hive.insert(Value::new(20));
+        hive.get(b).unwrap().check(20);
+        assert!(hive.get(ids[1]).is_none());
+        let a = a.join().unwrap();
+        assert_ne!(a, b);
+        hive.get(a).unwrap().check(10);
+        for id in [a, b] {
+            if id.index() < 2 {
+                assert_eq!(
+                    id.generation().get(),
+                    2,
+                    "recycled slots restart above their floor"
+                );
+            } else {
+                assert_eq!(id.index(), 4);
+            }
+        }
+        assert!(
+            a.index() < 2 || b.index() < 2,
+            "the freed page is reused first"
+        );
+        if a.index() < 2 && b.index() < 2 {
+            RECYCLED_BOTH.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            RECYCLED_FRESH.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert!(hive.get(stale).is_none() && hive.get(ids[1]).is_none());
+        hive.get(ids[2]).unwrap().check(2);
+        assert_eq!(hive.len(), 4);
+    });
+    assert!(RECYCLED_BOTH.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(RECYCLED_FRESH.load(std::sync::atomic::Ordering::Relaxed));
+}

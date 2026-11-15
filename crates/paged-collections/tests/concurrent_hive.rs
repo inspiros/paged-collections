@@ -1,4 +1,4 @@
-//! Guard ownership, counted destruction, exclusive recovery and a plain oracle.
+//! Guard ownership, counted destruction, exclusive recovery, conversions and a plain oracle.
 
 #![cfg(all(feature = "concurrent", not(loom)))]
 #![cfg(all(
@@ -18,7 +18,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use paged_collections::concurrent::{ConcurrentHive, Ref};
-use paged_collections::hive::Hive;
+use paged_collections::hive::{Hive, RawPage, RawSlot};
 use paged_collections::id_alloc::{Id, MAX_GENERATION};
 use proptest::prelude::*;
 
@@ -175,6 +175,238 @@ fn eight_threads_mix_inserts_guards_removes_takes_and_iteration() {
     assert_eq!(made.load(Ordering::SeqCst), drops.load(Ordering::SeqCst));
 }
 
+fn id(index: u32, generation: u32) -> Id {
+    Id::new(index, NonZeroU32::new(generation).unwrap())
+}
+
+#[test]
+fn conversion_round_trip_preserves_removed_reused_and_shrunken_history() {
+    let mut plain = Hive::<u32, 4>::with_capacity(32);
+    let original: Vec<_> = (0..12).map(|value| plain.insert(value)).collect();
+    let mut dead = Vec::new();
+    for &old in &original[..8] {
+        assert!(plain.remove(old).is_some());
+        dead.push(old);
+    }
+    for value in 20..25 {
+        let reused = plain.insert(value);
+        if value % 2 == 0 {
+            assert!(plain.remove(reused).is_some());
+            dead.push(reused);
+        }
+    }
+    plain.shrink_to_fit();
+    assert!(
+        plain
+            .raw_pages()
+            .any(|raw| raw.floor != 0 && raw.slots.is_empty())
+    );
+    plain.reserve(40);
+    let mut live: Vec<_> = plain.iter().map(|(id, value)| (id, *value)).collect();
+    let concurrent = ConcurrentHive::from(plain);
+    assert_eq!(concurrent.len(), live.len());
+    assert_eq!(
+        concurrent
+            .iter()
+            .map(|(id, v)| (id, *v))
+            .collect::<Vec<_>>(),
+        live
+    );
+    for &old in &dead {
+        assert!(concurrent.get(old).is_none());
+    }
+    // Check stale ids while filling reusable vacancies in shared storage.
+    for value in 60..90 {
+        let new = concurrent.insert(value);
+        assert!(!dead.contains(&new));
+        live.push((new, value));
+        for &old in &dead {
+            assert!(concurrent.get(old).is_none());
+        }
+    }
+    // Also carry a removal performed in the concurrent hive back to Hive.
+    let removed = concurrent.insert(99);
+    assert!(concurrent.remove(removed));
+    dead.push(removed);
+    assert_eq!(concurrent.len(), live.len());
+    let mut back = concurrent.into_hive();
+    assert_eq!(back.len(), live.len());
+    assert_eq!(back.iter().count(), live.len());
+    for &old in &dead {
+        assert!(back.get(old).is_none());
+    }
+    for (id, value) in live {
+        assert_eq!(back.get(id), Some(&value));
+    }
+    for value in 100..160 {
+        let new = back.insert(value);
+        assert!(!dead.contains(&new));
+        for &old in &dead {
+            assert!(back.get(old).is_none());
+        }
+    }
+}
+
+fn floor_fixture() -> Hive<u32, 4> {
+    Hive::try_from_raw_pages(vec![
+        RawPage {
+            floor: 0,
+            slots: vec![
+                RawSlot::Vacant { version: 0 },
+                RawSlot::Vacant { version: 4 },
+                RawSlot::Occupied {
+                    version: 3,
+                    value: 11,
+                },
+            ],
+        },
+        RawPage {
+            floor: 8,
+            slots: vec![],
+        },
+        RawPage {
+            floor: 0,
+            slots: vec![RawSlot::Occupied {
+                version: 1,
+                value: 22,
+            }],
+        },
+        RawPage {
+            floor: u32::MAX - 1,
+            slots: vec![],
+        },
+        RawPage {
+            floor: 0,
+            slots: vec![],
+        },
+    ])
+    .unwrap()
+}
+
+#[test]
+fn conversion_keeps_retirement_and_materializes_nonzero_page_floors() {
+    let mut dead = vec![
+        id(0, 1),
+        id(0, MAX_GENERATION),
+        id(1, 1),
+        id(1, 2),
+        id(2, 1),
+    ];
+    for index in 4..8 {
+        for generation in 1..=4 {
+            dead.push(id(index, generation));
+        }
+    }
+    for index in 12..16 {
+        dead.push(id(index, 1));
+        dead.push(id(index, MAX_GENERATION - 1));
+    }
+    // Exercise both immediate conversion back and inserts before conversion.
+    for insert_first in [false, true] {
+        let concurrent = ConcurrentHive::from(floor_fixture());
+        assert_eq!(concurrent.index_bound(), 16);
+        assert_eq!(concurrent.len(), 2);
+        assert_eq!(concurrent.get(id(2, 2)).map(|v| *v), Some(11));
+        assert_eq!(concurrent.get(id(8, 1)).map(|v| *v), Some(22));
+        for &old in &dead {
+            assert!(!concurrent.contains(old));
+        }
+        if insert_first {
+            let mut issued = BTreeSet::new();
+            for value in 100..120 {
+                let new = concurrent.insert(value);
+                assert!(issued.insert(new));
+                assert!(!dead.contains(&new));
+                assert_ne!(new.index(), 0);
+                if (4..8).contains(&new.index()) {
+                    assert_eq!(new.generation().get(), 5);
+                }
+                if (12..16).contains(&new.index()) {
+                    assert_eq!(new.generation().get(), MAX_GENERATION);
+                }
+            }
+            // Interior floor-zero holes spend never-issued generation 1 so
+            // that a popped zero state remains unambiguously retired.
+            for index in [3, 9, 10, 11] {
+                assert!(issued.contains(&id(index, 2)));
+            }
+            assert!((4..8).all(|index| issued.contains(&id(index, 5))));
+            assert!((12..16).all(|index| issued.contains(&id(index, MAX_GENERATION))));
+        }
+        let mut back = concurrent.into_hive();
+        assert_eq!(back.len(), if insert_first { 22 } else { 2 });
+        assert_eq!(back.get(id(2, 2)), Some(&11));
+        assert_eq!(back.get(id(8, 1)), Some(&22));
+        for value in 200..224 {
+            let new = back.insert(value);
+            assert!(!dead.contains(&new));
+            assert_ne!(new.index(), 0);
+            for &old in &dead {
+                assert!(!back.contains(old));
+            }
+        }
+        // Retire all final-generation slots, then preserve their zero states.
+        back.clear();
+        let concurrent = ConcurrentHive::from(back);
+        for &old in &dead {
+            assert!(!concurrent.contains(old));
+        }
+        for _ in 0..32 {
+            let new = concurrent.insert(0);
+            assert_ne!(new.index(), 0);
+            assert!(!(12..16).contains(&new.index()));
+        }
+    }
+}
+
+#[test]
+fn conversion_leaves_only_a_never_used_suffix_to_fresh_reservation() {
+    let plain = Hive::<u32, 4>::with_capacity(32);
+    let concurrent = ConcurrentHive::from(plain);
+    assert_eq!(concurrent.index_bound(), 0);
+    assert_eq!(concurrent.insert(1), id(0, 1));
+
+    let mut plain = Hive::<u32, 4>::with_capacity(32);
+    let first = plain.insert(1);
+    let concurrent = ConcurrentHive::from(plain);
+    assert_eq!(concurrent.index_bound(), 1);
+    assert_eq!(concurrent.get(first).map(|v| *v), Some(1));
+    assert_eq!(concurrent.insert(2), id(1, 1));
+    assert_eq!(concurrent.into_hive().get(first), Some(&1));
+}
+
+#[test]
+fn conversion_empty_hives_preserve_empty_state_and_stale_history() {
+    let plain = ConcurrentHive::<u32, 4>::new().into_hive();
+    assert!(plain.is_empty());
+    assert_eq!(plain.len(), 0);
+    let concurrent = ConcurrentHive::from(plain);
+    assert!(concurrent.is_empty());
+    assert_eq!(concurrent.len(), 0);
+    assert_eq!(concurrent.index_bound(), 0);
+
+    for shrink in [false, true] {
+        let mut plain = Hive::<u32, 4>::new();
+        let old = plain.insert(1);
+        assert_eq!(plain.remove(old), Some(1));
+        if shrink {
+            plain.shrink_to_fit();
+        }
+        let concurrent = ConcurrentHive::from(plain);
+        assert!(concurrent.is_empty());
+        assert_eq!(concurrent.len(), 0);
+        assert!(concurrent.get(old).is_none());
+        let mut back = concurrent.into_hive();
+        assert!(back.is_empty());
+        assert_eq!(back.len(), 0);
+        assert!(back.get(old).is_none());
+        for value in 0..16 {
+            assert_ne!(back.insert(value), old);
+            assert!(back.get(old).is_none());
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Counted {
     value: i32,
@@ -191,6 +423,48 @@ fn counted(value: i32, drops: &Arc<AtomicUsize>) -> Counted {
     Counted {
         value,
         drops: drops.clone(),
+    }
+}
+
+#[test]
+fn conversion_finalizes_marked_values_and_releases_forgotten_guards() {
+    for keep_live in [false, true] {
+        let marked_drops = Arc::new(AtomicUsize::new(0));
+        let live_drops = Arc::new(AtomicUsize::new(0));
+        let mut plain = Hive::<Counted, 2>::new();
+        let marked = plain.insert(counted(1, &marked_drops));
+        let live = keep_live.then(|| plain.insert(counted(2, &live_drops)));
+        let hive = ConcurrentHive::from(plain);
+        assert_eq!(hive.len(), 1 + usize::from(keep_live));
+        assert_eq!(marked_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(live_drops.load(Ordering::SeqCst), 0);
+        std::mem::forget(hive.get(marked).unwrap());
+        if let Some(live) = live {
+            std::mem::forget(hive.get(live).unwrap());
+        }
+        assert!(hive.remove(marked));
+        assert!(hive.get(marked).is_none());
+        assert_eq!(hive.len(), usize::from(keep_live));
+        assert_eq!(marked_drops.load(Ordering::SeqCst), 0);
+
+        let plain = hive.into_hive();
+        assert!(!plain.contains(marked));
+        assert_eq!(plain.len(), usize::from(keep_live));
+        assert_eq!(plain.iter().count(), plain.len());
+        assert_eq!(marked_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(live_drops.load(Ordering::SeqCst), 0);
+        if let Some(live) = live {
+            assert_eq!(plain.get(live).unwrap().value, 2);
+        }
+        let hive = ConcurrentHive::from(plain);
+        assert_eq!(hive.len(), usize::from(keep_live));
+        assert!(!hive.contains(marked));
+        if let Some(live) = live {
+            assert_eq!(hive.get(live).unwrap().value, 2);
+        }
+        drop(hive);
+        assert_eq!(marked_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(live_drops.load(Ordering::SeqCst), usize::from(keep_live));
     }
 }
 
@@ -586,4 +860,93 @@ proptest! {
             }
         }
     }
+}
+
+/// Random inserts, removals, shrinks and Hive round trips against an
+/// oracle: live ids keep their values, no issued id is ever issued again,
+/// and dead ids stay dead.
+fn shrink_model(ops: Vec<(u8, u8)>) {
+    let mut hive = ConcurrentHive::<u32, 4>::new();
+    let mut live: std::collections::BTreeMap<Id, u32> = std::collections::BTreeMap::new();
+    let mut issued: BTreeSet<Id> = BTreeSet::new();
+    let mut next = 0;
+    for (op, pick) in ops {
+        match op % 8 {
+            0..=3 => {
+                let id = hive.insert(next);
+                assert!(issued.insert(id), "{id:?} issued twice");
+                live.insert(id, next);
+                next += 1;
+            }
+            4 | 5 => {
+                if let Some(&id) = live.keys().nth(usize::from(pick) % live.len().max(1)) {
+                    assert!(hive.remove(id));
+                    live.remove(&id);
+                }
+            }
+            6 => hive.shrink_to_fit(),
+            _ => hive = ConcurrentHive::from(hive.into_hive()),
+        }
+        assert_eq!(hive.len(), live.len());
+        for id in &issued {
+            assert_eq!(hive.get(*id).map(|v| *v), live.get(id).copied(), "{id:?}");
+        }
+        assert_eq!(hive.iter().count(), live.len());
+    }
+    hive.shrink_to_fit();
+    let mut plain = hive.into_hive();
+    for id in &issued {
+        assert_eq!(plain.get(*id).copied(), live.get(id).copied());
+    }
+    for v in 0..20 {
+        assert!(!issued.contains(&plain.insert(v)));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: if cfg!(miri) { 4 } else { 256 }, ..ProptestConfig::default() })]
+    #[test]
+    fn shrink_to_fit_frees_reuses_and_never_revives(ops in prop::collection::vec((any::<u8>(), any::<u8>()), 0..120)) {
+        shrink_model(ops);
+    }
+}
+
+#[test]
+fn shrink_to_fit_frees_empty_pages_below_the_bound_only() {
+    let mut hive = ConcurrentHive::<u32, 4>::new();
+    let ids: Vec<_> = (0..10).map(|v| hive.insert(v)).collect();
+    for &id in &ids {
+        assert!(hive.remove(id));
+    }
+    // Pages 0 and 1 are empty and below the bound (10); page 2 holds it.
+    hive.shrink_to_fit();
+    hive.shrink_to_fit(); // idempotent: freed pages stay queued once
+    let again: Vec<_> = (0..10).map(|v| hive.insert(v + 100)).collect();
+    let indices: BTreeSet<u32> = again.iter().map(|id| id.index()).collect();
+    // Page 2's two free slots (8, 9) first, then freed pages 0 and 1.
+    assert_eq!(indices, (0..10).collect());
+    assert_eq!(again[0].index(), 8);
+    assert_eq!(again[2].index(), 0);
+    for (id, old) in again.iter().zip(&ids) {
+        assert!(!ids.contains(id), "{id:?} revived ({old:?})");
+    }
+    assert_eq!(hive.index_bound(), 10);
+}
+
+#[test]
+fn shrink_to_fit_finalizes_forgotten_guards_once() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut hive = ConcurrentHive::<Counted, 2>::new();
+    let ids: Vec<_> = (0..4).map(|v| hive.insert(counted(v, &drops))).collect();
+    std::mem::forget(hive.get(ids[0]).unwrap());
+    assert!(hive.remove(ids[0])); // marked: the forgotten guard pins it
+    assert!(hive.remove(ids[1]));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    hive.shrink_to_fit(); // finalizes ids[0], then frees page 0
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    let id = hive.insert(counted(9, &drops));
+    assert_eq!(id.index(), 0);
+    assert!(hive.get(ids[0]).is_none());
+    drop(hive);
+    assert_eq!(drops.load(Ordering::SeqCst), 5);
 }

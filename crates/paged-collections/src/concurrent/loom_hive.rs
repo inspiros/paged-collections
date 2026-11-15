@@ -1,5 +1,8 @@
 //! Bounded explorations of guard publication, removal, reuse and extraction.
 
+#[cfg(not(feature = "std"))]
+extern crate std;
+
 use alloc::vec::Vec;
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
@@ -280,4 +283,67 @@ fn stale_stack_hint_cannot_claim_a_mid_drop_cell() {
         drop(hive);
         assert_eq!(drops.load(Ordering::SeqCst), 3);
     });
+}
+
+/// Interleavings of the recycled-page model where both inserts landed in the
+/// recycled page, and where the second went to a fresh page. Both must occur.
+static RECYCLED_BOTH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RECYCLED_FRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[test]
+fn inserts_reuse_a_freed_page_without_reviving_its_ids() {
+    model(|| {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let value = |tag| Value {
+            tag,
+            drops: drops.clone(),
+        };
+        let mut hive = ConcurrentHive::<Value, 2>::new();
+        let ids: Vec<_> = (0..4).map(|tag| hive.insert(value(tag))).collect();
+        assert!(hive.remove(ids[0]));
+        assert!(hive.remove(ids[1]));
+        hive.shrink_to_fit(); // frees page 0; page 1 stays full
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        let hive = Arc::new(hive);
+        let writer = hive.clone();
+        let stale = ids[0];
+        let made = value(10);
+        let a = thread::spawn(move || {
+            let id = writer.insert(made);
+            assert_eq!(writer.get(id).unwrap().tag, 10);
+            assert!(writer.get(stale).is_none());
+            id
+        });
+        thread::yield_now();
+        let b = hive.insert(value(20));
+        assert_eq!(hive.get(b).unwrap().tag, 20);
+        assert!(hive.get(ids[1]).is_none());
+        let a = a.join().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(hive.get(a).unwrap().tag, 10);
+        for id in [a, b] {
+            if id.index() < 2 {
+                assert_eq!(
+                    id.generation().get(),
+                    2,
+                    "recycled slots restart above their floor"
+                );
+            } else {
+                assert_eq!(id.index(), 4);
+            }
+        }
+        assert!(
+            a.index() < 2 || b.index() < 2,
+            "the freed page is reused first"
+        );
+        if a.index() < 2 && b.index() < 2 {
+            RECYCLED_BOTH.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            RECYCLED_FRESH.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(hive.get(ids[2]).unwrap().tag, 2);
+        assert_eq!(hive.len(), 4);
+    });
+    assert!(RECYCLED_BOTH.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(RECYCLED_FRESH.load(std::sync::atomic::Ordering::Relaxed));
 }

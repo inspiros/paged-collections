@@ -123,6 +123,13 @@ impl FreeStack {
         self.next_fresh.load(Ordering::Relaxed)
     }
 
+    /// Empties the stack under exclusive access; the fresh bound is kept.
+    /// No pop can be in flight, so no stale link can be followed later.
+    pub(crate) fn reset(&mut self) {
+        // Relaxed: exclusive access rules out concurrent pushes and pops.
+        self.head.0.store(NONE as u64, Ordering::Relaxed);
+    }
+
     /// Sets the fresh-index boundary during exclusive construction only.
     pub(crate) fn set_next_fresh(&mut self, bound: u32) {
         debug_assert_eq!(self.index_bound(), 0);

@@ -223,6 +223,7 @@ mod id_alloc;
 mod index;
 mod lock;
 mod radix;
+mod recycle;
 mod sparse;
 mod spine;
 mod vec;
