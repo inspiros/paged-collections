@@ -96,6 +96,25 @@ let in_range: Vec<u32> = score.range(a..=b).map(|(_, &s)| s).collect();
 assert_eq!(in_range, [10, 20]);
 ```
 
+`Hive::id_of` turns a reference to an element back into its id, by address,
+in time proportional to the number of pages. To visit elements in order,
+`sorted_ids` (and `_by`, `_by_key`) returns the live ids sorted by element
+and moves nothing. `sort` (and `_by`, `_by_key`) instead reorders the
+elements across the occupied slots, so iteration yields them sorted. Ids
+name slots, so after `sort` each id names whatever element moved into its
+slot.
+
+```rust
+use paged_collections::hive::Hive;
+
+let mut hive: Hive<u32> = Hive::new();
+let (x, y) = (hive.insert(30), hive.insert(10));
+assert_eq!(hive.id_of(&hive[y]), Some(y));
+assert_eq!(hive.sorted_ids(), [y, x]); // ids follow their elements
+hive.sort();
+assert_eq!(hive[x], 10);               // ids now name sorted slots
+```
+
 ## Concurrent
 
 The `concurrent` feature adds separate types for shared (`&self`) mutation
@@ -115,7 +134,10 @@ under `&mut self` or on drop, so no epochs or hazard pointers are needed.
 | `ConcurrentIdAllocator` | allocate, free | Generational ids, as `IdAllocator` |
 
 Each type converts to and from its plain counterpart under exclusive
-ownership (`into_inner`, `From`). The sparse types, `ConcurrentDirectMap` and
+ownership (`into_inner`, or `into_hive` for the hives, and `From`), keeping
+every id and generation. Under `&mut self`, `shrink_to_fit` on both hives
+frees pages that are wholly empty. Later shared inserts reuse those pages
+with generations above any id they ever held, so a stale id stays dead. The sparse types, `ConcurrentDirectMap` and
 `AtomicDirectMap` take a final `SharedDirectory` parameter: `page::Flat` by
 default, or `page::Radix` for keys anywhere in the `usize` range.
 `page::Tree` has no concurrent form.
