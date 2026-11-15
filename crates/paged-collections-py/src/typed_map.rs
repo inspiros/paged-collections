@@ -1,6 +1,7 @@
 //! `SparseMapF64` and friends: `PagedSparseMap<u32, T>` for NumPy dtypes `T`;
 //! `IdMapF64` and friends: the same keyed by `Id`.
 
+use crate::storage::MapInner;
 use numpy::PyArray1;
 use paged_collections::sparse_map::PagedSparseMap;
 use pyo3::IntoPyObjectExt;
@@ -21,8 +22,8 @@ use paged_collections::id_alloc::Id;
 /// A key counts as new if the map did not hold it (exactly) before it was
 /// written, so an id that evicts another generation of its slot is new,
 /// although the length does not change.
-pub(crate) fn write_batch<K: PyKey, V>(
-    map: &mut PagedSparseMap<K, V>,
+pub(crate) fn write_batch<K: PyKey, V, const PAGE: usize>(
+    map: &mut PagedSparseMap<K, V, PAGE>,
     exports: &Exports,
     type_name: &str,
     keys: Vec<K>,
@@ -45,8 +46,8 @@ pub(crate) fn write_batch<K: PyKey, V>(
 /// As [`write_batch`], for maps whose values are atomic cells that may be
 /// exported: existing values are written with `ValueCell::set`, never through a
 /// `&mut` (see the invariants in [`crate::export`]).
-fn write_cells<K: PyKey, T: TypedValue>(
-    map: &mut PagedSparseMap<K, ValueCell<T>>,
+fn write_cells<K: PyKey, T: TypedValue, const PAGE: usize>(
+    map: &mut PagedSparseMap<K, ValueCell<T>, PAGE>,
     exports: &Exports,
     type_name: &str,
     keys: Vec<K>,
@@ -114,7 +115,7 @@ macro_rules! typed_map {
         pub(crate) struct $name {
             /// Values are atomic cells so they can be exported to NumPy and still
             /// be written by Rust (see [`crate::export`]).
-            map: PagedSparseMap<$K, ValueCell<$t>>,
+            map: MapInner<$K, ValueCell<$t>>,
             exports: Exports,
             /// Changes on every structural change, so iterators can detect them.
             mods: u64,
@@ -123,7 +124,7 @@ macro_rules! typed_map {
         impl $name {
             fn empty() -> Self {
                 Self {
-                    map: PagedSparseMap::new(),
+                    map: MapInner::default(),
                     exports: Exports::default(),
                     mods: 0,
                 }
@@ -144,7 +145,7 @@ macro_rules! typed_map {
             ) -> PyResult<usize> {
                 let keys = KeyBatch::<$K>::new(keys)?.to_insert_keys()?;
                 let values = value_batch::<$t>(values, keys.len())?;
-                let new = write_cells(&mut self.map, &self.exports, $pyname, keys, values)?;
+                let new = paged!(MapInner, &mut self.map, map => write_cells(map, &self.exports, $pyname, keys, values))?;
                 if new > 0 {
                     self.changed();
                 }
@@ -164,17 +165,23 @@ macro_rules! typed_map {
             // `__new__` accepts and ignores any arguments, so subclasses can
             // define their own `__init__`; `__init__` fills the map.
             #[new]
-            #[pyo3(signature = (*_args, **_kwargs), text_signature = "(keys=None, values=None)")]
+            #[pyo3(signature = (*_args, **_kwargs), text_signature = "(keys=None, values=None, *, page_size=DEFAULT_PAGE_SIZE)")]
             fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
                 Self::empty()
             }
 
-            #[pyo3(signature = (keys = None, values = None))]
+            #[pyo3(signature = (keys = None, values = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
             fn __init__(
                 &mut self,
                 keys: Option<&Bound<'_, PyAny>>,
                 values: Option<&Bound<'_, PyAny>>,
+                #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
             ) -> PyResult<()> {
+                if self.map.page_size() != page_size {
+                    self.exports.check($pyname)?;
+                    self.map.set_page_size(page_size)?;
+                    self.changed();
+                }
                 match (keys, values) {
                     (None, None) => Ok(()),
                     (Some(keys), Some(values)) => self.set_batch(keys, values).map(drop),
@@ -227,7 +234,7 @@ macro_rules! typed_map {
                 let py = slf.py();
                 let this = slf.try_borrow()?;
                 let items = repr_items(this.map.iter().map(|(&k, v)| (k.to_bits(), v.get())), py)?;
-                Ok(format!("{}({{{items}}})", slf.get_type().name()?))
+                Ok(format!("{}({{{items}}}{})", slf.get_type().name()?, crate::page_size_repr(slf.try_borrow()?.map.page_size())))
             }
 
             fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
@@ -465,6 +472,10 @@ macro_rules! typed_map {
             fn allocated_pages(&self) -> usize {
                 self.map.allocated_pages()
             }
+
+            /// Slots per page for this instance.
+            #[getter]
+            fn page_size(&self) -> usize { self.map.page_size() }
 
             /// The NumPy dtype name of the values.
             #[classattr]

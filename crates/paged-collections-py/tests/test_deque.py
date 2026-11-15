@@ -121,7 +121,7 @@ def test_basic_api():
     assert len(d) == 4
     c = d.copy()
     assert c == d and c.maxlen == d.maxlen and c is not d
-    assert pc.PagedDeque.page_size == 1024
+    assert pc.PagedDeque().page_size == 1024
     assert pc.PagedDeque[int] is not None
 
 

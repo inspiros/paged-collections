@@ -1,5 +1,6 @@
 //! `DirectMap`: `PagedDirectMap<u32, Py<PyAny>>`, for arbitrary values.
 
+use crate::storage::DirectInner;
 use numpy::PyArray1;
 use paged_collections::direct_map::PagedDirectMap;
 use pyo3::IntoPyObjectExt;
@@ -61,7 +62,11 @@ fn query_bounds(
 }
 
 /// Write a fully validated batch. Duplicate keys keep their last value.
-fn write_batch<V>(map: &mut PagedDirectMap<Key, V>, keys: Vec<Key>, values: Vec<V>) -> usize {
+fn write_batch<V, const PAGE: usize>(
+    map: &mut PagedDirectMap<Key, V, PAGE>,
+    keys: Vec<Key>,
+    values: Vec<V>,
+) -> usize {
     debug_assert_eq!(keys.len(), values.len());
     let before = map.len();
     for (key, value) in keys.into_iter().zip(values) {
@@ -83,7 +88,7 @@ fn write_batch<V>(map: &mut PagedDirectMap<Key, V>, keys: Vec<Key>, values: Vec<
     weakref
 )]
 pub(crate) struct DirectMap {
-    map: PagedDirectMap<Key, Py<PyAny>>,
+    map: DirectInner<Py<PyAny>>,
     /// Changes on every structural change, so iterators can detect them.
     mods: u64,
 }
@@ -91,7 +96,7 @@ pub(crate) struct DirectMap {
 impl DirectMap {
     fn empty() -> Self {
         Self {
-            map: PagedDirectMap::new(),
+            map: DirectInner::default(),
             mods: 0,
         }
     }
@@ -121,7 +126,7 @@ impl DirectMap {
                 keys.len()
             )));
         }
-        let new = write_batch(&mut self.map, keys, values);
+        let new = paged!(DirectInner, &mut self.map, map => write_batch(map, keys, values));
         if new > 0 {
             self.changed();
         }
@@ -140,17 +145,22 @@ impl DirectMap {
     // `__new__` accepts and ignores any arguments, so subclasses can define
     // their own `__init__`; `__init__` fills the collection, as for `dict`.
     #[new]
-    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(keys=None, values=None)")]
+    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(keys=None, values=None, *, page_size=DEFAULT_PAGE_SIZE)")]
     fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
         Self::empty()
     }
 
-    #[pyo3(signature = (keys = None, values = None))]
+    #[pyo3(signature = (keys = None, values = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
     fn __init__(
         &mut self,
         keys: Option<&Bound<'_, PyAny>>,
         values: Option<&Bound<'_, PyAny>>,
+        #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
     ) -> PyResult<()> {
+        if self.map.page_size() != page_size {
+            self.map.set_page_size(page_size)?;
+            self.changed();
+        }
         match (keys, values) {
             (None, None) => Ok(()),
             (Some(keys), Some(values)) => self.set_batch(keys, values).map(drop),
@@ -222,7 +232,10 @@ impl DirectMap {
         crate::repr_guarded(slf.as_any(), &name, || {
             let this = slf.try_borrow()?;
             let items = repr_items(this.map.iter().map(|(k, v)| (k, v.bind(py).clone())), py)?;
-            Ok(format!("{name}({{{items}}})"))
+            Ok(format!(
+                "{name}({{{items}}}{})",
+                crate::page_size_repr(slf.try_borrow()?.map.page_size())
+            ))
         })
     }
 
@@ -243,7 +256,7 @@ impl DirectMap {
 
     /// Return a shallow copy: the values are shared, not copied.
     fn copy(&self, py: Python<'_>) -> Self {
-        let mut map = PagedDirectMap::new();
+        let mut map = self.map.same_size_empty();
         for (key, value) in self.map.iter() {
             map.insert(key, value.clone_ref(py));
         }
@@ -559,6 +572,12 @@ impl DirectMap {
         self.changed();
     }
 
+    /// Slots per page for this instance.
+    #[getter]
+    fn page_size(&self) -> usize {
+        self.map.page_size()
+    }
+
     /// Values are arbitrary Python objects.
     #[classattr]
     fn dtype() -> &'static str {
@@ -580,7 +599,7 @@ macro_rules! typed_direct_map {
         )]
         #[pyclass(module = "paged_collections._core", name = $pyname, subclass)]
         pub(crate) struct $name {
-            map: PagedDirectMap<Key, $t>,
+            map: DirectInner<$t>,
             /// Changes on every structural change, so iterators can detect them.
             mods: u64,
         }
@@ -588,7 +607,7 @@ macro_rules! typed_direct_map {
         impl $name {
             fn empty() -> Self {
                 Self {
-                    map: PagedDirectMap::new(),
+                    map: DirectInner::default(),
                     mods: 0,
                 }
             }
@@ -612,7 +631,7 @@ macro_rules! typed_direct_map {
             ) -> PyResult<usize> {
                 let keys = KeyBatch::new(keys)?.to_insert_keys()?;
                 let values = value_batch::<$t>(values, keys.len())?;
-                let new = write_batch(&mut self.map, keys, values);
+                let new = paged!(DirectInner, &mut self.map, map => write_batch(map, keys, values));
                 if new > 0 {
                     self.changed();
                 }
@@ -631,17 +650,22 @@ macro_rules! typed_direct_map {
             // `__new__` accepts and ignores any arguments, so subclasses can
             // define their own `__init__`; `__init__` fills the map.
             #[new]
-            #[pyo3(signature = (*_args, **_kwargs), text_signature = "(keys=None, values=None)")]
+            #[pyo3(signature = (*_args, **_kwargs), text_signature = "(keys=None, values=None, *, page_size=DEFAULT_PAGE_SIZE)")]
             fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
                 Self::empty()
             }
 
-            #[pyo3(signature = (keys = None, values = None))]
+            #[pyo3(signature = (keys = None, values = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
             fn __init__(
                 &mut self,
                 keys: Option<&Bound<'_, PyAny>>,
                 values: Option<&Bound<'_, PyAny>>,
+                #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
             ) -> PyResult<()> {
+                if self.map.page_size() != page_size {
+                    self.map.set_page_size(page_size)?;
+                    self.changed();
+                }
                 match (keys, values) {
                     (None, None) => Ok(()),
                     (Some(keys), Some(values)) => self.set_batch(keys, values).map(drop),
@@ -693,7 +717,7 @@ macro_rules! typed_direct_map {
                 let py = slf.py();
                 let this = slf.try_borrow()?;
                 let items = repr_items(this.map.iter().map(|(k, v)| (k, *v)), py)?;
-                Ok(format!("{}({{{items}}})", slf.get_type().name()?))
+                Ok(format!("{}({{{items}}}{})", slf.get_type().name()?, crate::page_size_repr(slf.try_borrow()?.map.page_size())))
             }
 
             fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
@@ -967,6 +991,10 @@ macro_rules! typed_direct_map {
             fn allocated_pages(&self) -> usize {
                 self.map.allocated_pages()
             }
+
+            /// Slots per page for this instance.
+            #[getter]
+            fn page_size(&self) -> usize { self.map.page_size() }
 
             /// The NumPy dtype name of the values.
             #[classattr]

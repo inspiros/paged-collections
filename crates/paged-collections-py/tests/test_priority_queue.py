@@ -102,7 +102,7 @@ def test_basic(cls):
     with pytest.raises(IndexError):
         q.peek()
     assert not q
-    assert cls.page_size == 1024
+    assert cls().page_size == 1024
 
 
 def test_constructor_accepts_mapping_inputs(cls):

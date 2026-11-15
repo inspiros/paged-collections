@@ -41,7 +41,7 @@ def check_model(hive, model, dead):
     for key in list(dead)[-10:]:
         assert key not in hive
         assert hive.get(key, "absent") == "absent"
-    assert hive.capacity == hive.allocated_pages * Hive.page_size
+    assert hive.capacity == hive.allocated_pages * hive.page_size
     assert hive.capacity >= len(hive)
     assert hive.is_exhausted is False
 
@@ -134,7 +134,7 @@ def test_random_history_model(seed):
 
 def test_basics_reuse_batches_and_side_map():
     assert "Hive" in pc.__all__ and not hasattr(pc, "HiveIterator")
-    assert Hive.dtype == "object" and Hive.page_size == 1024
+    assert Hive.dtype == "object" and Hive().page_size == 1024
     hive = Hive(["a", "b", "c"])
     first, second, third = hive.ids().tolist()
     assert repr(hive) == f"Hive({{{first}: 'a', {second}: 'b', {third}: 'c'}})"

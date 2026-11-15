@@ -36,6 +36,8 @@ from typing import Any
 import numpy as np
 
 from paged_collections._core import (
+    DEFAULT_PAGE_SIZE,
+    PAGE_SIZES,
     KEY_LIMIT,
     MAX_GENERATION,
     MAX_INDICES,
@@ -151,7 +153,7 @@ def _map_class(dtype: Any, object_class: Any, typed_maps: dict, kind: str) -> An
     raise TypeError(f"no {kind} map for dtype {resolved}; supported: object, {supported}")
 
 
-def paged_list(dtype: Any = None, values: Any = None) -> Any:
+def paged_list(dtype: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
     """Create a paged list of objects or values of the given NumPy dtype.
 
     Supported typed dtypes are float64, float32, int64, int32, uint64,
@@ -168,10 +170,10 @@ def paged_list(dtype: Any = None, values: Any = None) -> Any:
         else:
             supported = ", ".join(str(d) for d in _TYPED_LISTS)
             raise TypeError(f"no paged list for dtype {resolved}; supported: object, {supported}")
-    return cls() if values is None else cls(values)
+    return cls(page_size=page_size) if values is None else cls(values, page_size=page_size)
 
 
-def sparse_map(dtype: Any = None, keys: Any = None, values: Any = None) -> Any:
+def sparse_map(dtype: Any = None, keys: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
     """Create a map whose values have ``dtype``.
 
     ``dtype=None`` or ``object`` gives a ``SparseMap`` of arbitrary objects.
@@ -181,11 +183,11 @@ def sparse_map(dtype: Any = None, keys: Any = None, values: Any = None) -> Any:
     """
     cls = _map_class(dtype, SparseMap, _TYPED_MAPS, "sparse")
     if keys is None and values is None:
-        return cls()
-    return cls(keys, values)
+        return cls(page_size=page_size)
+    return cls(keys, values, page_size=page_size)
 
 
-def id_map(dtype: Any = None, keys: Any = None, values: Any = None) -> Any:
+def id_map(dtype: Any = None, keys: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
     """Create a generational-id map whose values have ``dtype``.
 
     ``dtype=None`` or ``object`` gives an ``IdMap`` of arbitrary objects.
@@ -195,11 +197,11 @@ def id_map(dtype: Any = None, keys: Any = None, values: Any = None) -> Any:
     """
     cls = _map_class(dtype, IdMap, _TYPED_ID_MAPS, "id")
     if keys is None and values is None:
-        return cls()
-    return cls(keys, values)
+        return cls(page_size=page_size)
+    return cls(keys, values, page_size=page_size)
 
 
-def direct_map(dtype: Any = None, keys: Any = None, values: Any = None) -> Any:
+def direct_map(dtype: Any = None, keys: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
     """Create an ordered direct map whose values have ``dtype``.
 
     ``dtype=None`` or ``object`` gives a ``DirectMap`` of arbitrary objects.
@@ -210,11 +212,13 @@ def direct_map(dtype: Any = None, keys: Any = None, values: Any = None) -> Any:
     """
     cls = _map_class(dtype, DirectMap, _TYPED_DIRECT_MAPS, "direct")
     if keys is None and values is None:
-        return cls()
-    return cls(keys, values)
+        return cls(page_size=page_size)
+    return cls(keys, values, page_size=page_size)
 
 
 __all__ = [
+    "DEFAULT_PAGE_SIZE",
+    "PAGE_SIZES",
     "KEY_LIMIT",
     "MAX_GENERATION",
     "MAX_INDICES",

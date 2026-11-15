@@ -15,7 +15,7 @@ use pyo3::{PyTraverseError, PyVisit};
 use crate::convert::{TypedValue, as_ndarray, cast_to, value_batch};
 use crate::export::{Exports, ValueCell, cell_view};
 
-const PAGE: usize = 1024;
+use crate::storage::ListInner;
 
 /// Convert before borrowing: `__index__` can run arbitrary Python code.
 /// Saturation is useful for insertion/search bounds and preserves out-of-range
@@ -40,7 +40,12 @@ fn strict_index(obj: &Bound<'_, PyAny>) -> PyResult<isize> {
 /// Replaces the `n` elements at `start..start + n` with `vals` and returns
 /// the removed ones, in O(len - start) moves (never O(len * n)). The caller
 /// reserves room for any growth first.
-fn splice<T>(list: &mut PagedVec<T>, start: usize, n: usize, vals: Vec<T>) -> Vec<T> {
+fn splice<T, const PAGE: usize>(
+    list: &mut PagedVec<T, PAGE>,
+    start: usize,
+    n: usize,
+    vals: Vec<T>,
+) -> Vec<T> {
     let mut tail = list.split_off(start + n);
     let removed = list.drain(start..).collect();
     list.extend(vals);
@@ -50,7 +55,10 @@ fn splice<T>(list: &mut PagedVec<T>, start: usize, n: usize, vals: Vec<T>) -> Ve
 
 /// Removes the elements at `positions` (distinct, any order) and returns
 /// them, keeping the order of the rest, in O(len - min(positions)) moves.
-fn remove_positions<T>(list: &mut PagedVec<T>, mut positions: Vec<usize>) -> Vec<T> {
+fn remove_positions<T, const PAGE: usize>(
+    list: &mut PagedVec<T, PAGE>,
+    mut positions: Vec<usize>,
+) -> Vec<T> {
     positions.sort_unstable();
     let Some(&lo) = positions.first() else {
         return Vec::new();
@@ -305,12 +313,12 @@ macro_rules! list_iterator {
     };
 }
 
-/// A list stored in pages of 1024 elements. Appending never moves existing
+/// A list stored in pages of configurable size. Appending never moves existing
 /// elements. Slices are copies. Typed variants offer zero-copy NumPy access
 /// per page through ``page_view``.
 #[pyclass(module = "paged_collections._core", subclass, weakref)]
 pub(crate) struct PagedList {
-    list: PagedVec<Py<PyAny>>,
+    list: ListInner<Py<PyAny>>,
     /// Every mutation, including value replacement, invalidates an in-flight sort.
     mods: u64,
 }
@@ -318,7 +326,7 @@ pub(crate) struct PagedList {
 impl PagedList {
     fn empty() -> Self {
         Self {
-            list: PagedVec::new(),
+            list: ListInner::default(),
             mods: 0,
         }
     }
@@ -328,8 +336,11 @@ impl PagedList {
     fn snapshot(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
         self.list.iter().map(|v| v.clone_ref(py)).collect()
     }
-    fn from_values(values: Vec<Py<PyAny>>) -> PyResult<Self> {
-        let mut out = Self::empty();
+    fn from_values(values: Vec<Py<PyAny>>, page_size: usize) -> PyResult<Self> {
+        let mut out = Self {
+            list: ListInner::new(page_size)?,
+            mods: 0,
+        };
         out.list
             .try_reserve(values.len())
             .map_err(crate::reserve_error)?;
@@ -363,15 +374,29 @@ impl PagedList {
 #[pymethods]
 impl PagedList {
     #[new]
-    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(values=None)")]
+    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(values=None, *, page_size=DEFAULT_PAGE_SIZE)")]
     fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
         Self::empty()
     }
 
-    #[pyo3(signature = (values=None))]
-    fn __init__(slf: &Bound<'_, Self>, values: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    #[pyo3(signature = (values=None, *, page_size=crate::DEFAULT_PAGE_SIZE))]
+    fn __init__(
+        slf: &Bound<'_, Self>,
+        values: Option<&Bound<'_, PyAny>>,
+        #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
+    ) -> PyResult<()> {
         // As `list.__init__`: always starts from empty.
+        let replacement = ListInner::new(page_size)?;
         Self::clear(slf)?;
+        if slf.try_borrow()?.list.page_size() != page_size {
+            // clear drops objects outside the borrow; callbacks may append.
+            // Preserve those values while switching the empty storage policy.
+            let values = slf.try_borrow()?.snapshot(slf.py());
+            let mut this = slf.try_borrow_mut()?;
+            this.list = replacement;
+            this.list.extend(values);
+            this.changed();
+        }
         match values {
             Some(values) => Self::extend(slf, values),
             None => Ok(()),
@@ -401,7 +426,11 @@ impl PagedList {
                         .map(|i| this.list.get(i).unwrap().clone_ref(py))
                         .collect()
                 };
-                Ok(Bound::new(py, Self::from_values(vals)?)?.into_any())
+                Ok(Bound::new(
+                    py,
+                    Self::from_values(vals, slf.try_borrow()?.list.page_size())?,
+                )?
+                .into_any())
             }
         }
     }
@@ -436,7 +465,7 @@ impl PagedList {
                         .try_reserve(vals.len().saturating_sub(s.slicelength))
                         .map_err(crate::reserve_error)?;
                     let removed = if s.step == 1 {
-                        splice(&mut this.list, s.start as usize, s.slicelength, vals)
+                        paged!(ListInner, &mut this.list, list => splice(list, s.start as usize, s.slicelength, vals))
                     } else {
                         slice_positions(&s)
                             .zip(vals)
@@ -463,7 +492,7 @@ impl PagedList {
                 }
                 Subscript::Slice(slice) => {
                     let s = slice.indices(this.list.len() as isize)?;
-                    remove_positions(&mut this.list, slice_positions(&s).collect())
+                    paged!(ListInner, &mut this.list, list => remove_positions(list, slice_positions(&s).collect()))
                 }
             };
             this.changed();
@@ -572,9 +601,12 @@ impl PagedList {
         };
         let mut vals = slf.try_borrow()?.snapshot(slf.py());
         vals.extend(other.try_borrow()?.snapshot(slf.py()));
-        Ok(Bound::new(slf.py(), Self::from_values(vals)?)?
-            .into_any()
-            .unbind())
+        Ok(Bound::new(
+            slf.py(),
+            Self::from_values(vals, slf.try_borrow()?.list.page_size())?,
+        )?
+        .into_any()
+        .unbind())
     }
     fn __iadd__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> {
         Self::extend(slf, other)
@@ -582,11 +614,11 @@ impl PagedList {
     fn __mul__(slf: &Bound<'_, Self>, n: &Bound<'_, PyAny>) -> PyResult<Self> {
         let n = strict_index(n)?;
         if n <= 0 {
-            return Ok(Self::empty());
+            return Self::from_values(Vec::new(), slf.try_borrow()?.list.page_size());
         }
         let vals = slf.try_borrow()?.snapshot(slf.py());
         let total = repeat_len(vals.len(), n)?;
-        let mut out = Self::empty();
+        let mut out = Self::from_values(Vec::new(), slf.try_borrow()?.list.page_size())?;
         out.list.try_reserve(total).map_err(crate::reserve_error)?;
         for _ in 0..if vals.is_empty() { 0 } else { n.max(0) } {
             out.list.extend(vals.iter().map(|v| v.clone_ref(slf.py())));
@@ -682,7 +714,7 @@ impl PagedList {
         self.changed();
     }
     fn copy(&self, py: Python<'_>) -> PyResult<Self> {
-        Self::from_values(self.snapshot(py))
+        Self::from_values(self.snapshot(py), self.list.page_size())
     }
     #[pyo3(signature = (*, key=None, reverse=false))]
     fn sort(
@@ -741,9 +773,9 @@ impl PagedList {
     fn dtype() -> &'static str {
         "object"
     }
-    #[classattr]
-    fn page_size() -> usize {
-        PAGE
+    #[getter]
+    fn page_size(&self) -> usize {
+        self.list.page_size()
     }
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
         let name = slf.get_type().name()?.to_string();
@@ -766,7 +798,11 @@ impl PagedList {
             if more {
                 parts.push("...".to_owned());
             }
-            Ok(format!("{name}([{}])", parts.join(", ")))
+            Ok(format!(
+                "{name}([{}]{})",
+                parts.join(", "),
+                crate::page_size_repr(slf.try_borrow()?.list.page_size())
+            ))
         })
     }
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
@@ -779,7 +815,7 @@ impl PagedList {
         )
     }
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        for value in &self.list {
+        for value in self.list.iter() {
             visit.call(value)?;
         }
         Ok(())
@@ -810,19 +846,19 @@ fn numeric_order<T: PartialOrd>(a: T, b: T) -> Ordering {
 
 macro_rules! typed_list {
     ($name:ident, $iter:ident, $pyname:literal, $t:ty, $writeable:literal) => {
-        #[doc = concat!("A list of ``", stringify!($t), "`` stored in pages of 1024 elements. ",
+        #[doc = concat!("A list of ``", stringify!($t), "`` stored in pages of configurable size. ",
             "Appending never moves existing elements; slices are copies. ",
             "Zero-copy NumPy access is per page via ``page_view``. While views exist, ",
             "appending and value writes are allowed; removing or moving elements raises BufferError.")]
         #[pyclass(module = "paged_collections._core", name = $pyname, subclass)]
         pub(crate) struct $name {
-            list: PagedVec<ValueCell<$t>>,
+            list: ListInner<ValueCell<$t>>,
             exports: Exports,
         }
         impl $name {
-            fn empty() -> Self { Self { list: PagedVec::new(), exports: Exports::default() } }
-            fn from_values(vals: Vec<$t>) -> PyResult<Self> {
-                let mut out = Self::empty();
+            fn empty() -> Self { Self { list: ListInner::default(), exports: Exports::default() } }
+            fn from_values(vals: Vec<$t>, page_size: usize) -> PyResult<Self> {
+                let mut out = Self { list: ListInner::new(page_size)?, exports: Exports::default() };
                 out.extend_values(vals)?;
                 Ok(out)
             }
@@ -840,10 +876,10 @@ macro_rules! typed_list {
         #[pymethods]
         impl $name {
             #[new]
-            #[pyo3(signature = (*_args, **_kwargs), text_signature = "(values=None)")]
+            #[pyo3(signature = (*_args, **_kwargs), text_signature = "(values=None, *, page_size=DEFAULT_PAGE_SIZE)")]
             fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self { Self::empty() }
-            #[pyo3(signature = (values=None))]
-            fn __init__(slf: &Bound<'_, Self>, values: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+            #[pyo3(signature = (values=None, *, page_size=crate::DEFAULT_PAGE_SIZE))]
+            fn __init__(slf: &Bound<'_, Self>, values: Option<&Bound<'_, PyAny>>, #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize) -> PyResult<()> {
                 // As `list.__init__`: always starts from empty.
                 let vals = match values {
                     Some(values) => typed_values::<$t>(values)?,
@@ -851,7 +887,8 @@ macro_rules! typed_list {
                 };
                 {
                     let mut this = slf.try_borrow_mut()?;
-                    if !this.list.is_empty() { this.exports.check($pyname)?; }
+                    if !this.list.is_empty() || this.list.page_size() != page_size { this.exports.check($pyname)?; }
+                    if this.list.page_size() != page_size { this.list = ListInner::new(page_size)?; }
                     let additional = vals.len().saturating_sub(this.list.len());
                     this.list.try_reserve(additional).map_err(crate::reserve_error)?;
                     this.list.clear();
@@ -872,7 +909,7 @@ macro_rules! typed_list {
                         let vals = { let this = slf.try_borrow()?;
                             let s = slice.indices(this.list.len() as isize)?;
                             slice_positions(&s).map(|i| this.list.get(i).unwrap().get()).collect() };
-                        Ok(Bound::new(slf.py(), Self::from_values(vals)?)?.into_any())
+                        Ok(Bound::new(slf.py(), Self::from_values(vals, slf.try_borrow()?.list.page_size())?)?.into_any())
                     }
                 }
             }
@@ -895,7 +932,7 @@ macro_rules! typed_list {
                             this.exports.check($pyname)?;
                             this.list.try_reserve(vals.len().saturating_sub(s.slicelength)).map_err(crate::reserve_error)?;
                             let vals = vals.into_iter().map(ValueCell::new).collect();
-                            splice(&mut this.list, s.start as usize, s.slicelength, vals);
+                            paged!(ListInner, &mut this.list, list => splice(list, s.start as usize, s.slicelength, vals));
                         }
                     }
                 }
@@ -912,7 +949,7 @@ macro_rules! typed_list {
                     }
                     Subscript::Slice(slice) => {
                         let s = slice.indices(this.list.len() as isize)?;
-                        remove_positions(&mut this.list, slice_positions(&s).collect());
+                        paged!(ListInner, &mut this.list, list => remove_positions(list, slice_positions(&s).collect()));
                     }
                 }
                 Ok(())
@@ -962,15 +999,15 @@ macro_rules! typed_list {
                 let Ok(other) = other.cast::<Self>() else { return Ok(slf.py().NotImplemented()); };
                 let mut vals = slf.try_borrow()?.snapshot();
                 vals.extend(other.try_borrow()?.snapshot());
-                Ok(Bound::new(slf.py(), Self::from_values(vals)?)?.into_any().unbind())
+                Ok(Bound::new(slf.py(), Self::from_values(vals, slf.try_borrow()?.list.page_size())?)?.into_any().unbind())
             }
             fn __iadd__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<()> { Self::extend(slf, other) }
             fn __mul__(slf: &Bound<'_, Self>, n: &Bound<'_, PyAny>) -> PyResult<Self> {
                 let n = strict_index(n)?;
-                if n <= 0 { return Ok(Self::empty()); }
+                if n <= 0 { return Self::from_values(Vec::new(), slf.try_borrow()?.list.page_size()); }
                 let vals = slf.try_borrow()?.snapshot();
                 let total = repeat_len(vals.len(), n)?;
-                let mut out = Self::empty();
+                let mut out = Self::from_values(Vec::new(), slf.try_borrow()?.list.page_size())?;
                 out.list.try_reserve(total).map_err(crate::reserve_error)?;
                 for _ in 0..if vals.is_empty() { 0 } else { n.max(0) } {
                     for &v in &vals { out.list.push(ValueCell::new(v)); }
@@ -1021,7 +1058,7 @@ macro_rules! typed_list {
             }
             fn clear(&mut self) -> PyResult<()> { self.exports.check($pyname)?; self.list.clear(); Ok(()) }
             fn reverse(&mut self) -> PyResult<()> { self.exports.check($pyname)?; self.list.reverse(); Ok(()) }
-            fn copy(&self) -> PyResult<Self> { Self::from_values(self.snapshot()) }
+            fn copy(&self) -> PyResult<Self> { Self::from_values(self.snapshot(), self.list.page_size()) }
             #[pyo3(signature = (*, reverse=false))]
             fn sort(slf: &Bound<'_, Self>, #[pyo3(from_py_with = sort_reverse)] reverse: bool) -> PyResult<()> {
                 let mut this = slf.try_borrow_mut()?;
@@ -1041,8 +1078,8 @@ macro_rules! typed_list {
             fn allocated_pages(&self) -> usize { self.list.allocated_pages() }
             #[classattr]
             fn dtype() -> &'static str { <$t as TypedValue>::DTYPE }
-            #[classattr]
-            fn page_size() -> usize { PAGE }
+            #[getter]
+            fn page_size(&self) -> usize { self.list.page_size() }
             fn tolist(&self) -> Vec<$t> { self.snapshot() }
             fn to_numpy<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<$t>> { PyArray1::from_vec(py, self.snapshot()) }
             /// NumPy conversion (`numpy.asarray(lst)`): always a copy, since
@@ -1082,7 +1119,7 @@ macro_rules! typed_list {
                 let page = position(page, this.list.pages().len(), $pyname)?;
                 let data = this.list.pages().nth(page).unwrap();
                 // SAFETY: data is the current prefix of an owner-held page Vec.
-                // Its capacity is >= PAGE and it never grows beyond PAGE, so
+                // Its capacity is >= this instance's page_size and never grows beyond it, so
                 // appends/reserve cannot reallocate or move existing cells.
                 // Every removal/reorder/free checks exports; all value writes
                 // use ValueCell::set, never mutable references into the prefix.
@@ -1096,7 +1133,7 @@ macro_rules! typed_list {
                 let vals = { let this = slf.try_borrow()?;
                     this.list.iter().take(crate::REPR_ITEMS + 1).map(ValueCell::get).collect::<Vec<_>>() };
                 let parts = vals.into_iter().map(|v| Ok(v.into_bound_py_any(slf.py())?.repr()?.to_string())).collect::<PyResult<Vec<_>>>()?;
-                Ok(format!("{}([{}])", slf.get_type().name()?, crate::truncated(parts.into_iter())))
+                Ok(format!("{}([{}]{})", slf.get_type().name()?, crate::truncated(parts.into_iter()), crate::page_size_repr(slf.try_borrow()?.list.page_size())))
             }
             fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
                 let contents = slf.try_borrow()?.to_numpy(slf.py()).into_any();

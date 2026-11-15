@@ -237,7 +237,7 @@ a in hive                            # False
 hive[c]                              # "d"
 ```
 
-`PagedList` is a list stored in pages of 1024 elements, so appending never
+`PagedList` is a list stored in pages of elements, so appending never
 moves existing elements; `paged_list(dtype)` picks a typed list (float64,
 int64 and the other map dtypes). Slices are copies. A typed list's
 `page_view(i)` is a zero-copy NumPy view of one page that stays valid while
@@ -253,6 +253,33 @@ page[0] = 4.0                     # updates values[0]
 values.extend(range(5000))        # allowed: existing pages never move
 values.pop()                      # BufferError while `page` is alive
 ```
+
+Every paged class takes a keyword-only `page_size`, one of
+`paged_collections.PAGE_SIZES` (by default 256, 512, 1024, 2048 and 4096),
+with `DEFAULT_PAGE_SIZE` (1024) when omitted. Instances keep their size
+through `copy`, pickling and `repr`. Pickles from earlier versions load at
+1024.
+
+```python
+from paged_collections import SparseMap, PAGE_SIZES
+
+small = SparseMap(page_size=256)   # less memory per sparse cluster
+small.page_size                    # 256
+SparseMap(page_size=300)           # ValueError: not compiled in
+```
+
+Rust needs page sizes at compile time, so every size in the list is compiled
+into the extension, and each one adds code and build time. To build a wheel
+with other sizes, set these variables when building from source (from
+`crates/paged-collections-py`):
+
+```bash
+PAGED_COLLECTIONS_PAGE_SIZES=64,1024,16384 PAGED_COLLECTIONS_DEFAULT_PAGE_SIZE=1024 maturin build --release
+```
+
+Sizes are integers in `1..=1048576` without duplicates, and the default must
+be one of them. A pickle made with a size the reading build lacks raises
+`ValueError` when loaded.
 
 ## Layout
 

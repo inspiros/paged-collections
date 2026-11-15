@@ -1,7 +1,8 @@
 //! Object-valued hive with generational integer handles.
 
+use crate::storage::HiveInner;
 use numpy::PyArray1;
-use paged_collections::hive::{Hive as Storage, RawPage, RawSlot};
+use paged_collections::hive::{RawPage, RawSlot};
 use paged_collections::id_alloc::{Id, MAX_INDICES};
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyKeyError, PyOverflowError, PyRuntimeError, PyValueError};
@@ -16,13 +17,13 @@ fn exhausted() -> PyErr {
     PyOverflowError::new_err("Hive is exhausted")
 }
 
-/// Objects stored in pages of 1024 reusable slots, addressed by generational
+/// Objects stored in pages of reusable slots, addressed by generational
 /// integer ids. Removed ids stay dead throughout this hive's allocation history.
 /// Iteration visits ids in slot order; array and list results are copies.
 /// Ids work with ``id_index``, ``id_generation`` and ``IdMap``.
 #[pyclass(module = "paged_collections._core", subclass, weakref)]
 pub(crate) struct Hive {
-    hive: Storage<Py<PyAny>>,
+    hive: HiveInner<Py<PyAny>>,
     mods: u64,
 }
 
@@ -77,8 +78,8 @@ impl Hive {
         removed
     }
 
-    fn from_state(state: &Bound<'_, PyAny>) -> PyResult<Storage<Py<PyAny>>> {
-        let parse = || -> PyResult<Storage<Py<PyAny>>> {
+    fn from_state(state: &Bound<'_, PyAny>, page_size: usize) -> PyResult<HiveInner<Py<PyAny>>> {
+        let parse = || -> PyResult<HiveInner<Py<PyAny>>> {
             let parts = state.cast::<PyTuple>()?;
             if parts.len() != 3 {
                 return Err(PyValueError::new_err(
@@ -114,9 +115,47 @@ impl Hive {
                     })
                     .collect(),
             });
-            Storage::try_from_raw_pages(pages).map_err(|err| PyValueError::new_err(err.to_string()))
+            HiveInner::try_from_raw_pages(page_size, pages)
+                .map_err(|err| PyValueError::new_err(err.to_string()))
         };
         parse().map_err(|err| PyValueError::new_err(err.to_string()))
+    }
+
+    /// Retile generation history when explicitly reinitializing at a new size.
+    /// Missing slots had no live id; materialize their floor so merging pages
+    /// cannot resurrect any stale id. At floor zero, skipping generation one
+    /// distinguishes a reusable vacancy from a retired (version zero) slot.
+    fn repage(&self, py: Python<'_>, page_size: usize) -> PyResult<HiveInner<Py<PyAny>>> {
+        let mut pages = Vec::new();
+        let mut slots = Vec::new();
+        let old_size = self.hive.page_size();
+        for (p, page) in self.hive.raw_pages().enumerate() {
+            let limit = old_size.min(MAX_INDICES as usize - p * old_size);
+            let mut source = page.slots.into_iter();
+            for _ in 0..limit {
+                slots.push(match source.next() {
+                    Some(RawSlot::Occupied { version, value }) => RawSlot::Occupied {
+                        version,
+                        value: value.clone_ref(py),
+                    },
+                    Some(RawSlot::Vacant { version }) => RawSlot::Vacant { version },
+                    None => RawSlot::Vacant {
+                        version: page.floor.max(2),
+                    },
+                });
+                if slots.len() == page_size {
+                    pages.push(RawPage {
+                        floor: 0,
+                        slots: std::mem::take(&mut slots),
+                    });
+                }
+            }
+        }
+        if !slots.is_empty() {
+            pages.push(RawPage { floor: 0, slots });
+        }
+        HiveInner::try_from_raw_pages(page_size, pages)
+            .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
     fn reconstruct_copy<'py>(
@@ -139,28 +178,40 @@ impl Hive {
 #[pymethods]
 impl Hive {
     #[new]
-    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(values=None)")]
+    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(values=None, *, page_size=DEFAULT_PAGE_SIZE)")]
     fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
         Self {
-            hive: Storage::new(),
+            hive: HiveInner::default(),
             mods: 0,
         }
     }
 
-    #[pyo3(signature = (values=None, _state=None))]
+    #[pyo3(signature = (values=None, _state=None, *, page_size=crate::DEFAULT_PAGE_SIZE))]
     fn __init__(
         slf: &Bound<'_, Self>,
         values: Option<&Bound<'_, PyAny>>,
         _state: Option<&Bound<'_, PyAny>>,
+        #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
     ) -> PyResult<()> {
         // Parse and materialize before borrowing, including on reinitialization.
-        let hive = _state.map(Self::from_state).transpose()?;
+        let hive = _state
+            .map(|state| Self::from_state(state, page_size))
+            .transpose()?;
         let values: Vec<_> = match values {
             Some(values) => values
                 .try_iter()?
                 .map(|v| v.map(Bound::unbind))
                 .collect::<PyResult<_>>()?,
             None => Vec::new(),
+        };
+        let hive = match hive {
+            Some(hive) => Some(hive),
+            None => {
+                let this = slf.try_borrow()?;
+                (this.hive.page_size() != page_size)
+                    .then(|| this.repage(slf.py(), page_size))
+                    .transpose()?
+            }
         };
         if let Some(hive) = hive {
             let old = {
@@ -280,7 +331,11 @@ impl Hive {
             if more {
                 parts.push("...".to_owned());
             }
-            Ok(format!("{name}({{{}}})", parts.join(", ")))
+            Ok(format!(
+                "{name}({{{}}}{})",
+                parts.join(", "),
+                crate::page_size_repr(slf.try_borrow()?.hive.page_size())
+            ))
         })
     }
 
@@ -320,8 +375,9 @@ impl Hive {
     /// Shallow copy preserving ids and all generation history.
     fn copy(&self, py: Python<'_>) -> Self {
         Self {
-            hive: Storage::try_from_raw_pages(self.hive.raw_pages().map(|page| {
-                RawPage {
+            hive: HiveInner::try_from_raw_pages(
+                self.hive.page_size(),
+                self.hive.raw_pages().map(|page| RawPage {
                     floor: page.floor,
                     slots: page
                         .slots
@@ -334,8 +390,8 @@ impl Hive {
                             RawSlot::Vacant { version } => RawSlot::Vacant { version },
                         })
                         .collect(),
-                }
-            }))
+                }),
+            )
             .expect("valid Hive state"),
             mods: 0,
         }
@@ -555,9 +611,9 @@ impl Hive {
         "object"
     }
 
-    #[classattr]
-    fn page_size() -> usize {
-        1024
+    #[getter]
+    fn page_size(&self) -> usize {
+        self.hive.page_size()
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {

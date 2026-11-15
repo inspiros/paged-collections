@@ -1,7 +1,7 @@
 //! `SparseSet`: Python wrapper of `PagedSparseSet<u32>`.
 
+use crate::storage::SetInner;
 use numpy::PyArray1;
-use paged_collections::sparse_set::PagedSparseSet;
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
@@ -16,7 +16,7 @@ const NAME: &str = "SparseSet";
 /// membership, and a contiguous array of its keys.
 ///
 /// Memory follows the key ranges in use: keys are indexed through pages of
-/// 1024 slots, allocated on first use. Keys keep insertion order until a
+/// configurable size, allocated on first use. Keys keep insertion order until a
 /// removal, which moves the last key into the gap.
 ///
 /// Batch methods (``add_many``, ``discard_many``, ``contains_many``) take
@@ -25,7 +25,7 @@ const NAME: &str = "SparseSet";
 /// resize or reorder the set raise ``BufferError``.
 #[pyclass(module = "paged_collections._core", name = "SparseSet", subclass)]
 pub(crate) struct SparseSet {
-    pub(crate) set: PagedSparseSet<Key>,
+    pub(crate) set: SetInner<Key>,
     pub(crate) exports: Exports,
     /// Changes on every structural change, so iterators can detect them.
     pub(crate) mods: u64,
@@ -34,7 +34,7 @@ pub(crate) struct SparseSet {
 impl SparseSet {
     fn empty() -> Self {
         Self {
-            set: PagedSparseSet::new(),
+            set: SetInner::default(),
             exports: Exports::default(),
             mods: 0,
         }
@@ -70,13 +70,22 @@ impl SparseSet {
     // `__new__` accepts and ignores any arguments, so subclasses can define
     // their own `__init__`; `__init__` fills the collection, as for `dict`.
     #[new]
-    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(keys=None)")]
+    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(keys=None, *, page_size=DEFAULT_PAGE_SIZE)")]
     fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
         Self::empty()
     }
 
-    #[pyo3(signature = (keys = None))]
-    fn __init__(&mut self, keys: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    #[pyo3(signature = (keys = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
+    fn __init__(
+        &mut self,
+        keys: Option<&Bound<'_, PyAny>>,
+        #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
+    ) -> PyResult<()> {
+        if self.set.page_size() != page_size {
+            self.exports.check(NAME)?;
+            self.set.set_page_size(page_size)?;
+            self.changed();
+        }
         if let Some(keys) = keys {
             self.add_batch(keys)?;
         }
@@ -101,7 +110,11 @@ impl SparseSet {
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
         let keys = crate::truncated(slf.try_borrow()?.set.iter().map(Key::to_string));
-        Ok(format!("{}([{keys}])", slf.get_type().name()?))
+        Ok(format!(
+            "{}([{keys}]{})",
+            slf.get_type().name()?,
+            crate::page_size_repr(slf.try_borrow()?.set.page_size())
+        ))
     }
 
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
@@ -254,6 +267,12 @@ impl SparseSet {
         self.exports.check(NAME)?;
         self.set.shrink_to_fit();
         Ok(())
+    }
+
+    /// Slots per page for this instance.
+    #[getter]
+    fn page_size(&self) -> usize {
+        self.set.page_size()
     }
 
     /// Number of allocated pages of the sparse index.

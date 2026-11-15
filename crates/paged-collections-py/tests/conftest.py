@@ -100,3 +100,14 @@ def object_roundtrip(request):
     if request.param == "deepcopy":
         return copy.deepcopy
     return lambda obj: pickle.loads(pickle.dumps(obj, protocol=request.param))
+
+
+def pytest_collection_modifyitems(config, items):
+    # Most suites pin page boundaries at 1024 (the stock default).
+    # test_page_size.py covers every compiled size on any build.
+    if pc.DEFAULT_PAGE_SIZE == 1024:
+        return
+    skip = pytest.mark.skip(reason="assumes DEFAULT_PAGE_SIZE == 1024 (custom build)")
+    for item in items:
+        if item.path.name != "test_page_size.py":
+            item.add_marker(skip)

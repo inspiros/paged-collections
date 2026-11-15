@@ -3,7 +3,6 @@
 //! the deque held: elements are cloned out first, and removed elements are
 //! dropped after the borrow ends.
 
-use paged_collections::paged_deque::PagedDeque as Core;
 use pyo3::exceptions::{
     PyIndexError, PyMemoryError, PyOverflowError, PyRuntimeError, PyTypeError, PyValueError,
 };
@@ -12,7 +11,7 @@ use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyDict, PyInt, PyList, PyTuple};
 use pyo3::{IntoPyObjectExt, PyTraverseError, PyVisit};
 
-const PAGE: usize = 1024;
+use crate::storage::DequeInner;
 
 /// Reuse the shallow reconstruction used by copy.copy, including subclass
 /// state and slots, without dispatching to a subclass's __init__ or __copy__.
@@ -91,13 +90,13 @@ fn equal_objects(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(a.is(b) || a.eq(b)?)
 }
 
-/// A double-ended queue of objects stored in pages of 1024 elements, with
+/// A double-ended queue of objects stored in pages of configurable size, with
 /// the interface of ``collections.deque``. Pushing at either end never moves
 /// existing elements. With ``maxlen``, pushing onto a full deque discards an
 /// element from the other end.
 #[pyclass(module = "paged_collections._core", subclass, weakref)]
 pub(crate) struct PagedDeque {
-    deque: Core<Py<PyAny>, PAGE>,
+    deque: DequeInner<Py<PyAny>>,
     maxlen: Option<usize>,
     /// CPython's state: endpoint movement invalidates iterators, replacement
     /// and reverse do not. Empty clear and rotations of length <= 1 are inert.
@@ -107,7 +106,7 @@ pub(crate) struct PagedDeque {
 impl PagedDeque {
     fn empty(maxlen: Option<usize>) -> Self {
         Self {
-            deque: Core::new(),
+            deque: DequeInner::default(),
             maxlen,
             mods: 0,
         }
@@ -136,8 +135,9 @@ impl PagedDeque {
             if this.maxlen != Some(0) {
                 // A front push may need an entire spare page even when the
                 // tail has unused slots. Make that allocation fallible too.
+                let additional = if front { this.deque.page_size() } else { 1 };
                 this.deque
-                    .try_reserve(if front { PAGE } else { 1 })
+                    .try_reserve(additional)
                     .map_err(crate::reserve_error)?;
                 if let Some(limit) = this.maxlen {
                     evicted
@@ -271,7 +271,7 @@ impl PagedDeque {
 #[pymethods]
 impl PagedDeque {
     #[new]
-    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(iterable=(), maxlen=None)")]
+    #[pyo3(signature = (*_args, **_kwargs), text_signature = "(iterable=(), maxlen=None, *, page_size=DEFAULT_PAGE_SIZE)")]
     fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
         Self::empty(None)
     }
@@ -298,11 +298,13 @@ impl PagedDeque {
         } else {
             None
         };
+        let mut page_size = crate::DEFAULT_PAGE_SIZE;
         if let Some(kwargs) = kwargs {
             for (key, value) in kwargs.iter() {
                 match key.extract::<&str>()? {
                     "iterable" if iterable.is_none() => iterable = Some(value),
                     "maxlen" if maxlen.is_none() => maxlen = Some(value),
+                    "page_size" => page_size = crate::extract_page_size(&value)?,
                     "iterable" | "maxlen" => {
                         return Err(PyTypeError::new_err("multiple values for argument"));
                     }
@@ -310,10 +312,20 @@ impl PagedDeque {
                 }
             }
         }
+        let replacement = DequeInner::new(page_size)?;
         let maxlen = Self::parse_maxlen(maxlen.as_ref())?;
         // Install before releasing old elements: their destructors may append.
         slf.try_borrow_mut()?.maxlen = maxlen;
         Self::clear(slf)?;
+        if slf.try_borrow()?.deque.page_size() != page_size {
+            let vals = slf.try_borrow()?.snapshot(slf.py());
+            let mut this = slf.try_borrow_mut()?;
+            this.deque = replacement;
+            for value in vals {
+                this.deque.push_back(value);
+            }
+            this.changed();
+        }
         match iterable {
             Some(values) => Self::extend(slf, &values),
             None => Ok(()),
@@ -601,7 +613,10 @@ impl PagedDeque {
         }
         let i = bound(i, this.deque.len());
         // Core insert shifts toward the shorter side and may push_front.
-        this.deque.try_reserve(PAGE).map_err(crate::reserve_error)?;
+        let page_size = this.deque.page_size();
+        this.deque
+            .try_reserve(page_size)
+            .map_err(crate::reserve_error)?;
         this.deque.insert(i, value);
         this.changed();
         Ok(())
@@ -639,7 +654,10 @@ impl PagedDeque {
         let k = n.rem_euclid(len as isize) as usize;
         this.changed();
         if k != 0 {
-            this.deque.try_reserve(PAGE).map_err(crate::reserve_error)?;
+            let page_size = this.deque.page_size();
+            this.deque
+                .try_reserve(page_size)
+                .map_err(crate::reserve_error)?;
             if k <= len / 2 {
                 for _ in 0..k {
                     let value = this.deque.pop_back().expect("rotation is nonempty");
@@ -693,9 +711,9 @@ impl PagedDeque {
         Ok(slf.try_borrow()?.deque.allocated_pages())
     }
 
-    #[classattr]
-    fn page_size() -> usize {
-        PAGE
+    #[getter]
+    fn page_size(&self) -> usize {
+        self.deque.page_size()
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
@@ -713,8 +731,16 @@ impl PagedDeque {
                     .map(|v| Ok(v.bind(slf.py()).repr()?.to_string()))
                     .collect::<PyResult<Vec<_>>>()?;
                 Ok(match maxlen {
-                    Some(m) => format!("{name}([{}], maxlen={m})", parts.join(", ")),
-                    None => format!("{name}([{}])", parts.join(", ")),
+                    Some(m) => format!(
+                        "{name}([{}], maxlen={m}{})",
+                        parts.join(", "),
+                        crate::page_size_repr(slf.try_borrow()?.deque.page_size())
+                    ),
+                    None => format!(
+                        "{name}([{}]{})",
+                        parts.join(", "),
+                        crate::page_size_repr(slf.try_borrow()?.deque.page_size())
+                    ),
                 })
             },
         )
@@ -736,7 +762,7 @@ impl PagedDeque {
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        for value in &self.deque {
+        for value in self.deque.iter() {
             visit.call(value)?;
         }
         Ok(())

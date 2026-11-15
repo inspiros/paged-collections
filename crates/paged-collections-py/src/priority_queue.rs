@@ -6,7 +6,6 @@
 use std::cmp::Ordering;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use paged_collections::priority_queue::PagedPriorityQueue;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyMemoryError, PyOverflowError, PyValueError};
 use pyo3::prelude::*;
@@ -14,7 +13,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::convert::{insert_key, lookup_key};
 
-const PAGE: usize = 1024;
+use crate::storage::QueueInner;
 
 fn has_entry_room(len: usize, present: bool) -> bool {
     present || len < u32::MAX as usize
@@ -83,14 +82,14 @@ macro_rules! priority_queue {
                         )]
         #[pyclass(module = "paged_collections._core", name = $pyname, subclass, weakref)]
         pub(crate) struct $name {
-            queue: PagedPriorityQueue<u32, Prio<$t>, PAGE>,
+            queue: QueueInner<Prio<$t>>,
             min: bool,
         }
 
         impl $name {
             fn empty(min: bool) -> Self {
                 Self {
-                    queue: PagedPriorityQueue::new(),
+                    queue: QueueInner::default(),
                     min,
                 }
             }
@@ -109,16 +108,17 @@ macro_rules! priority_queue {
         #[pymethods]
         impl $name {
             #[new]
-            #[pyo3(signature = (*_args, **_kwargs), text_signature = "(items=None, min=False)")]
+            #[pyo3(signature = (*_args, **_kwargs), text_signature = "(items=None, min=False, *, page_size=DEFAULT_PAGE_SIZE)")]
             fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
                 Self::empty(false)
             }
 
-            #[pyo3(signature = (items=None, min=false))]
+            #[pyo3(signature = (items=None, min=false, *, page_size=crate::DEFAULT_PAGE_SIZE))]
             fn __init__(
                 slf: &Bound<'_, Self>,
                 items: Option<&Bound<'_, PyAny>>,
                 min: bool,
+                #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
             ) -> PyResult<()> {
                 // Validate both keys and priorities without borrowing or
                 // modifying self. On failure the previous contents/direction
@@ -148,7 +148,7 @@ macro_rules! priority_queue {
                         }
                     }
                 }
-                let mut replacement = Self::empty(min);
+                let mut replacement = Self { queue: QueueInner::new(page_size)?, min };
                 for (k, p) in pairs {
                     replacement.push_number(k, p)?;
                 }
@@ -351,10 +351,8 @@ macro_rules! priority_queue {
                 $dtype
             }
 
-            #[classattr]
-            fn page_size() -> usize {
-                PAGE
-            }
+            #[getter]
+            fn page_size(&self) -> usize { self.queue.page_size() }
 
             fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
                 let name = slf.get_type().name()?.to_string();
@@ -364,9 +362,9 @@ macro_rules! priority_queue {
                 };
                 let body = crate::repr_items(entries.into_iter(), slf.py())?;
                 Ok(if min {
-                    format!("{name}({{{body}}}, min=True)")
+                    format!("{name}({{{body}}}, min=True{})", crate::page_size_repr(slf.try_borrow()?.queue.page_size()))
                 } else {
-                    format!("{name}({{{body}}})")
+                    format!("{name}({{{body}}}{})", crate::page_size_repr(slf.try_borrow()?.queue.page_size()))
                 })
             }
 

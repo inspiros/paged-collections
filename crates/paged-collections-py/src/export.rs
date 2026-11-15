@@ -16,7 +16,8 @@
 //!    buffer is not reallocated. Methods that could do so call
 //!    [`Exports::check`] first and raise `BufferError`. Maps keep their dense
 //!    lengths fixed. PagedList pages may grow: each buffer has capacity at
-//!    least PAGE, never grows past PAGE, and push touches only the new last
+//!    least the instance's page_size, never grows past that size, and push
+//!    touches only the new last
 //!    element. Reserving pages moves only directory headers, not buffers.
 //! 2. Rust code creates no `&mut` reference into an exported `Vec`'s
 //!    elements. Exported key arrays are only read. Exported value arrays

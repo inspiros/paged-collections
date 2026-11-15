@@ -1,8 +1,8 @@
 //! `SparseMap` and `IdMap`: `PagedSparseMap<u32 | Id, Py<PyAny>>`, for
 //! arbitrary values.
 
+use crate::storage::MapInner;
 use numpy::PyArray1;
-use paged_collections::sparse_map::PagedSparseMap;
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -35,7 +35,7 @@ macro_rules! object_map {
         )]
         #[pyclass(module = "paged_collections._core", name = $pyname, subclass)]
         pub(crate) struct $name {
-            map: PagedSparseMap<$K, Py<PyAny>>,
+            map: MapInner<$K, Py<PyAny>>,
             exports: Exports,
             /// Changes on every structural change, so iterators can detect them.
             mods: u64,
@@ -44,7 +44,7 @@ macro_rules! object_map {
         impl $name {
             fn empty() -> Self {
                 Self {
-                    map: PagedSparseMap::new(),
+                    map: MapInner::default(),
                     exports: Exports::default(),
                     mods: 0,
                 }
@@ -75,13 +75,13 @@ macro_rules! object_map {
                         keys.len()
                     )));
                 }
-                let new = crate::typed_map::write_batch(
-                    &mut self.map,
+                let new = paged!(MapInner, &mut self.map, map => crate::typed_map::write_batch(
+                    map,
                     &self.exports,
                     $pyname,
                     keys,
                     values,
-                )?;
+                ))?;
                 if new > 0 {
                     self.changed();
                 }
@@ -101,17 +101,23 @@ macro_rules! object_map {
             // `__new__` accepts and ignores any arguments, so subclasses can define
             // their own `__init__`; `__init__` fills the collection, as for `dict`.
             #[new]
-            #[pyo3(signature = (*_args, **_kwargs), text_signature = "(keys=None, values=None)")]
+            #[pyo3(signature = (*_args, **_kwargs), text_signature = "(keys=None, values=None, *, page_size=DEFAULT_PAGE_SIZE)")]
             fn new(_args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> Self {
                 Self::empty()
             }
 
-            #[pyo3(signature = (keys = None, values = None))]
+            #[pyo3(signature = (keys = None, values = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
             fn __init__(
                 &mut self,
                 keys: Option<&Bound<'_, PyAny>>,
                 values: Option<&Bound<'_, PyAny>>,
+                #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
             ) -> PyResult<()> {
+                if self.map.page_size() != page_size {
+                    self.exports.check($pyname)?;
+                    self.map.set_page_size(page_size)?;
+                    self.changed();
+                }
                 match (keys, values) {
                     (None, None) => Ok(()),
                     (Some(keys), Some(values)) => self.set_batch(keys, values).map(drop),
@@ -189,7 +195,7 @@ macro_rules! object_map {
                             .map(|(&k, v)| (k.to_bits(), v.bind(py).clone())),
                         py,
                     )?;
-                    Ok(format!("{name}({{{items}}})"))
+                    Ok(format!("{name}({{{items}}}{})", crate::page_size_repr(slf.try_borrow()?.map.page_size())))
                 })
             }
 
@@ -211,7 +217,7 @@ macro_rules! object_map {
             /// Return a shallow copy: the values are shared, not copied. The copy
             /// has no views.
             fn copy(&self, py: Python<'_>) -> Self {
-                let mut map = PagedSparseMap::with_capacity(self.map.len());
+                let mut map = self.map.same_size_empty();
                 for (&key, value) in self.map.iter() {
                     map.insert(key, value.clone_ref(py));
                 }
@@ -468,6 +474,10 @@ macro_rules! object_map {
                     self.changed();
                 }
             }
+
+            /// Slots per page for this instance.
+            #[getter]
+            fn page_size(&self) -> usize { self.map.page_size() }
 
             /// Values are arbitrary Python objects.
             #[classattr]

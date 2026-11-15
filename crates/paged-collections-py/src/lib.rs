@@ -10,6 +10,8 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyTuple, PyType};
 
+include!(concat!(env!("OUT_DIR"), "/page_sizes.rs"));
+
 mod convert;
 mod deque;
 mod direct_map;
@@ -21,6 +23,7 @@ mod object_map;
 mod paged_list;
 mod priority_queue;
 mod set;
+mod storage;
 mod typed_map;
 
 /// Creates an instance of `cls`, a subclass of `base` (one of this module's
@@ -28,11 +31,12 @@ mod typed_map;
 /// so a subclass's own `__init__` is never called with the base's
 /// arguments, as `copyreg.__reduce_ex__` does for `dict` subclasses.
 #[pyfunction]
-#[pyo3(signature = (cls, base, *args))]
+#[pyo3(signature = (cls, base, *args, **kwargs))]
 fn _rebuild<'py>(
     cls: &Bound<'py, PyType>,
     base: &Bound<'py, PyType>,
     args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if !cls.is_subclass(base)? {
         return Err(PyTypeError::new_err(format!(
@@ -41,11 +45,91 @@ fn _rebuild<'py>(
             base.name()?
         )));
     }
+    // A pickle without a size predates `page_size`, when every paged class
+    // used 1024. Reading it at another build's default would misplace Hive
+    // generation floors and could revive stale ids, so ask for 1024 itself.
+    let legacy;
+    let kwargs = match kwargs {
+        None if base.getattr_opt("page_size")?.is_some() => {
+            if !PAGE_SIZES.contains(&LEGACY_PAGE_SIZE) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "this pickle predates page_size and needs page size {LEGACY_PAGE_SIZE}, \
+                     which this build lacks; rebuild with it in PAGED_COLLECTIONS_PAGE_SIZES"
+                )));
+            }
+            legacy = PyDict::new(cls.py());
+            legacy.set_item("page_size", LEGACY_PAGE_SIZE)?;
+            Some(&legacy)
+        }
+        kwargs => kwargs,
+    };
     let obj = cls.call_method1("__new__", (cls,))?;
     let init_args: Vec<_> = std::iter::once(obj.clone()).chain(args.iter()).collect();
     let init_args = PyTuple::new(cls.py(), init_args)?;
-    base.getattr("__init__")?.call1(init_args)?;
+    base.getattr("__init__")?.call(init_args, kwargs)?;
     Ok(obj)
+}
+
+/// Keyword-aware pickle entry point. The final positional value is the size,
+/// keeping the contents at their original offsets in the reduce arguments.
+#[pyfunction]
+#[pyo3(signature = (cls, base, *args))]
+fn _rebuild_paged<'py>(
+    cls: &Bound<'py, PyType>,
+    base: &Bound<'py, PyType>,
+    args: &Bound<'py, PyTuple>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let count = args
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| PyTypeError::new_err("missing pickle page_size"))?;
+    let page_size = extract_page_size(&args.get_item(count)?)?;
+    let kwargs = PyDict::new(cls.py());
+    kwargs.set_item("page_size", page_size)?;
+    let contents = PyTuple::new(cls.py(), args.iter().take(count))?;
+    _rebuild(cls, base, &contents, Some(&kwargs))
+}
+
+/// The page size of every paged class before `page_size` was selectable.
+const LEGACY_PAGE_SIZE: usize = 1024;
+
+/// Error for a page size not compiled into the extension.
+fn page_size_error(page_size: impl std::fmt::Display) -> PyErr {
+    let sizes = PAGE_SIZES
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    pyo3::exceptions::PyValueError::new_err(format!(
+        "page_size must be one of ({sizes}), got {page_size}; rebuild with PAGED_COLLECTIONS_PAGE_SIZES to add sizes"
+    ))
+}
+
+/// Extract and validate an instance size; all unsupported ints
+/// (including negative and arbitrarily large ones) raise the same ValueError.
+fn extract_page_size(value: &Bound<'_, PyAny>) -> PyResult<usize> {
+    let value = value.cast::<pyo3::types::PyInt>()?;
+    // Normalize int subclasses without invoking their formatting overrides.
+    let integer = value
+        .py()
+        .import("operator")?
+        .call_method1("index", (value,))?;
+    if let Ok(size) = integer.extract::<usize>() {
+        if PAGE_SIZES.contains(&size) {
+            return Ok(size);
+        }
+        return Err(page_size_error(size));
+    }
+    Err(page_size_error(integer))
+}
+
+/// Optional keyword in a collection's call-style repr.
+fn page_size_repr(page_size: usize) -> String {
+    if page_size == DEFAULT_PAGE_SIZE {
+        String::new()
+    } else {
+        format!(", page_size={page_size}")
+    }
 }
 
 /// The `__reduce__` value of `obj`, an instance of `base` or a subclass:
@@ -59,10 +143,20 @@ fn reduce<'py>(
     items: Option<Bound<'py, PyIterator>>,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let py = obj.py();
-    let rebuild = py.import("paged_collections._core")?.getattr("_rebuild")?;
+    let module = py.import("paged_collections._core")?;
+    let page_size = base.getattr_opt("page_size")?;
+    let rebuild = module.getattr(if page_size.is_some() {
+        "_rebuild_paged"
+    } else {
+        "_rebuild"
+    })?;
     let cls = obj.get_type();
     let mut args = vec![cls.clone().into_any(), base.clone().into_any()];
     args.extend(contents);
+    if let Some(descriptor) = page_size {
+        // Read the base descriptor, bypassing subclass property overrides.
+        args.push(descriptor.call_method1("__get__", (obj, base))?);
+    }
     let args = PyTuple::new(py, args)?;
     let state = if cls.is(base) {
         None
@@ -183,7 +277,7 @@ mod _core {
     use super::*;
 
     #[pymodule_export]
-    use super::_rebuild;
+    use super::{_rebuild, _rebuild_paged};
     #[pymodule_export]
     use crate::deque::{PagedDeque, PagedDequeIterator};
     #[pymodule_export]
@@ -231,6 +325,11 @@ mod _core {
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+        m.add(
+            "PAGE_SIZES",
+            PyTuple::new(m.py(), PAGE_SIZES.iter().copied())?,
+        )?;
+        m.add("DEFAULT_PAGE_SIZE", DEFAULT_PAGE_SIZE)?;
         m.add(
             "MAX_GENERATION",
             paged_collections::id_alloc::MAX_GENERATION,
