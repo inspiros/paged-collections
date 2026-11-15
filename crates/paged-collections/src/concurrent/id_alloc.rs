@@ -193,7 +193,11 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
     /// Keeps pages and retired indices; requires exclusive access.
     pub fn clear(&mut self) {
         for index in 0..self.index_bound() {
-            let slot = self.slot(index).expect("issued index has a page");
+            // A reservation whose page allocation unwound has no page and
+            // never issued an id.
+            let Some(slot) = self.slot(index) else {
+                continue;
+            };
             // Relaxed: exclusive access excludes all other version writers.
             let version = slot.version.load(Ordering::Relaxed);
             if version % 2 == 1 {
@@ -205,16 +209,18 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
 
     /// Converts to the plain allocator, preserving ids and LIFO reuse order.
     /// Takes O(number of indices ever reserved) time and temporary storage.
-    pub fn into_inner(mut self) -> IdAllocator {
+    pub fn into_inner(self) -> IdAllocator {
         let bound = self.index_bound() as usize;
-        let mut versions = Vec::with_capacity(bound);
-        for (page_index, page) in self.pages.iter_mut() {
-            for slot in page.slots.iter().take(bound - page_index * PAGE) {
+        // By index, not by installed page: a reservation whose page
+        // allocation unwound has no page and keeps version 0 (never issued),
+        // so later indices keep their own generations.
+        let versions: Vec<u32> = (0..bound as u32)
+            .map(|index| {
                 // Relaxed: self is exclusively owned, with no operations in flight.
-                versions.push(slot.version.load(Ordering::Relaxed));
-            }
-        }
-        debug_assert_eq!(versions.len(), bound);
+                self.slot(index)
+                    .map_or(0, |slot| slot.version.load(Ordering::Relaxed))
+            })
+            .collect();
         let mut free = Vec::new();
         while let Some(index) = self
             .free

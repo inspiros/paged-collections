@@ -284,12 +284,20 @@ impl<T, const PAGE: usize> Hive<T, PAGE> {
         self.len == 0
     }
 
-    /// Number of slots in allocated pages, occupied or not.
+    /// Number of usable slots in allocated pages, occupied or not (a last
+    /// page cut short by [`MAX_INDICES`] counts only its usable slots).
+    /// Takes O(pages) time: it scans the page directory.
     pub fn capacity(&self) -> usize {
-        self.allocated_pages() * PAGE
+        self.pages
+            .iter()
+            .enumerate()
+            .filter(|(_, page)| page.allocated())
+            .map(|(p, _)| Self::limit(p))
+            .sum()
     }
 
-    /// Number of allocated pages.
+    /// Number of allocated pages. Takes O(pages) time: it scans the page
+    /// directory.
     pub fn allocated_pages(&self) -> usize {
         self.pages.iter().filter(|page| page.allocated()).count()
     }

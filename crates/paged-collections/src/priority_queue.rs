@@ -210,10 +210,10 @@ impl<K: Key, P: Ord, const PAGE: usize, D: Directory> PagedPriorityQueue<K, P, P
     /// failure leaves entries unchanged; a comparison panic has the
     /// guarantees described in the [module docs](self).
     pub fn push(&mut self, key: K, priority: P) -> Option<P> {
-        if let Some(stored) = self.keys.occupant(key.index()).copied() {
+        if let Some(pos) = self.keys.occupant_pos(key.index()) {
+            let stored = self.keys.as_slice()[pos];
             // Equality is user code too: finish it before changing either array.
             let same = stored == key;
-            let pos = self.keys.position(stored).expect("occupant is present");
             if !same {
                 self.keys.replace(key);
             }
@@ -322,10 +322,10 @@ impl<K: Key, P: Ord, const PAGE: usize, D: Directory> PagedPriorityQueue<K, P, P
     }
 
     fn remove_at(&mut self, pos: usize) -> (K, P) {
-        let key = self.keys.as_slice()[pos];
-        // Set removal can only call non-panicking index operations after
-        // mutation; the matching swap_remove cannot allocate or run P code.
-        self.keys.remove(key);
+        // Remove by position, not by key equality (user code): the key and
+        // priority arrays stay in step even if `K: Eq` misbehaves. Neither
+        // swap_remove can allocate or run P code.
+        let key = self.keys.remove_at(pos);
         let priority = self.priorities.swap_remove(pos);
         if pos < self.len() {
             self.repair(pos);

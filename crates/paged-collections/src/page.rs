@@ -1075,20 +1075,23 @@ impl<T, const PAGE: usize> PageStore<T, PAGE> for RadixTree<T, PAGE> {
         }
         // Build the page first: `T::default()` may panic.
         let new = new_page::<T, PAGE>();
-        self.allocated += 1;
-        if self.root.is_none() {
-            return self
-                .root
+        // Count the page only once it is linked: inserting can allocate
+        // (and so panic, with unwinding OOM handlers).
+        let page = if self.root.is_none() {
+            self.root
                 .insert(Child::Leaf {
                     number: page,
                     page: new,
                 })
-                .leaf_page();
-        }
-        match &mut self.root {
-            Some(root) => root.insert(page, new),
-            None => unreachable!("root checked above"),
-        }
+                .leaf_page()
+        } else {
+            match &mut self.root {
+                Some(root) => root.insert(page, new),
+                None => unreachable!("root checked above"),
+            }
+        };
+        self.allocated += 1;
+        page
     }
 
     fn remove(&mut self, page: usize) -> Option<Box<[T; PAGE]>> {
