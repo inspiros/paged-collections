@@ -379,6 +379,47 @@ fn slice_extension_clones_non_copy_values_and_keeps_addresses() {
 
 // Deliberately leaking owned allocations is incompatible with Miri's leak check.
 #[cfg(not(miri))]
+fn drain_capacity<const PAGE: usize>() {
+    for len in 0..=4 * PAGE + 1 {
+        for spare in [0, 1, 3] {
+            for start in 0..=len {
+                for end in start..=len {
+                    let mut v: PagedVec<i32, PAGE> = PagedVec::new();
+                    v.reserve(len + spare * PAGE);
+                    v.extend(0..len as i32);
+                    let before = v.allocated_pages();
+                    let drained: Vec<i32> = v.drain(start..end).collect();
+                    assert_eq!(drained, (start as i32..end as i32).collect::<Vec<_>>());
+                    let mut model: Vec<i32> = (0..len as i32).collect();
+                    model.drain(start..end);
+                    check(&v, &model);
+                    let after = v.allocated_pages();
+                    // Spare pages stay; only the removed range's pages may leave.
+                    assert!(
+                        after <= before,
+                        "len {len} {start}..{end}: {after} > {before}"
+                    );
+                    assert!(
+                        after + (end - start).div_ceil(PAGE) >= before,
+                        "len {len} spare {spare} {start}..{end}: {before} -> {after}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn drain_keeps_spare_pages() {
+    drain_capacity::<1>();
+    drain_capacity::<4>();
+    let mut v: PagedVec<i32, 4> = PagedVec::new();
+    v.reserve(40);
+    v.extend(0..5);
+    v.drain(..);
+    assert_eq!(v.allocated_pages(), 8);
+}
+
 #[test]
 fn leaked_drain_leaves_eager_result_ready_for_reuse() {
     let mut v: PagedVec<i32, 3> = (0..10).collect();

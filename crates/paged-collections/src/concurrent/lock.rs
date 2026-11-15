@@ -33,6 +33,7 @@ mod implementation {
 
 #[cfg(any(not(feature = "std"), loom))]
 mod implementation {
+    use core::marker::PhantomData;
     use core::ops::{Deref, DerefMut};
 
     use super::super::atomic::{AtomicU32, Ordering, UnsafeCell};
@@ -52,14 +53,23 @@ mod implementation {
     // accessor. Acquire/Release synchronizes successive accesses.
     unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 
+    // Guards are `!Send` like `std`'s, so the containers' guard and entry
+    // types have the same auto traits with and without the `std` feature
+    // (the feature stays additive). `Sync` still follows `&RwLock<T>`.
+    struct NotSend(PhantomData<*const ()>);
+    // SAFETY: a zero-sized marker with no data; it only removes `Send`.
+    unsafe impl Sync for NotSend {}
+
     pub(crate) struct ReadGuard<'a, T> {
         lock: &'a RwLock<T>,
+        _not_send: NotSend,
         #[cfg(loom)]
         access: Option<loom::cell::ConstPtr<T>>,
     }
 
     pub(crate) struct WriteGuard<'a, T> {
         lock: &'a RwLock<T>,
+        _not_send: NotSend,
         #[cfg(loom)]
         access: Option<loom::cell::MutPtr<T>>,
     }
@@ -90,6 +100,7 @@ mod implementation {
                     {
                         return ReadGuard {
                             lock: self,
+                            _not_send: NotSend(PhantomData),
                             #[cfg(loom)]
                             access: Some(self.value.read()),
                         };
@@ -109,6 +120,7 @@ mod implementation {
                 {
                     return WriteGuard {
                         lock: self,
+                        _not_send: NotSend(PhantomData),
                         #[cfg(loom)]
                         access: Some(self.value.write()),
                     };
@@ -205,6 +217,22 @@ mod implementation {
             assert_eq!(*lock.read(), 2);
             *lock.get_mut() = 3;
             assert_eq!(lock.into_inner(), 3);
+        }
+
+        // Compiles only if the guards are `!Send` (otherwise the two impls
+        // make the inferred parameter ambiguous) and `Sync` for `Sync` data.
+        #[test]
+        fn guards_are_not_send_like_std() {
+            trait AmbiguousIfSend<A> {
+                fn check() {}
+            }
+            impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+            impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+            <super::ReadGuard<'static, u32> as AmbiguousIfSend<_>>::check();
+            <super::WriteGuard<'static, u32> as AmbiguousIfSend<_>>::check();
+            fn sync<T: Sync>() {}
+            sync::<super::ReadGuard<'static, u32>>();
+            sync::<super::WriteGuard<'static, u32>>();
         }
     }
 }

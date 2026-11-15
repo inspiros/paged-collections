@@ -6,9 +6,12 @@
 //! slot for reuse; the next element there gets the next generation, so a
 //! stale id of a removed element is never mistaken for a live one.
 //!
-//! - **Stable addresses.** An element never moves while it is in the hive:
+//! - **Stable addresses.** An element does not move while it is in the hive:
 //!   inserts, removals of other elements, [`reserve`](Hive::reserve) and
 //!   [`shrink_to_fit`](Hive::shrink_to_fit) leave its address unchanged.
+//!   Only [`sort`](Hive::sort) and its variants move elements between
+//!   slots; ids name slots, so after a sort an id names whatever element
+//!   moved into its slot.
 //!   Pages are allocated once with room for `PAGE` slots and never
 //!   reallocated.
 //! - **Slot reuse.** Inserts fill one page with room at a time: a page that
@@ -119,6 +122,7 @@ pub struct RawPage<T> {
 
 /// Why [`Hive::try_from_raw_pages`] rejected its input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RawPagesError {
     /// More pages than the slot indices below [`MAX_INDICES`] can cover.
     TooManyPages,

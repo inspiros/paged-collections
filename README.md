@@ -5,7 +5,8 @@ bindings built on PyO3.
 
 > Status: in development. Every collection below is implemented in Rust;
 > Python bindings cover the sparse sets and maps, `DirectMap`, `IdAllocator`,
-> `IdMap`, `Hive`, `PagedList`, `PagedDeque` and `PagedPriorityQueue`.
+> `IdMap`, `Hive`, `PagedList`, `PagedDeque` and the priority queues
+> (`PriorityQueue`, `PriorityQueueF64`).
 > Concurrent types have no Python bindings. Nothing is published.
 
 ## Why paging
@@ -30,12 +31,14 @@ Paging serves two separate purposes:
 | `PagedDirectMap<K, V>` | index | Direct-address map: values stored in place, iterated in slot-index (for integers, key) order |
 | `PagedVec<T>` | storage | Growable vector with stable addresses |
 | `PagedDeque<T>` | storage | Double-ended queue with stable addresses through pushes and pops at either end |
-| `Hive<T>` | storage | Unordered container with stable addresses and generational handles |
+| `Hive<T>` | storage | Unordered container with stable addresses (until `sort`) and generational handles |
 | `IdAllocator` | none | Generational id allocator for use as keys |
 
 The indexed collections use `page::Flat` by default, for dense keys below a
 few billion. Choose `page::Radix` for wide keys spread over the `usize` range;
-its compressed radix directory uses memory proportional to allocated pages.
+its compressed radix directory uses memory proportional to allocated pages,
+plus a flat window over the low page numbers (up to about 8 times the
+allocated page count) that does not shrink below its highest live page.
 Choose `page::Tree` for a standard B-tree, or when benchmarks show it wins
 for your key pattern. The directory is the final type parameter, for example
 `PagedDirectMap<usize, u32, 1024, page::Radix>`.
@@ -51,7 +54,7 @@ Numbers come from the bench crate `crates/bench` (see
 | `PagedPriorityQueue` | You need `change_priority` or removal by key: push is 3-17x faster than the `priority-queue` crate | You never change priorities: `BinaryHeap` is 1.3-2x faster |
 | `PagedDeque` | Large queues (parity with `VecDeque` at 10 million elements) or stable addresses | Small queues: `VecDeque` is 1.4-1.7x faster |
 | `PagedVec` | You need stable addresses: iteration matches `Vec` | Random access dominates: `Vec` is 1.8-2.5x faster |
-| `Hive`, `IdMap` | Generational handles with stable addresses: `IdMap` is within 1.2-4x of `SlotMap` and iterates faster at small and medium sizes | Raw lookup speed matters more than stable addresses: `SlotMap` is faster |
+| `Hive`; `IdAllocator` + `PagedSparseMap` (Python `IdMap`) | Generational handles with stable addresses: the allocator-plus-map pairing is within 1.2-4x of `SlotMap` and iterates faster at small and medium sizes | Raw lookup speed matters more than stable addresses: `SlotMap` is faster |
 
 - **Spread-out keys are the worst case.** Each key in a new page allocates
   and zeroes a whole page, so uniformly spread keys made inserts 36-480x
@@ -201,7 +204,8 @@ to the collector).
 
 The classes can be subclassed. As with `dict`, the built-in methods do not
 call overridden methods (`set_many` and `update` do not go through your
-`__setitem__`), and `copy()` returns the base class. `pickle`,
+`__setitem__`), and `copy()` returns the base class, except on `PagedDeque`
+and the priority queues, whose `copy()` keeps the subclass. `pickle`,
 `copy.copy` and `copy.deepcopy` keep the subclass and its attributes, and
 never call the subclass's `__init__`.
 

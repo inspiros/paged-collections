@@ -1115,7 +1115,10 @@ range_iterator!(
     /// Iterator over the entries of a [`PagedDirectMap`] in a range of slot
     /// indices, from [`range`](PagedDirectMap::range) or
     /// [`slot_range`](PagedDirectMap::slot_range).
-    Range, Pages, Iter, (K, &'a V)
+    Range,
+    Pages,
+    Iter,
+    (K, &'a V)
 );
 
 range_iterator!(
@@ -1123,7 +1126,10 @@ range_iterator!(
     /// indices, with mutable values, from
     /// [`range_mut`](PagedDirectMap::range_mut) or
     /// [`slot_range_mut`](PagedDirectMap::slot_range_mut).
-    RangeMut, PagesMut, IterMut, (K, &'a mut V)
+    RangeMut,
+    PagesMut,
+    IterMut,
+    (K, &'a mut V)
 );
 
 impl<K: DirectKey, V, const PAGE: usize, D: Directory> Clone for Range<'_, K, V, PAGE, D> {

@@ -21,6 +21,10 @@ jobs:
       - run: cargo test --all-features
       - name: no_std build
         run: cargo build -p paged-collections --no-default-features
+      - name: no_std concurrent (spin lock)
+        run: |
+          cargo build -p paged-collections --no-default-features --features concurrent
+          cargo test -p paged-collections --no-default-features --features concurrent --lib
 
   msrv:
     runs-on: ubuntu-latest

@@ -337,7 +337,9 @@ impl<K: Key, const PAGE: usize, D: SharedDirectory> From<PagedSparseSet<K, PAGE,
 /// interleave dense order; exclusive removal uses swap-remove.
 ///
 /// Same-slot insertions wait for the winning writer, including its factory.
-/// Factories must not recursively insert into their own reserved slot. `Sync`
+/// Factories must not recursively insert into their own reserved slot, and
+/// factories on two threads that each insert the other's pending key
+/// deadlock (each waits on the other's reservation). `Sync`
 /// requires both `K` and `V` to be `Send + Sync`. Uses `core` and `alloc` only.
 ///
 /// With [`Flat`], memory follows the highest page and lookups cost O(1);
@@ -448,7 +450,9 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentSparseMap<K, V,
     /// Only the RESERVED winner calls `make`, at most once per call. If it
     /// panics, a guard restores the slot to empty and other writers may retry.
     /// The factory must not insert recursively into this same slot: it would
-    /// wait on its own reservation. Factories run before dense reservation.
+    /// wait on its own reservation. Nor may two threads' factories insert
+    /// each other's pending keys: each would wait on the other's
+    /// reservation. Factories run before dense reservation.
     ///
     /// # Panics
     ///

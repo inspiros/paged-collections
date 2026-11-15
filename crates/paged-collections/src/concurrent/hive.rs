@@ -641,7 +641,10 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
     /// kept). It remembers its highest version, so ids it issued stay dead:
     /// shared inserts reuse freed pages, lowest first, after the free slots
     /// of the remaining pages, with generations above every earlier one.
-    /// The free slots are relinked in index order. The page directory's own
+    /// That order is exact only for one inserter: while one insert is
+    /// relinking a reused page, a concurrent insert can take a fresh index
+    /// instead (and fail at the index limit even though slots are about to
+    /// be freed). The free slots are relinked in index order. The page directory's own
     /// small arrays stay allocated.
     ///
     /// ```

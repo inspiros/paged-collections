@@ -345,8 +345,9 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
     /// The id of the element at `value`'s address, if `value` is a live
     /// element of this hive: the inverse of [`get`](Self::get).
     ///
-    /// Takes O(installed pages) time: it compares the address with each
-    /// page's slot range, then checks that the slot found is published live
+    /// Takes time linear in the directory's page cells up to the highest
+    /// installed page (with `Flat`, O(highest page number)): it compares the
+    /// address with each installed page's slot range, then checks that the slot found is published live
     /// and holds exactly that element. Anything else gives `None`. Uses
     /// address comparison only; no pointer is dereferenced.
     ///
@@ -520,7 +521,10 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
     /// kept). It remembers its highest version, so ids it issued stay dead:
     /// shared inserts reuse freed pages, lowest first, after the free slots
     /// of the remaining pages, with generations above every earlier one.
-    /// The free slots are relinked in index order. The page directory's own
+    /// That order is exact only for one inserter: while one insert is
+    /// relinking a reused page, a concurrent insert can take a fresh index
+    /// instead (and fail at the index limit even though slots are about to
+    /// be freed). The free slots are relinked in index order. The page directory's own
     /// small arrays stay allocated.
     ///
     /// ```

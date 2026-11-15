@@ -8,7 +8,7 @@
 //! | Marker | Store | Page lookup | Directory memory |
 //! |---|---|---|---|
 //! | [`Flat`] | `Vec<Option<Box<[T; PAGE]>>>` | O(1), one indirection | one pointer per page up to the highest page used |
-//! | [`Radix`] | flat window for low page numbers, then a path-compressed 64-ary trie | O(1) in the window, else O(depth), at most ceil(usize bits / 6) branches | proportional to allocated pages only |
+//! | [`Radix`] | flat window for low page numbers, then a path-compressed 64-ary trie | O(1) in the window, else O(depth), at most ceil(usize bits / 6) branches | proportional to the peak allocated page count (the window does not shrink below its highest live page) |
 //! | [`Tree`] | `BTreeMap<usize, Box<[T; PAGE]>>` | O(log pages) | proportional to allocated pages only |
 //!
 //! Use [`Flat`] (the default) when indices stay below a few billion, for

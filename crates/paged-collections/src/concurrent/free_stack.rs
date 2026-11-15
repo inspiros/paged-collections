@@ -6,7 +6,9 @@
 //! inside one stalled pop. After such a wrap a pop may return an index that
 //! is not free. So **a pop is only a hint**: the caller must claim the index
 //! with a compare-exchange on that slot's own state and discard the index if
-//! the claim fails. Soundness must never rest on the tag.
+//! the claim fails. Soundness must never rest on the tag. A wrap can also
+//! leave the stack linked into a cycle, so callers that pop until a claim
+//! succeeds may spin forever (a liveness failure, never unsoundness).
 
 use super::atomic::{AtomicU32, AtomicU64, CachePadded, Ordering, spin_loop};
 

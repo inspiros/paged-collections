@@ -569,7 +569,10 @@ impl<T, const PAGE: usize> PagedVec<T, PAGE> {
     /// and may change addresses. An empty range moves nothing. When the
     /// start is a page boundary, the removed pages are reused, including a
     /// partial last page. If both ends are page boundaries, the following
-    /// pages also keep their element addresses.
+    /// pages also keep their element addresses. Spare (empty) pages stay in
+    /// the vector, up to its page count before the call; pages handed to the
+    /// iterator with the removed elements are freed with it, so capacity can
+    /// drop by the pages the removed range occupied.
     ///
     /// Unlike [`Vec::drain`], removal finishes before this method returns.
     /// Dropping the iterator drops the unconsumed removed elements;
@@ -582,6 +585,7 @@ impl<T, const PAGE: usize> PagedVec<T, PAGE> {
     /// overflows `usize`, or allocation size overflows.
     pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, T, PAGE> {
         let (start, end) = range_indices(range, self.len);
+        let pages_before = self.pages.len();
         let removed = if start == end {
             Self::new()
         } else if end == self.len {
@@ -627,6 +631,15 @@ impl<T, const PAGE: usize> PagedVec<T, PAGE> {
             }
             self.split_into(new_len, result)
         };
+        // Aligned splits hand over trailing spare pages too; give back up to
+        // the original page count so `drain` keeps capacity like
+        // `Vec::drain`. The directory never shrank, so this cannot allocate.
+        let mut removed = removed;
+        let used = removed.used_pages();
+        let back = (removed.pages.len() - used).min(pages_before.saturating_sub(self.pages.len()));
+        if back > 0 {
+            self.pages.extend(removed.pages.drain(used..used + back));
+        }
         Drain {
             inner: removed.into_iter(),
             _borrow: PhantomData,
