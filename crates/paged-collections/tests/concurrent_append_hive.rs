@@ -496,7 +496,14 @@ fn iteration_mutation_and_lookup_edges() {
 fn eager_drain_leaves_hive_empty_even_when_forgotten() {
     let mut hive = ConcurrentAppendHive::<u32, 4>::new();
     let first = hive.insert(7);
-    std::mem::forget(hive.drain());
+    // Miri reports the deliberate leak; there, drop instead (removal is
+    // eager either way, which is what this test checks natively).
+    let drain = hive.drain();
+    if cfg!(miri) {
+        drop(drain);
+    } else {
+        std::mem::forget(drain);
+    }
     assert!(hive.is_empty());
     assert!(hive.get(first).is_none());
     let next = hive.insert(8);

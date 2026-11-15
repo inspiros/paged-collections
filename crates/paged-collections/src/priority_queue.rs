@@ -714,7 +714,14 @@ mod tests {
         assert_eq!(queue.allocated_pages(), pages);
         queue.push(1, 1);
         queue.check();
-        core::mem::forget(queue.drain());
+        // Miri reports the deliberate leak; there, drop instead (removal
+        // is eager either way, which this test checks natively).
+        let drain = queue.drain();
+        if cfg!(miri) {
+            drop(drain);
+        } else {
+            core::mem::forget(drain);
+        }
         queue.check();
         assert!(queue.is_empty());
         assert_eq!(queue.pop(), None);

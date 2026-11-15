@@ -377,10 +377,13 @@ fn slice_extension_clones_non_copy_values_and_keeps_addresses() {
     assert_eq!(values, ["second", "third"]);
 }
 
-// Deliberately leaking owned allocations is incompatible with Miri's leak check.
-#[cfg(not(miri))]
 fn drain_capacity<const PAGE: usize>() {
-    for len in 0..=4 * PAGE + 1 {
+    let max = if cfg!(miri) {
+        2 * PAGE + 1
+    } else {
+        4 * PAGE + 1
+    };
+    for len in 0..=max {
         for spare in [0, 1, 3] {
             for start in 0..=len {
                 for end in start..=len {
@@ -420,6 +423,8 @@ fn drain_keeps_spare_pages() {
     assert_eq!(v.allocated_pages(), 8);
 }
 
+// Deliberately leaking owned allocations is incompatible with Miri's leak check.
+#[cfg(not(miri))]
 #[test]
 fn leaked_drain_leaves_eager_result_ready_for_reuse() {
     let mut v: PagedVec<i32, 3> = (0..10).collect();
