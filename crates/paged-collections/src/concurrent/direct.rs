@@ -5,7 +5,7 @@ use core::fmt;
 use core::mem;
 use core::ops::{Bound, Deref, DerefMut, RangeBounds};
 
-use super::atomic::{AtomicUsize, Ordering};
+use super::count::StripedLen;
 use super::directory::{SharedDirectory, SharedPages};
 use super::lock::{ReadGuard, RwLock, WriteGuard};
 use crate::direct_map::PagedDirectMap;
@@ -22,6 +22,8 @@ struct Page<K: DirectKey, V> {
 struct PageData<K: DirectKey, V> {
     slots: Box<[Slot<K, V>]>,
     occupied: usize,
+    // This page's directory number: its length stripe.
+    number: usize,
 }
 
 impl<K: DirectKey, V> PageData<K, V> {
@@ -29,21 +31,21 @@ impl<K: DirectKey, V> PageData<K, V> {
         &mut self,
         offset: usize,
         pair: (K::Tag, V),
-        len: &AtomicUsize,
+        len: &StripedLen,
     ) -> Option<(K::Tag, V)> {
         let old = self.slots[offset].replace(pair);
         if old.is_none() {
             self.occupied += 1;
-            len.fetch_add(1, Ordering::Relaxed);
+            len.increment(self.number);
         }
         old
     }
 
-    fn remove(&mut self, offset: usize, len: &AtomicUsize) -> Option<(K::Tag, V)> {
+    fn remove(&mut self, offset: usize, len: &StripedLen) -> Option<(K::Tag, V)> {
         let old = self.slots[offset].take();
         if old.is_some() {
             self.occupied -= 1;
-            len.fetch_sub(1, Ordering::Relaxed);
+            len.decrement(self.number);
         }
         old
     }
@@ -74,7 +76,7 @@ impl<K: DirectKey, V> PageData<K, V> {
 ///
 /// Traversals visit ascending slot indices, holding one page lock at a time.
 /// They are consistent per page only and weakly consistent across pages.
-/// Length is exact when no write is in flight. The `no_std` spin lock permits
+/// Length is exact when no write is in flight (see [`len`](Self::len)). The `no_std` spin lock permits
 /// writer starvation; the `std` lock ignores poisoning because mutations keep
 /// slots and counts valid even when user code panics.
 ///
@@ -94,7 +96,7 @@ pub struct ConcurrentDirectMap<
 > {
     // A GAT projection is invariant in K and V, as shared insertion requires.
     pages: D::Pages<Page<K, V>>,
-    len: AtomicUsize,
+    len: StripedLen,
 }
 
 // SAFETY: both sealed directories own stable pages and are Send when their
@@ -156,13 +158,13 @@ pub enum Entry<'a, K: DirectKey, V> {
 /// An occupied entry holding its page's write lock.
 pub struct OccupiedEntry<'a, K: DirectKey, V> {
     value: DirectMapRefMut<'a, K, V>,
-    len: &'a AtomicUsize,
+    len: &'a StripedLen,
 }
 
 /// A vacant entry holding its page's write lock, possibly over another generation.
 pub struct VacantEntry<'a, K: DirectKey, V> {
     value: DirectMapRefMut<'a, K, V>,
-    len: &'a AtomicUsize,
+    len: &'a StripedLen,
 }
 
 impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V, PAGE, D> {
@@ -181,16 +183,23 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
         );
         Self {
             pages: D::Pages::<Page<K, V>>::new(),
-            len: AtomicUsize::new(0),
+            len: StripedLen::new(),
         }
     }
 
     /// Number of entries; exact when no write is in flight.
+    ///
+    /// The count is split over per-page-group counters so that writers on
+    /// different pages do not contend on one cache line. While writes are in
+    /// flight, the sum may combine counters read at different moments and
+    /// so differ from every count the map actually held (for example, 0 for
+    /// a map that was never empty), though it never exceeds the number of
+    /// entries inserted.
     pub fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
+        self.len.get()
     }
 
-    /// Whether `len()` is zero, subject to concurrent writes.
+    /// Whether `len()` is zero; like `len`, exact only with no write in flight.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -214,6 +223,7 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
                 data: RwLock::new(PageData {
                     slots: (0..PAGE).map(|_| None).collect(),
                     occupied: 0,
+                    number,
                 }),
             })
         })
@@ -489,7 +499,7 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
     /// Detaches and frees all pages. The map is empty even if a destructor panics.
     pub fn reset(&mut self) {
         let pages = mem::replace(&mut self.pages, D::Pages::<Page<K, V>>::new());
-        self.len.store(0, Ordering::Relaxed);
+        self.len.reset();
         drop(pages);
     }
 }
@@ -505,6 +515,7 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
                 RwLock::new(PageData {
                     slots: Box::default(),
                     occupied: 0,
+                    number,
                 }),
             );
             let base = number * PAGE;

@@ -7,6 +7,7 @@
     target_has_atomic = "64"
 ))]
 
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -607,4 +608,97 @@ fn auto_traits_need_only_shared_directory() {
     }
     check::<Flat>();
     check::<Radix>();
+}
+
+#[test]
+fn striped_len_is_exact_after_four_writers_and_all_removal_paths() {
+    const PAGE: usize = 3;
+    let mut map = ConcurrentDirectMap::<usize, usize, PAGE>::new();
+    let gate = Barrier::new(4);
+    let pages_per_thread = if cfg!(miri) { 9 } else { 96 };
+    // Disjoint pages include both different stripes and page numbers that
+    // collide modulo 32. Values and final presence do not depend on winners.
+    thread::scope(|scope| {
+        for worker in 0..4 {
+            let (map, gate) = (&map, &gate);
+            scope.spawn(move || {
+                gate.wait();
+                for i in 0..pages_per_thread {
+                    let base = (worker + 4 * i) * PAGE;
+                    assert_eq!(map.insert(base, base), None);
+                    assert!(map.try_insert(base + 1, base + 1).is_ok());
+                    drop(map.entry(base + 2).or_insert(base + 2));
+                    // Replacement must not change the stripe count.
+                    assert_eq!(map.insert(base + 2, base + 20), Some(base + 2));
+                    assert_eq!(map.remove(base), Some(base));
+                    if i % 2 == 0 {
+                        match map.entry(base + 1) {
+                            Entry::Occupied(entry) => assert_eq!(entry.remove(), base + 1),
+                            Entry::Vacant(_) => panic!("inserted entry is occupied"),
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let mut oracle = BTreeMap::new();
+    for worker in 0..4 {
+        for i in 0..pages_per_thread {
+            let base = (worker + 4 * i) * PAGE;
+            if i % 2 != 0 {
+                oracle.insert(base + 1, base + 1);
+            }
+            oracle.insert(base + 2, base + 20);
+        }
+    }
+    assert_eq!(map.len(), oracle.len());
+    assert_eq!(
+        contents(&map).into_iter().collect::<BTreeMap<_, _>>(),
+        oracle
+    );
+    map.retain(|key, value| {
+        *value += 1;
+        key % 2 == 0
+    });
+    oracle.retain(|key, value| {
+        *value += 1;
+        key % 2 == 0
+    });
+    assert_eq!(map.len(), oracle.len());
+    assert_eq!(
+        contents(&map).into_iter().collect::<BTreeMap<_, _>>(),
+        oracle
+    );
+    let removed: Vec<_> = oracle.keys().copied().step_by(3).collect();
+    for key in removed {
+        match map.entry(key) {
+            Entry::Occupied(entry) => {
+                assert_eq!(entry.remove_entry(), (key, oracle.remove(&key).unwrap()))
+            }
+            Entry::Vacant(_) => panic!("oracle key is occupied"),
+        }
+        assert_eq!(map.len(), oracle.len());
+    }
+    let plain = map.into_inner();
+    assert_eq!(plain.len(), oracle.len());
+    assert_eq!(
+        plain
+            .iter()
+            .map(|(k, &v)| (k, v))
+            .collect::<BTreeMap<_, _>>(),
+        oracle
+    );
+    map = ConcurrentDirectMap::from(plain);
+    assert_eq!(map.len(), oracle.len());
+    map.clear();
+    assert_eq!(map.len(), 0);
+    assert!(contents(&map).is_empty());
+    // Reuse the retained pages after every stripe has returned to zero.
+    for (&key, &value) in &oracle {
+        assert_eq!(map.insert(key, value), None);
+    }
+    assert_eq!(map.len(), oracle.len());
+    map.reset();
+    assert_eq!(map.len(), 0);
+    assert_eq!(map.allocated_pages(), 0);
 }

@@ -1,8 +1,12 @@
 //! Bounded explorations of page locks, factories and value lifetime.
 
+#[cfg(not(feature = "std"))]
+extern crate std;
+
 use loom::sync::Arc;
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::thread;
+use std::sync::atomic::{AtomicBool as CoverageFlag, Ordering as CoverageOrdering};
 
 use super::ConcurrentDirectMap;
 
@@ -229,4 +233,49 @@ fn radix_split_races_install_and_reader() {
         assert_eq!(map.len(), 4);
         assert_eq!(map.allocated_pages(), 4);
     });
+}
+
+#[test]
+fn different_stripes_stay_bounded_during_cross_thread_removals() {
+    static REMOVED_OTHER: CoverageFlag = CoverageFlag::new(false);
+    static SAW_BOTH: CoverageFlag = CoverageFlag::new(false);
+    REMOVED_OTHER.store(false, CoverageOrdering::Relaxed);
+    SAW_BOTH.store(false, CoverageOrdering::Relaxed);
+    model(|| {
+        // PAGE=2: keys 0 and 2 use page numbers 0 and 1, hence different
+        // stripes even with loom's STRIPES=2. Pages are preinstalled so the
+        // model explores counting, not page installation.
+        let mut map = ConcurrentDirectMap::<u32, usize, 2>::new();
+        map.insert(0, 0);
+        map.insert(2, 0);
+        map.clear();
+        let map = Arc::new(map);
+        let writer = map.clone();
+        // Removes the other thread's key: its decrement must land on the
+        // stripe of that insertion, after it, so no stripe goes negative.
+        let a = thread::spawn(move || {
+            assert_eq!(writer.insert(0, 10), None);
+            writer.remove(2).is_some()
+        });
+        thread::yield_now();
+        assert_eq!(map.insert(2, 20), None);
+        // Reads both stripes while the writer may be between its updates.
+        // Stripes may be read at different moments, so 0 is possible here
+        // even though the map always holds a key; but no stripe underflows,
+        // so the sum never wraps past the capacity in use.
+        let len = map.len();
+        assert!(len <= 2, "striped count out of range: {len}");
+        if len == 2 {
+            SAW_BOTH.store(true, CoverageOrdering::Relaxed);
+        }
+        let removed = a.join().unwrap();
+        if removed {
+            REMOVED_OTHER.store(true, CoverageOrdering::Relaxed);
+        }
+        assert_eq!(map.contains_key(2), !removed);
+        assert_eq!(map.get(0).map(|v| *v), Some(10));
+        assert_eq!(map.len(), 2 - usize::from(removed));
+    });
+    assert!(REMOVED_OTHER.load(CoverageOrdering::Relaxed));
+    assert!(SAW_BOTH.load(CoverageOrdering::Relaxed));
 }

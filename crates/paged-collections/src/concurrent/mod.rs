@@ -215,6 +215,7 @@ mod append;
 mod append_hive;
 mod atomic;
 mod atomic_map;
+mod count;
 mod direct;
 mod directory;
 mod free_stack;
