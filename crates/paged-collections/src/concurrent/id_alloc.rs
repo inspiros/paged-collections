@@ -326,6 +326,30 @@ mod tests {
     }
 
     #[test]
+    fn the_last_indices_below_u32_max_are_issued_freed_and_reused() {
+        // Reservation resumes 3 below the limit: the last page is
+        // [2^32 - 4096, 2^32), and its top slot (index u32::MAX) is NONE.
+        let mut ids: ConcurrentIdAllocator<4096> = ConcurrentIdAllocator::new();
+        ids.free.set_next_fresh(MAX_INDICES - 3);
+        let got: Vec<Id> = (0..3).map(|_| ids.allocate()).collect();
+        let indices: Vec<u32> = got.iter().map(|id| id.index()).collect();
+        assert_eq!(indices, [MAX_INDICES - 3, MAX_INDICES - 2, MAX_INDICES - 1]);
+        assert_eq!(ids.try_allocate(), None);
+        assert_eq!(ids.index_bound(), MAX_INDICES);
+        assert!(!ids.is_live(Id::new(MAX_INDICES, got[0].generation())));
+        assert!(!ids.free(Id::new(MAX_INDICES, got[0].generation())));
+        // The top index goes back on a stack and comes out with a new
+        // generation; nothing else is issued.
+        assert!(ids.free(got[2]));
+        let again = ids.allocate();
+        assert_eq!(again.index(), MAX_INDICES - 1);
+        assert_ne!(again, got[2]);
+        assert!(ids.is_live(again) && !ids.is_live(got[2]));
+        assert_eq!(ids.try_allocate(), None);
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
     fn a_live_index_on_the_free_stack_is_never_reissued() {
         // Simulates the stack corruption an ABA tag wrap could cause: a
         // live index sits on the free stack.

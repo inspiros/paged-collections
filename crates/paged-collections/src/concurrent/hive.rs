@@ -1168,6 +1168,36 @@ mod tests {
         assert!(hive.is_empty());
     }
 
+    // Leaks the hive: exclusive cleanup (drop, clear, shrink) walks every
+    // index below the bound, ~4.3e9 here.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn the_last_slots_below_u32_max_hold_values_and_exhaust_exactly() {
+        // The last page is [2^32 - 4096, 2^32); its top slot (index
+        // u32::MAX) is NONE and never usable.
+        let mut hive = ConcurrentHive::<u64, 4096>::new();
+        hive.free.set_next_fresh(MAX_INDICES - 2);
+        let a = hive.insert(1);
+        let b = hive.insert(2);
+        assert_eq!((a.index(), b.index()), (MAX_INDICES - 2, MAX_INDICES - 1));
+        assert_eq!(hive.try_insert(3), Err(3));
+        assert_eq!(hive.index_bound(), MAX_INDICES);
+        assert_eq!((*hive.get(a).unwrap(), *hive.get(b).unwrap()), (1, 2));
+        let top = Id::new(MAX_INDICES, b.generation());
+        assert!(hive.get(top).is_none() && !hive.remove(top));
+        assert_eq!(hive.take(top), None);
+        // The top usable slot is reused with a new generation.
+        assert_eq!(hive.take(b), Some(2));
+        let c = hive.insert(4);
+        assert_eq!(c.index(), MAX_INDICES - 1);
+        assert!(c != b && hive.get(b).is_none());
+        assert_eq!(*hive.get(c).unwrap(), 4);
+        assert_eq!(hive.try_insert(5), Err(5));
+        assert_eq!(hive.len(), 2);
+        // u64 values need no drop; the pages are freed with the process.
+        core::mem::forget(hive);
+    }
+
     #[test]
     fn a_live_stack_hint_is_discarded() {
         let hive = ConcurrentHive::<u8, 2>::new();

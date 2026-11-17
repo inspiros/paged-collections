@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool as StdAtomicBool, Ordering as StdOrdering};
 
 use super::ConcurrentIdAllocator;
 use super::atomic::AtomicU32;
-use super::free_stack::{FreeStack, set_loom_shard};
+use super::free_stack::{FreeStack, SPLICE_RETRIED, set_loom_shard};
 
 fn model(f: impl Fn() + Send + Sync + 'static) {
     let mut builder = loom::model::Builder::new();
@@ -155,6 +155,65 @@ fn a_stolen_chain_carries_links_published_by_its_pusher() {
         all.sort_unstable();
         assert_eq!(all, [1, 2]);
     });
+}
+
+/// A thief splices the chain [1] (it keeps 2) onto shard 0, which holds
+/// [0], while a shard-mate pops 0 (`push_instead` false) or pushes 3 (true).
+/// The thief's CAS fails and must retry with its cached tail relinked to the
+/// new top: NONE after the pop, 3 after the push. (One mate doing both
+/// would hide a stale link: loom runs it through the thief's retry yield.)
+fn splice_under_a_changing_stack(push_instead: bool) {
+    SPLICE_RETRIED.store(false, StdOrdering::Relaxed);
+    model(move || {
+        let stack = Arc::new(FreeStack::new());
+        let links: Arc<[AtomicU32; 4]> = Arc::new(core::array::from_fn(|_| AtomicU32::new(0)));
+        for _ in 0..4 {
+            stack.fresh(4, 1);
+        }
+        stack.push(0, &links[0]);
+        set_loom_shard(1);
+        stack.push(1, &links[1]);
+        stack.push(2, &links[2]);
+        set_loom_shard(0);
+        let (s, l) = (stack.clone(), links.clone());
+        let thief = thread::spawn(move || s.steal(|i| &l[i as usize]));
+        let (s, l) = (stack.clone(), links.clone());
+        let mate = thread::spawn(move || {
+            if push_instead {
+                s.push(3, &l[3]);
+                None
+            } else {
+                s.pop(|i| &l[i as usize])
+            }
+        });
+        let stolen = thief.join().unwrap();
+        let popped = mate.join().unwrap();
+        assert_eq!(stolen, Some(2));
+        let mut all: Vec<u32> = popped.into_iter().collect();
+        all.push(2);
+        let next = |i: u32| &links[i as usize];
+        while let Some(i) = stack.pop(next).or_else(|| stack.steal(next)) {
+            all.push(i);
+        }
+        all.sort_unstable();
+        let expected: &[u32] = if push_instead {
+            &[0, 1, 2, 3]
+        } else {
+            &[0, 1, 2]
+        };
+        assert_eq!(all, expected);
+    });
+    assert!(
+        SPLICE_RETRIED.load(StdOrdering::Relaxed),
+        "no schedule retried a splice with a cached tail"
+    );
+}
+
+#[test]
+fn a_stolen_chain_splices_under_a_concurrent_pop_and_push() {
+    // One test: SPLICE_RETRIED is global, and other models also install.
+    splice_under_a_changing_stack(false);
+    splice_under_a_changing_stack(true);
 }
 
 /// Every index below the bound is either handed out or listed as unissued.

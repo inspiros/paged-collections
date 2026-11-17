@@ -98,6 +98,12 @@ fn shard_index() -> usize {
     LOOM_SHARD.with(|shard| shard.get())
 }
 
+/// Set when `install` retries its CAS with a cached chain tail (a plain
+/// atomic outside loom's model): loom models assert they reach that path.
+#[cfg(loom)]
+pub(super) static SPLICE_RETRIED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Makes the calling loom thread use `shard` (default 0).
 #[cfg(loom)]
 pub(super) fn set_loom_shard(shard: usize) {
@@ -368,6 +374,10 @@ impl FreeStack {
             match head.compare_exchange_weak(word, new, Ordering::SeqCst, Ordering::Acquire) {
                 Ok(_) => break,
                 Err(actual) => word = actual,
+            }
+            #[cfg(loom)]
+            if tail.is_some() {
+                SPLICE_RETRIED.store(true, core::sync::atomic::Ordering::Relaxed);
             }
             retry(&mut spins);
         }
@@ -842,6 +852,57 @@ mod tests {
         next.store(word as u32, Ordering::Relaxed);
         head.store((word & !INDEX) | u64::from(index), Ordering::Relaxed);
         stack.mark(shard);
+    }
+
+    /// The real limit is `u32::MAX`, which is also `NONE` and the top of the
+    /// packed block word's cursor half: no index may reach it, and a block
+    /// ending there must not carry into the end half.
+    #[test]
+    fn blocks_and_single_reservations_stop_just_below_u32_max() {
+        const LIMIT: u32 = u32::MAX;
+        assert_eq!(NONE, LIMIT);
+        // Block mode: the last aligned block [2^32 - 4096, 2^32) is clipped
+        // to end at the limit, so it holds 4095 indices.
+        let mut stack = FreeStack::new();
+        let start = LIMIT - 4095;
+        stack.set_next_fresh(start - 2);
+        stack.force_blocks();
+        assert_eq!(stack.fresh(LIMIT, 4096), Some(start - 2)); // [start - 2, start)
+        assert_eq!(stack.fresh(LIMIT, 4096), Some(start - 1));
+        assert_eq!(stack.fresh(LIMIT, 4096), Some(start)); // the clipped block
+        assert_eq!(stack.index_bound(), LIMIT);
+        let own = &stack.shards[shard_index()];
+        assert_eq!(own.block.load(Ordering::Relaxed), pack(start + 1, LIMIT));
+        let mut unissued = stack.unissued();
+        assert!(!unissued.contains(start));
+        assert!(unissued.contains(start + 1));
+        assert!(unissued.contains(LIMIT - 1));
+        assert!(!unissued.contains(LIMIT));
+        for expected in start + 1..LIMIT {
+            assert_eq!(stack.fresh(LIMIT, 4096), Some(expected));
+        }
+        // The cursor reached the end without overflowing into it.
+        let own = &stack.shards[shard_index()];
+        assert_eq!(own.block.load(Ordering::Relaxed), pack(LIMIT, LIMIT));
+        assert_eq!(stack.fresh(LIMIT, 4096), None);
+        assert_eq!(stack.fresh(LIMIT, 4096), None);
+        assert_eq!(stack.index_bound(), LIMIT);
+        assert!(!stack.unissued().contains(LIMIT - 1));
+
+        // SINGLE mode through the inlined claim path.
+        let links = links(2);
+        let mut stack = FreeStack::new();
+        stack.set_next_fresh(LIMIT - 2);
+        let claim =
+            |stack: &FreeStack| stack.next_index(|i| &links[i as usize], || None, LIMIT, 4096);
+        assert_eq!(claim(&stack), Some((LIMIT - 2, false)));
+        assert_eq!(claim(&stack), Some((LIMIT - 1, false)));
+        assert_eq!(claim(&stack), None);
+        assert_eq!(stack.index_bound(), LIMIT);
+        assert_eq!(
+            stack.shards[shard_index()].block.load(Ordering::Relaxed),
+            SINGLE
+        );
     }
 
     #[test]
