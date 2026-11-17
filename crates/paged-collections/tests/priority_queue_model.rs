@@ -38,6 +38,7 @@ fn max_len() -> usize {
 enum Op<K> {
     Push(K, i32),
     TryPush(K, i32),
+    Replace(K, i32),
     Increase(K, i32),
     Decrease(K, i32),
     Change(K, i32),
@@ -59,6 +60,7 @@ fn operations<K: Key + Debug + 'static>(keys: BoxedStrategy<K>) -> BoxedStrategy
     prop_oneof![
         12 => entries.clone().prop_map(|(k, p)| Op::Push(k, p)),
         8 => entries.clone().prop_map(|(k, p)| Op::TryPush(k, p)),
+        6 => entries.clone().prop_map(|(k, p)| Op::Replace(k, p)),
         6 => entries.clone().prop_map(|(k, p)| Op::Increase(k, p)),
         6 => entries.clone().prop_map(|(k, p)| Op::Decrease(k, p)),
         6 => entries.clone().prop_map(|(k, p)| Op::Change(k, p)),
@@ -180,6 +182,13 @@ where
                     model_push(&mut model, key, priority)
                 );
                 pages.insert(key.index() / PAGE);
+            }
+            &Op::Replace(key, priority) => {
+                let old = model.keys().find(|k| k.index() == key.index()).copied();
+                let expected = old.map(|old| (old, model.remove(&old).unwrap()));
+                model.insert(key, priority);
+                pages.insert(key.index() / PAGE);
+                prop_assert_eq!(queue.replace(key, priority), expected);
             }
             &Op::TryPush(key, priority) => {
                 let occupied_by_other = model.keys().any(|k| k.index() == key.index() && *k != key);

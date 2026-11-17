@@ -870,10 +870,53 @@ impl<T, const PAGE: usize> Hive<T, PAGE> {
     /// assert_eq!(hive[first], 1); // the id now names the smallest element
     /// ```
     pub fn sort_by(&mut self, mut compare: impl FnMut(&T, &T) -> Ordering) {
+        self.permute_by(|values, order| order.sort_by(|&a, &b| compare(values[a], values[b])));
+    }
+
+    /// Sorts the elements in place with `compare`, without preserving the
+    /// order of equal elements. Otherwise as [`sort_by`](Self::sort_by)
+    /// (same id and address semantics; O(n) extra memory).
+    pub fn sort_unstable_by(&mut self, mut compare: impl FnMut(&T, &T) -> Ordering) {
+        self.permute_by(|values, order| {
+            order.sort_unstable_by(|&a, &b| compare(values[a], values[b]));
+        });
+    }
+
+    /// Sorts the elements in place by key, without preserving the order of
+    /// equal elements; see [`sort_unstable_by`](Self::sort_unstable_by).
+    pub fn sort_unstable_by_key<K: Ord>(&mut self, mut key: impl FnMut(&T) -> K) {
+        self.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+    }
+
+    /// Sorts the elements in place, without preserving the order of equal
+    /// elements; see [`sort_unstable_by`](Self::sort_unstable_by).
+    pub fn sort_unstable(&mut self)
+    where
+        T: Ord,
+    {
+        self.sort_unstable_by(T::cmp);
+    }
+
+    /// Sorts the elements in place by key, calling `key` once per element
+    /// (a stable sort); see [`sort_by`](Self::sort_by).
+    pub fn sort_by_cached_key<K: Ord>(&mut self, mut key: impl FnMut(&T) -> K) {
+        self.permute_by(|values, order| {
+            let keys: Vec<K> = values.iter().map(|v| key(v)).collect();
+            order.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
+        });
+    }
+
+    /// Computes a permutation of the live elements with `arrange` (given
+    /// the elements in slot order and the identity permutation to reorder),
+    /// then moves the elements to match. If `arrange` panics, nothing moves.
+    fn permute_by(&mut self, arrange: impl FnOnce(&[&T], &mut [usize])) {
         let mut values: Vec<&mut T> = self.values_mut().collect();
         // `order[k]` is the position of the element that belongs at `k`.
         let mut order: Vec<usize> = (0..values.len()).collect();
-        order.sort_by(|&a, &b| compare(&*values[a], &*values[b]));
+        {
+            let shared: Vec<&T> = values.iter().map(|v| &**v).collect();
+            arrange(&shared, &mut order);
+        }
         // Apply the permutation one cycle at a time: the element for
         // position `k` sits at `order[k]`; follow the cycle with swaps.
         for start in 0..order.len() {

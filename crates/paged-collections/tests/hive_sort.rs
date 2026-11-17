@@ -41,6 +41,42 @@ proptest! {
     }
 
     #[test]
+    fn unstable_and_cached_sorts_match_std(values in prop::collection::vec((0_u8..8, any::<bool>()), 0..60)) {
+        let base = build(&values);
+        let ids: Vec<_> = base.ids().collect();
+        let mut stable: Vec<_> = base.values().copied().collect();
+        stable.sort_by_key(|&(v, _)| v);
+        let mut whole = stable.clone();
+        whole.sort();
+
+        let mut cached = base.clone();
+        let mut calls = 0;
+        cached.sort_by_cached_key(|&(v, _)| { calls += 1; v });
+        prop_assert_eq!(calls, stable.len());
+        prop_assert_eq!(cached.values().copied().collect::<Vec<_>>(), stable.clone());
+
+        // Unstable: only the key sequence is fixed; the multiset is kept.
+        let mut by_key = base.clone();
+        by_key.sort_unstable_by_key(|&(v, _)| v);
+        let keys = |h: &Hive<(u8, usize), 4>| h.values().map(|&(v, _)| v).collect::<Vec<_>>();
+        prop_assert_eq!(keys(&by_key), stable.iter().map(|&(v, _)| v).collect::<Vec<_>>());
+        let mut sorted_back: Vec<_> = by_key.values().copied().collect();
+        sorted_back.sort();
+        prop_assert_eq!(&sorted_back, &whole);
+
+        // Elements are distinct (slot number inside), so sort_unstable is exact.
+        let mut full = base.clone();
+        full.sort_unstable();
+        prop_assert_eq!(full.values().copied().collect::<Vec<_>>(), whole.clone());
+        let mut reversed = base.clone();
+        reversed.sort_unstable_by(|a, b| b.cmp(a));
+        prop_assert_eq!(reversed.values().copied().collect::<Vec<_>>(), whole.iter().rev().copied().collect::<Vec<_>>());
+        for hive in [&cached, &by_key, &full, &reversed] {
+            prop_assert_eq!(hive.ids().collect::<Vec<_>>(), ids.clone());
+        }
+    }
+
+    #[test]
     fn id_of_inverts_get(values in prop::collection::vec((any::<u8>(), any::<bool>()), 0..60)) {
         let hive = build(&values);
         for (id, value) in hive.iter() {

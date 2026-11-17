@@ -343,6 +343,15 @@ fn comparisons<const PAGE: usize>(a: &[i32], b: &[i32]) {
         left.partial_cmp(&right),
         model_left.partial_cmp(&model_right)
     );
+    let different: PagedDeque<i32, 3> = b.iter().copied().collect();
+    assert_eq!(
+        left.partial_cmp(&different),
+        model_left.partial_cmp(&model_right)
+    );
+    assert_eq!(
+        different.partial_cmp(&left),
+        model_right.partial_cmp(&model_left)
+    );
     assert_eq!(format!("{left:?}"), format!("{model_left:?}"));
     let mut shifted: PagedDeque<_, 5> = PagedDeque::new();
     shifted.push_back(0);

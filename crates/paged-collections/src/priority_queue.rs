@@ -231,6 +231,43 @@ impl<K: Key, P: Ord, const PAGE: usize, D: Directory> PagedPriorityQueue<K, P, P
         }
     }
 
+    /// Inserts or updates as [`push`](Self::push), but returns the entry
+    /// previously in `key`'s slot, whether it was `key` itself or another
+    /// generation that is now evicted (as
+    /// [`PagedSparseMap::replace`](crate::sparse_map::PagedSparseMap::replace)).
+    ///
+    /// Unlike `push`, this stores `key` even when the old key is equal to it.
+    /// Panics under the same conditions as `push`.
+    ///
+    /// ```
+    /// use paged_collections::id_alloc::IdAllocator;
+    /// use paged_collections::priority_queue::PagedPriorityQueue;
+    ///
+    /// let mut ids = IdAllocator::new();
+    /// let old = ids.alloc();
+    /// ids.free(old);
+    /// let new = ids.alloc(); // same slot, next generation
+    /// let mut queue: PagedPriorityQueue<_, i32> = PagedPriorityQueue::new();
+    /// queue.push(old, 5);
+    /// assert_eq!(queue.replace(new, 7), Some((old, 5)));
+    /// assert_eq!(queue.replace(new, 9), Some((new, 7)));
+    /// assert_eq!(queue.pop(), Some((new, 9)));
+    /// ```
+    pub fn replace(&mut self, key: K, priority: P) -> Option<(K, P)> {
+        if let Some(pos) = self.keys.occupant_pos(key.index()) {
+            let old_key = self.keys.overwrite_at(pos, key);
+            let old = core::mem::replace(&mut self.priorities[pos], priority);
+            self.repair(pos);
+            Some((old_key, old))
+        } else {
+            self.priorities.reserve(1);
+            self.keys.insert(key);
+            self.priorities.push(priority);
+            self.sift_up(self.len() - 1);
+            None
+        }
+    }
+
     /// Inserts or updates as [`push`](Self::push), but returns the supplied
     /// pair unchanged if another generation holds the slot.
     ///

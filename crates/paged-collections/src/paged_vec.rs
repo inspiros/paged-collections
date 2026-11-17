@@ -1167,8 +1167,10 @@ impl<T: PartialEq<U>, U, const PAGE: usize, const PAGE2: usize> PartialEq<PagedV
 impl<T: Eq, const PAGE: usize> Eq for PagedVec<T, PAGE> {}
 
 /// Lexicographic, like slices.
-impl<T: PartialOrd, const PAGE: usize> PartialOrd for PagedVec<T, PAGE> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+impl<T: PartialOrd, const PAGE: usize, const PAGE2: usize> PartialOrd<PagedVec<T, PAGE2>>
+    for PagedVec<T, PAGE>
+{
+    fn partial_cmp(&self, other: &PagedVec<T, PAGE2>) -> Option<Ordering> {
         self.iter().partial_cmp(other.iter())
     }
 }

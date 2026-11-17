@@ -385,6 +385,8 @@ fn comparisons<const PAGE: usize>(a: &[i32], b: &[i32]) {
     assert_eq!(other, left);
     assert_eq!(left.cmp(&right), a.cmp(b));
     assert_eq!(left.partial_cmp(&right), a.partial_cmp(b));
+    assert_eq!(left.partial_cmp(&different), a.partial_cmp(b));
+    assert_eq!(different.partial_cmp(&left), b.partial_cmp(a));
     assert_eq!(hash(&left), hash(&other));
     assert_eq!(hash(&left), hash(&left.clone()));
 }

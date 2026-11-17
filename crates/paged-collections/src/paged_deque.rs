@@ -996,8 +996,10 @@ impl<T: PartialEq<U>, U, const PAGE: usize, const PAGE2: usize> PartialEq<PagedD
 }
 impl<T: Eq, const PAGE: usize> Eq for PagedDeque<T, PAGE> {}
 
-impl<T: PartialOrd, const PAGE: usize> PartialOrd for PagedDeque<T, PAGE> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+impl<T: PartialOrd, const PAGE: usize, const PAGE2: usize> PartialOrd<PagedDeque<T, PAGE2>>
+    for PagedDeque<T, PAGE>
+{
+    fn partial_cmp(&self, other: &PagedDeque<T, PAGE2>) -> Option<Ordering> {
         self.iter().partial_cmp(other.iter())
     }
 }
