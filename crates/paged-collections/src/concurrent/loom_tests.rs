@@ -1,5 +1,8 @@
 //! Small, bounded schedule explorations of each shared protocol.
 
+#[cfg(not(feature = "std"))]
+extern crate std;
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use loom::sync::Arc;
@@ -124,24 +127,46 @@ fn fresh_reservations_do_not_cross_the_limit() {
 
 #[test]
 fn stack_aba_preserves_exclusive_index_ownership() {
+    static REACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    REACHED.store(false, std::sync::atomic::Ordering::Relaxed);
     model(|| {
         let stack = Arc::new(FreeStack::new());
         let links = Arc::new([AtomicU32::new(0), AtomicU32::new(0)]);
-        let owned = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+        // Owner numbers let a stalled pop identify the thread that has its
+        // candidate, and confirm that thread completed its push before retry.
+        let owned = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let returned = Arc::new([
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        ]);
         stack.push(0, &links[0]);
         stack.push(1, &links[1]);
         let mut threads = Vec::new();
-        for _ in 0..3 {
+        for owner in 1..=3 {
             let stack = stack.clone();
             let links = links.clone();
             let owned = owned.clone();
+            let returned = returned.clone();
             threads.push(thread::spawn(move || {
-                if let Some(i) = stack.pop(|i| &links[i as usize]) {
-                    let i = i as usize;
-                    assert!(!owned[i].swap(true, Ordering::SeqCst));
+                if let Some(i) = stack.pop(|i| {
+                    let link = &links[i as usize];
+                    let holder = owned[i as usize].load(Ordering::SeqCst);
                     thread::yield_now();
-                    assert!(owned[i].swap(false, Ordering::SeqCst));
+                    if holder != 0 && returned[holder - 1].load(Ordering::Relaxed) {
+                        // pop already read this candidate head, then saw it
+                        // owned elsewhere. Its owner has now pushed it back:
+                        // the candidate index is back, but its tag changed.
+                        REACHED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    link
+                }) {
+                    let i = i as usize;
+                    assert_eq!(owned[i].swap(owner, Ordering::SeqCst), 0);
+                    thread::yield_now();
+                    assert_eq!(owned[i].swap(0, Ordering::SeqCst), owner);
                     stack.push(i as u32, &links[i]);
+                    returned[owner - 1].swap(true, Ordering::Relaxed);
                 }
             }));
         }
@@ -157,6 +182,7 @@ fn stack_aba_preserves_exclusive_index_ownership() {
         assert_eq!(stack.fresh(2), None);
         assert_eq!(stack.index_bound(), 2);
     });
+    assert!(REACHED.load(std::sync::atomic::Ordering::Relaxed));
 }
 
 #[test]

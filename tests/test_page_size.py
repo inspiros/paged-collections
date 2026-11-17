@@ -20,6 +20,16 @@ LISTS = tuple(getattr(pc, "PagedList" + suffix) for suffix in SUFFIXES)
 QUEUES = (pc.PriorityQueue, pc.PriorityQueueF64)
 CLASSES = (pc.SparseSet, *MAPS, *LISTS, pc.Hive, pc.PagedDeque, *QUEUES)
 SIZES = pc.PAGE_SIZES
+# DirectMap exposes copies, not buffer/view exports.
+EXPORT_CASES = (pytest.param(pc.SparseSet, "view", id="SparseSet-view"),) + tuple(
+    pytest.param(base, method, id=f"{base.__name__}-{method}")
+    for base in MAPS
+    if not base.__name__.startswith("DirectMap")
+    for method in (
+        ("keys_view",) if base in (pc.SparseMap, pc.IdMap)
+        else ("keys_view", "values_view")
+    )
+)
 
 
 def _child(base):
@@ -330,9 +340,61 @@ def test_page_size_is_keyword_only(base):
 
 @pytest.mark.parametrize("base", (pc.SparseSet, *MAPS), ids=lambda cls: cls.__name__)
 @pytest.mark.parametrize("size", SIZES)
-def test_reinitialization_retiles_without_losing_contents(base, size):
-    source = next((s for s in SIZES if s != size), size)
-    obj, oracle = _filled(base, source, 3 * source + 5)
+@pytest.mark.parametrize("with_data", (False, True), ids=("preserve", "merge"))
+@pytest.mark.skipif(len(SIZES) < 2, reason="build has only one page size")
+def test_reinitialization_retiles_without_losing_contents(base, size, with_data):
+    source = next(s for s in SIZES if s != size)
+    n = 3 * source + 5
+    obj, oracle = _filled(base, source, n)
+    _remove_some(base, obj, oracle, source)
+    args = ()
+    if with_data:
+        old_key, new_key = next(iter(oracle)), 3 * n
+        if base is pc.SparseSet:
+            args = ([old_key, new_key],)
+            oracle.update(args[0])
+        else:
+            if base.__name__.startswith("IdMap"):
+                # Re-init merges entries, evicting an older generation at
+                # the same slot just like set_many, rather than clearing.
+                replacement = pc.make_id(pc.id_index(old_key), pc.id_generation(old_key) + 1)
+                del oracle[old_key]
+                old_key = replacement
+                new_key = pc.make_id(new_key, 1)
+            keys, values = [old_key, new_key], _values(base, 2)
+            args = (keys, values)
+            oracle.update(zip(keys, values))
+    base.__init__(obj, *args, page_size=size)
+    assert obj.page_size == size
+    assert _snapshot(base, obj) == oracle
+
+
+@pytest.mark.parametrize("base, method", EXPORT_CASES)
+@pytest.mark.parametrize("size", SIZES)
+@pytest.mark.parametrize("export_kind", ("view", "buffer"))
+@pytest.mark.skipif(len(SIZES) < 2, reason="build has only one page size")
+def test_reinitialization_with_different_page_size_is_blocked_by_export(
+    base, method, size, export_kind,
+):
+    source = next(s for s in SIZES if s != size)
+    obj, oracle = _filled(base, source, 7)
+    view = getattr(obj, method)()
+    array_before = view.copy()
+    export = memoryview(view) if export_kind == "buffer" else view
+    del view  # A derived buffer must keep the export alive on its own.
+    pages = obj.allocated_pages
+    before = list(obj)
+    iterator = iter(obj)
+    # No input data: failure must come from retiling itself, even when
+    # there is no insertion or generation eviction to trigger a guard.
+    with pytest.raises(BufferError):
+        base.__init__(obj, page_size=size)
+    assert obj.page_size == source
+    assert obj.allocated_pages == pages
+    assert _snapshot(base, obj) == oracle
+    assert list(iterator) == before
+    np.testing.assert_array_equal(export, array_before)
+    del export
     base.__init__(obj, page_size=size)
     assert obj.page_size == size
     assert _snapshot(base, obj) == oracle

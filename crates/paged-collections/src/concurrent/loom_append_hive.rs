@@ -123,6 +123,8 @@ fn get_acquires_payload_written_before_publication() {
 
 #[test]
 fn iter_acquires_payload_written_before_publication() {
+    static REACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    REACHED.store(false, std::sync::atomic::Ordering::Relaxed);
     model(|| {
         let hive = Arc::new(ConcurrentAppendHive::<u32, 2>::new());
         // Preinstalled page: only slot-state publication can carry the payload.
@@ -142,9 +144,11 @@ fn iter_acquires_payload_written_before_publication() {
             assert_eq!((id, *value), (first_id(), 7));
             // No join or handshake precedes this relaxed read.
             assert_eq!(payload.load(Ordering::Relaxed), 42);
+            REACHED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         assert_eq!(producer.join().unwrap(), first_id());
     });
+    assert!(REACHED.load(std::sync::atomic::Ordering::Relaxed));
 }
 
 #[test]

@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
 use loom::thread;
+use std::sync::atomic::{AtomicBool as StdAtomicBool, Ordering as StdOrdering};
 
 use super::ConcurrentHive;
 
@@ -28,6 +29,217 @@ impl Drop for Value {
     fn drop(&mut self) {
         self.drops.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+// A guard holder writes the payload immediately before releasing its guard.
+// Checking it in the finalizer (or taker), before any join, tests the guard
+// release as well as exactly-once destruction. The counter adds no barrier.
+struct ReleaseCheckedValue {
+    tag: usize,
+    drops: Arc<AtomicUsize>,
+    payload: Arc<AtomicUsize>,
+}
+
+impl Drop for ReleaseCheckedValue {
+    fn drop(&mut self) {
+        assert_eq!(self.payload.load(Ordering::Relaxed), self.tag);
+        self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn take_and_remove_have_exactly_one_winner() {
+    static TAKE_WON: StdAtomicBool = StdAtomicBool::new(false);
+    static REMOVE_WON: StdAtomicBool = StdAtomicBool::new(false);
+    TAKE_WON.store(false, StdOrdering::Relaxed);
+    REMOVE_WON.store(false, StdOrdering::Relaxed);
+    model(|| {
+        let hive = Arc::new(ConcurrentHive::<ReleaseCheckedValue, 1>::new());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload = Arc::new(AtomicUsize::new(0));
+        let id = hive.insert(ReleaseCheckedValue {
+            tag: 7,
+            drops: drops.clone(),
+            payload: payload.clone(),
+        });
+        let guard = hive.get(id).unwrap();
+        let taker = hive.clone();
+        let a = thread::spawn(move || {
+            let Some(value) = taker.take(id) else {
+                return false;
+            };
+            assert_eq!(value.tag, 7);
+            // This read must acquire the guard's release, without a join.
+            assert_eq!(value.payload.load(Ordering::Relaxed), 7);
+            assert_eq!(value.drops.load(Ordering::Relaxed), 0);
+            drop(value);
+            true
+        });
+        let remover = hive.clone();
+        let b = thread::spawn(move || remover.remove(id));
+        thread::yield_now();
+        let marked_while_pinned = !hive.contains(id);
+        assert_eq!(guard.id(), id);
+        assert_eq!(guard.tag, 7);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        // All cross-thread handshakes above precede this write.
+        payload.store(7, Ordering::Relaxed);
+        drop(guard);
+        let taken = a.join().unwrap();
+        let removed = b.join().unwrap();
+        assert_eq!(usize::from(taken) + usize::from(removed), 1);
+        if marked_while_pinned {
+            if taken {
+                TAKE_WON.store(true, StdOrdering::Relaxed);
+            } else {
+                REMOVE_WON.store(true, StdOrdering::Relaxed);
+            }
+        }
+        assert!(hive.get(id).is_none());
+        assert!(hive.is_empty());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        drop(hive);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    });
+    assert!(TAKE_WON.load(StdOrdering::Relaxed));
+    assert!(REMOVE_WON.load(StdOrdering::Relaxed));
+}
+
+#[test]
+fn marked_slot_waits_for_both_guards() {
+    static LAST_GUARD_REACHED: StdAtomicBool = StdAtomicBool::new(false);
+    LAST_GUARD_REACHED.store(false, StdOrdering::Relaxed);
+    model(|| {
+        let hive = Arc::new(ConcurrentHive::<ReleaseCheckedValue, 1>::new());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload = Arc::new(AtomicUsize::new(0));
+        let id = hive.insert(ReleaseCheckedValue {
+            tag: 7,
+            drops: drops.clone(),
+            payload: payload.clone(),
+        });
+        let first = hive.get(id).unwrap();
+        let gate = Arc::new(Gate {
+            phase: Mutex::new(0),
+            changed: Condvar::new(),
+        });
+        let first_dropped = Arc::new(loom::sync::atomic::AtomicBool::new(false));
+        let reader = hive.clone();
+        let waiting = gate.clone();
+        let released = first_dropped.clone();
+        let a = thread::spawn(move || {
+            let second = reader.get(id).unwrap();
+            {
+                let mut phase = waiting.phase.lock().unwrap();
+                *phase = 1;
+                waiting.changed.notify_all();
+                while *phase != 2 {
+                    phase = waiting.changed.wait(phase).unwrap();
+                }
+            }
+            assert_eq!(second.id(), id);
+            assert_eq!(second.tag, 7);
+            assert_eq!(second.drops.load(Ordering::Relaxed), 0);
+            if released.load(Ordering::Relaxed) {
+                // The first guard is gone, but this guard still pins T.
+                assert_eq!(second.drops.load(Ordering::Relaxed), 0);
+                LAST_GUARD_REACHED.store(true, StdOrdering::Relaxed);
+            }
+            drop(second);
+        });
+        thread::yield_now();
+        // Wait until guard two is held before marking the slot.
+        {
+            let mut phase = gate.phase.lock().unwrap();
+            while *phase != 1 {
+                phase = gate.changed.wait(phase).unwrap();
+            }
+            assert!(hive.remove(id)); // both guards are held at the mark
+            assert!(hive.get(id).is_none());
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            *phase = 2;
+            gate.changed.notify_all();
+        }
+        assert_eq!(first.tag, 7);
+        // The mutex handoff precedes this write, so only a guard release can
+        // carry it to a finalizer on the other thread.
+        payload.store(7, Ordering::Relaxed);
+        drop(first);
+        first_dropped.swap(true, Ordering::Relaxed);
+        a.join().unwrap();
+        assert!(hive.is_empty());
+        assert!(hive.get(id).is_none());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        drop(hive);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    });
+    assert!(LAST_GUARD_REACHED.load(StdOrdering::Relaxed));
+}
+
+#[test]
+fn last_guard_finalization_races_slot_reuse() {
+    static REUSED: StdAtomicBool = StdAtomicBool::new(false);
+    static FRESH: StdAtomicBool = StdAtomicBool::new(false);
+    REUSED.store(false, StdOrdering::Relaxed);
+    FRESH.store(false, StdOrdering::Relaxed);
+    model(|| {
+        let hive = Arc::new(ConcurrentHive::<ReleaseCheckedValue, 1>::new());
+        let old_drops = Arc::new(AtomicUsize::new(0));
+        let new_drops = Arc::new(AtomicUsize::new(0));
+        let old_payload = Arc::new(AtomicUsize::new(0));
+        let old = hive.insert(ReleaseCheckedValue {
+            tag: 1,
+            drops: old_drops.clone(),
+            payload: old_payload.clone(),
+        });
+        // The last guard is held, marked and dropped on its own thread, so
+        // its finalization races the inserter in both orders.
+        let finalizer = hive.clone();
+        let b = thread::spawn(move || {
+            let guard = finalizer.get(old).unwrap();
+            assert!(finalizer.remove(old));
+            assert!(finalizer.get(old).is_none());
+            assert_eq!(guard.tag, 1);
+            old_payload.store(1, Ordering::Relaxed);
+            drop(guard); // last guard finalizes the marked slot
+        });
+        let writer = hive.clone();
+        let counted = new_drops.clone();
+        let finalized = old_drops.clone();
+        let a = thread::spawn(move || {
+            let new = writer.insert(ReleaseCheckedValue {
+                tag: 2,
+                drops: counted,
+                payload: Arc::new(AtomicUsize::new(2)),
+            });
+            // The old id never resolves to the replacement.
+            if let Some(value) = writer.get(old) {
+                assert_eq!(value.tag, 1);
+            }
+            assert_eq!(writer.get(new).unwrap().tag, 2);
+            if new.index() == old.index() {
+                assert_ne!(new, old);
+                assert_eq!(new.generation().get(), 2);
+                // Reuse implies the finalizer's drop happened before the claim.
+                assert_eq!(finalized.load(Ordering::Relaxed), 1);
+                REUSED.store(true, StdOrdering::Relaxed);
+            } else {
+                FRESH.store(true, StdOrdering::Relaxed);
+            }
+            new
+        });
+        b.join().unwrap();
+        let new = a.join().unwrap();
+        assert!(hive.get(old).is_none());
+        assert_eq!(hive.get(new).unwrap().tag, 2);
+        assert_eq!(hive.len(), 1);
+        assert_eq!(old_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(new_drops.load(Ordering::Relaxed), 0);
+        drop(hive);
+        assert_eq!(new_drops.load(Ordering::Relaxed), 1);
+    });
+    assert!(REUSED.load(StdOrdering::Relaxed));
+    assert!(FRESH.load(StdOrdering::Relaxed));
 }
 
 #[test]
@@ -346,4 +558,99 @@ fn inserts_reuse_a_freed_page_without_reviving_its_ids() {
     });
     assert!(RECYCLED_BOTH.load(std::sync::atomic::Ordering::Relaxed));
     assert!(RECYCLED_FRESH.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
+fn recycled_pages_remain_distinct_while_growing_into_the_next_chunk() {
+    static RECYCLED_READ: StdAtomicBool = StdAtomicBool::new(false);
+    static NEXT_CHUNK_READ: StdAtomicBool = StdAtomicBool::new(false);
+    RECYCLED_READ.store(false, StdOrdering::Relaxed);
+    NEXT_CHUNK_READ.store(false, StdOrdering::Relaxed);
+    model(|| {
+        // Loom's Spine BASE is 2: pages 0..2 belong to chunk 0, and page 2
+        // starts chunk 1. PAGE=1 keeps two recycled pages plus growth tiny.
+        let mut hive = ConcurrentHive::<Value, 1>::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let stale: Vec<_> = (0..2)
+            .map(|tag| {
+                hive.insert(Value {
+                    tag,
+                    drops: drops.clone(),
+                })
+            })
+            .collect();
+        for &id in &stale {
+            assert!(hive.remove(id));
+        }
+        hive.shrink_to_fit(); // both chunk-0 pages now await PageStack pops
+        assert_eq!(hive.index_bound(), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        let hive = Arc::new(hive);
+        let payload = Arc::new(AtomicUsize::new(0));
+        let writer = hive.clone();
+        let written = payload.clone();
+        let counted = drops.clone();
+        let a = thread::spawn(move || {
+            writer.insert_with(|_| {
+                // The page and chunk exist before this write, so the reader
+                // below must acquire the slot's publication, even in chunk 1.
+                written.store(42, Ordering::Relaxed);
+                Value {
+                    tag: 10,
+                    drops: counted,
+                }
+            })
+        });
+        thread::yield_now();
+        let b = hive.insert(Value {
+            tag: 20,
+            drops: drops.clone(),
+        });
+        let c = hive.insert(Value {
+            tag: 30,
+            drops: drops.clone(),
+        });
+        // Three claims consume the two recycled pages and reserve page 2.
+        // Read before joining so the producer's payload has no extra barrier.
+        for _ in 0..2 {
+            let mut saw_writer = false;
+            for (id, value) in hive.iter() {
+                if value.tag == 10 {
+                    assert_eq!(payload.load(Ordering::Relaxed), 42);
+                    if id.index() < 2 {
+                        RECYCLED_READ.store(true, StdOrdering::Relaxed);
+                    } else {
+                        assert_eq!(id.index(), 2);
+                        NEXT_CHUNK_READ.store(true, StdOrdering::Relaxed);
+                    }
+                    saw_writer = true;
+                }
+            }
+            for &id in &stale {
+                assert!(hive.get(id).is_none());
+            }
+            if saw_writer {
+                break;
+            }
+            thread::yield_now();
+        }
+        let a = a.join().unwrap();
+        let mut indices = [a.index(), b.index(), c.index()];
+        indices.sort_unstable();
+        assert_eq!(indices, [0, 1, 2]);
+        for (id, tag) in [(a, 10), (b, 20), (c, 30)] {
+            assert_eq!(hive.get(id).unwrap().tag, tag);
+            assert_eq!(id.generation().get(), if id.index() < 2 { 2 } else { 1 });
+        }
+        for &id in &stale {
+            assert!(hive.get(id).is_none());
+        }
+        assert_eq!(hive.index_bound(), 3);
+        assert_eq!(hive.len(), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        drop(hive);
+        assert_eq!(drops.load(Ordering::SeqCst), 5);
+    });
+    assert!(RECYCLED_READ.load(StdOrdering::Relaxed));
+    assert!(NEXT_CHUNK_READ.load(StdOrdering::Relaxed));
 }

@@ -1,6 +1,7 @@
 //! `Hive::id_of`, `sorted_ids*` and `sort*` against a slot-order oracle.
 
-use paged_collections::hive::Hive;
+use paged_collections::hive::{Hive, RawPage, RawSlot};
+use paged_collections::id_alloc::MAX_GENERATION;
 use proptest::prelude::*;
 
 /// Builds a hive with holes: inserts every value, then removes the ones
@@ -70,6 +71,127 @@ fn id_of_rejects_copies_and_handles_zero_sized_elements() {
     for &id in &ids {
         assert_eq!(units.id_of(&units[id]), Some(id));
     }
+}
+
+fn check_id_of<T: Copy, const PAGE: usize>(hive: &Hive<T, PAGE>, other: &Hive<T, PAGE>) {
+    for (id, value) in hive.iter() {
+        let found = hive.id_of(value).expect("live address must have an id");
+        assert_eq!(found, id);
+        assert!(std::ptr::eq(hive.get(found).unwrap(), value));
+        let copy = *value;
+        assert_eq!(hive.id_of(&copy), None);
+    }
+    for value in other.values() {
+        assert_eq!(hive.id_of(value), None);
+    }
+}
+
+fn with_empty_pages() -> Hive<(u8, usize), 4> {
+    let values: Vec<_> = (0..16).map(|i| (i, i / 4 == 0 || i / 4 == 2)).collect();
+    let mut hive = build(&values);
+    hive.reserve(12); // Empty interior pages and spare trailing pages.
+    hive
+}
+
+#[test]
+fn id_of_after_shrink_and_page_reallocation() {
+    let mut hive = with_empty_pages();
+    let other = hive.clone();
+    let before: Vec<_> = hive
+        .iter()
+        .map(|(id, value)| (id, std::ptr::from_ref(value)))
+        .collect();
+    assert!(hive.allocated_pages() > 2);
+    hive.shrink_to_fit();
+    assert_eq!(hive.allocated_pages(), 2);
+    for (id, address) in before {
+        assert!(std::ptr::eq(hive.get(id).unwrap(), address));
+    }
+    check_id_of(&hive, &other);
+    // Recreate the freed pages above their saved generation floors.
+    let reused = hive.insert((42, 42));
+    assert_eq!(reused.index(), 0);
+    assert_eq!(reused.generation().get(), 2);
+    hive.extend((0..8).map(|i| (42, i)));
+    check_id_of(&hive, &other);
+}
+
+#[test]
+fn id_of_after_last_generation_retires_a_slot() {
+    let mut hive: Hive<(u8, usize), 4> = Hive::try_from_raw_pages([
+        RawPage {
+            floor: 0,
+            slots: vec![
+                RawSlot::Occupied {
+                    version: u32::MAX,
+                    value: (9, 0),
+                },
+                RawSlot::Occupied {
+                    version: 1,
+                    value: (7, 1),
+                },
+            ],
+        },
+        RawPage {
+            floor: 0,
+            slots: vec![RawSlot::Occupied {
+                version: 1,
+                value: (5, 4),
+            }],
+        },
+    ])
+    .unwrap();
+    let other = hive.clone();
+    let last = hive.occupant(0).unwrap();
+    assert_eq!(last.generation().get(), MAX_GENERATION);
+    let removed = hive.remove(last).unwrap();
+    assert_eq!(hive.id_of(&removed), None);
+    assert_eq!(hive.get(last), None);
+    check_id_of(&hive, &other); // Live elements beside and beyond the retired slot.
+
+    hive.remove(hive.occupant(1).unwrap());
+    hive.shrink_to_fit();
+    assert_eq!(hive.allocated_pages(), 2); // The retired slot pins empty page 0.
+    check_id_of(&hive, &other);
+    for i in 0..8 {
+        let fresh = hive.insert((3, i));
+        assert_ne!(fresh.index(), 0);
+        assert_eq!(hive.occupant(0), None);
+        check_id_of(&hive, &other);
+    }
+    assert_eq!(hive.id_of(&removed), None);
+}
+
+#[test]
+fn id_of_after_clone_and_from_iter() {
+    let mut original = with_empty_pages();
+    original.shrink_to_fit();
+    let reused = original.insert((42, 42));
+    assert_eq!(reused.generation().get(), 2);
+    let cloned = original.clone();
+    let collected: Hive<_, 4> = original.values().copied().collect();
+    assert_eq!(cloned, original); // Clone preserves ids and holes.
+    assert_eq!(
+        collected.values().copied().collect::<Vec<_>>(),
+        original.values().copied().collect::<Vec<_>>()
+    ); // FromIterator starts a fresh allocation history.
+    check_id_of(&cloned, &original);
+    check_id_of(&collected, &original);
+    check_id_of(&original, &cloned);
+    check_id_of(&original, &collected);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn id_of_after_deserialization() {
+    let mut original = with_empty_pages();
+    original.shrink_to_fit();
+    original.insert((42, 42));
+    let wire = serde_json::to_string(&original).unwrap();
+    let rebuilt: Hive<(u8, usize), 4> = serde_json::from_str(&wire).unwrap();
+    assert_eq!(rebuilt, original);
+    check_id_of(&rebuilt, &original);
+    check_id_of(&original, &rebuilt);
 }
 
 #[test]

@@ -3,6 +3,7 @@
 #![cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
 
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::iter::FusedIterator;
@@ -75,6 +76,16 @@ impl Model {
             .get(&candidate.index())
             .filter(|(current, _)| *current == candidate)
             .map(|(_, value)| *value)
+    }
+
+    fn sort_by(&mut self, compare: impl FnMut(&i32, &i32) -> Ordering) {
+        let mut values: Vec<_> = self.live.values().map(|&(_, value)| value).collect();
+        values.sort_by(compare);
+        // Ids name slots: keep each id and all allocation history unchanged,
+        // assigning only the stably sorted values back in slot-index order.
+        for ((_, value), sorted) in self.live.values_mut().zip(values) {
+            *value = sorted;
+        }
     }
 
     fn insert<const PAGE: usize>(&mut self, value: i32) -> Id {
@@ -287,6 +298,10 @@ enum Op {
     FromIter(Vec<i32>),
     Mutate(i32),
     Reuse(u8),
+    Sort,
+    SortBy(u8),
+    SortByKey(u8),
+    SortedIds(u8),
 }
 
 fn operation() -> impl Strategy<Value = Op> {
@@ -312,6 +327,12 @@ fn operation() -> impl Strategy<Value = Op> {
             1 => prop::collection::vec(any::<i32>(), 0..9).prop_map(Op::FromIter),
             1 => any::<i32>().prop_map(Op::Mutate),
             2 => (0u8..9).prop_map(Op::Reuse),
+        ].boxed(),
+        6 => prop_oneof![
+            Just(Op::Sort),
+            (1u8..5).prop_map(Op::SortBy),
+            (1u8..5).prop_map(Op::SortByKey),
+            (1u8..5).prop_map(Op::SortedIds),
         ].boxed(),
     ]
 }
@@ -593,6 +614,41 @@ impl<const PAGE: usize> Machine<PAGE> {
                         .wrapping_sub(1);
                 }
             }
+            Op::Sort => {
+                self.hive.sort();
+                self.model.sort_by(i32::cmp);
+            }
+            Op::SortBy(divisor) => {
+                // Small key spaces make unequal values compare equal, so
+                // stability is observable even though the payload is i32.
+                let key = |value: &i32| value.rem_euclid(i32::from(divisor));
+                self.hive.sort_by(|a, b| key(b).cmp(&key(a)));
+                self.model.sort_by(|a, b| key(b).cmp(&key(a)));
+            }
+            Op::SortByKey(divisor) => {
+                let key = |value: &i32| value.rem_euclid(i32::from(divisor));
+                self.hive.sort_by_key(key);
+                self.model.sort_by(|a, b| key(a).cmp(&key(b)));
+            }
+            Op::SortedIds(divisor) => {
+                let mut pairs = self.model.pairs();
+                pairs.sort_by_key(|&(_, value)| value);
+                let expected: Vec<_> = pairs.iter().map(|&(id, _)| id).collect();
+                assert_eq!(self.hive.sorted_ids(), expected);
+
+                let key = |value: &i32| value.rem_euclid(i32::from(divisor));
+                // Start again in slot order: ties retain that order, not the
+                // value order used by the sorted_ids oracle above.
+                let mut pairs = self.model.pairs();
+                pairs.sort_by_key(|&(_, value)| key(&value));
+                let expected: Vec<_> = pairs.iter().map(|&(id, _)| id).collect();
+                assert_eq!(self.hive.sorted_ids_by_key(key), expected);
+                assert_eq!(
+                    self.hive.sorted_ids_by(|a, b| key(a).cmp(&key(b))),
+                    expected
+                );
+                // The unchanged model is checked below: no value may move.
+            }
             Op::Reuse(raw) => {
                 let removed: Vec<_> = self
                     .model
@@ -613,6 +669,8 @@ impl<const PAGE: usize> Machine<PAGE> {
                 }
             }
         }
+        // This compares addresses by id (slot), not by value. Sorting moves
+        // values between those addresses while preserving the occupied slots.
         assert_stable(&self.hive, &before);
         check(&mut self.hive, &self.model);
     }
@@ -1095,6 +1153,40 @@ fn sequence<const PAGE: usize>(initial: &[i32], operations: &[Op]) -> Machine<PA
     machine.step(&Op::Extend(initial.to_vec()));
     machine.run(operations);
     machine
+}
+
+fn sorts_with_holes<const PAGE: usize>() {
+    let mut machine = sequence::<PAGE>(
+        &[5, 2, 9, 1, 6, 3, 10, 4],
+        &[Op::Remove(Target::Live(1)), Op::Remove(Target::Live(3))],
+    );
+    let ids: Vec<_> = machine.hive.ids().collect();
+    machine.step(&Op::SortBy(3));
+    assert_eq!(
+        machine.hive.values().copied().collect::<Vec<_>>(),
+        [5, 1, 10, 4, 9, 3]
+    );
+    machine.step(&Op::SortedIds(3));
+    machine.step(&Op::SortByKey(3));
+    assert_eq!(
+        machine.hive.values().copied().collect::<Vec<_>>(),
+        [9, 3, 1, 10, 4, 5]
+    );
+    machine.step(&Op::Sort);
+    assert_eq!(machine.hive.ids().collect::<Vec<_>>(), ids);
+    // Follow sorting with reuse and another sort, checking that neither
+    // generations nor the free-list history were reordered with the values.
+    machine.step(&Op::Reuse(2));
+    machine.step(&Op::SortBy(1)); // Every comparison is equal.
+    machine.step(&Op::SortedIds(1));
+}
+
+#[test]
+fn stable_sorts_match_model_with_holes_and_reuse() {
+    sorts_with_holes::<1>();
+    sorts_with_holes::<2>();
+    sorts_with_holes::<3>();
+    sorts_with_holes::<4>();
 }
 
 fn reserve_probe<const PAGE: usize>(operations: &[Op], n: usize, fallible: bool) {
