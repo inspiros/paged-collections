@@ -14,7 +14,7 @@ name = "_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-paged-collections = { workspace = true }
+paged-collections = { workspace = true, features = ["concurrent"] }
 pyo3 = { workspace = true }
 numpy = { workspace = true }
 

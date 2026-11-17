@@ -7,7 +7,7 @@ bindings built on PyO3.
 > Python bindings cover the sparse sets and maps, `DirectMap`, `IdAllocator`,
 > `IdMap`, `Hive`, `PagedList`, `PagedDeque` and the priority queues
 > (`PriorityQueue`, `PriorityQueueF64`).
-> Concurrent types have no Python bindings. Nothing is published.
+> Python binds only the primitive-valued concurrent sets and maps. Nothing is published.
 
 ## Why paging
 
@@ -319,6 +319,17 @@ PAGED_COLLECTIONS_PAGE_SIZES=64,1024,16384 PAGED_COLLECTIONS_DEFAULT_PAGE_SIZE=1
 Sizes are integers in `1..=1048576` without duplicates, and the default must
 be one of them. A pickle made with a size the reading build lacks raises
 `ValueError` when loaded.
+
+### Concurrent types
+
+`ConcurrentSparseSet` and the typed `ConcurrentSparseMap*` and
+`ConcurrentDirectMap*` classes support shared access from Python threads.
+They use the default page size and flat directory; sparse variants only insert
+while shared, and existing sparse map values are preserved. Batch methods
+release the GIL; single-key calls do not. Free-threaded builds are not yet
+published. Results are copies; there are no guards or views. Sparse removal
+and `clear` are exclusive: a conflicting exclusive call raises `RuntimeError`
+(`Already borrowed`). Direct map snapshots are ordered by key.
 
 ## Layout
 

@@ -12,6 +12,7 @@ use pyo3::types::{PyDict, PyIterator, PyTuple, PyType};
 
 include!(concat!(env!("OUT_DIR"), "/page_sizes.rs"));
 
+mod concurrent;
 mod convert;
 mod deque;
 mod direct_map;
@@ -278,6 +279,14 @@ mod _core {
 
     #[pymodule_export]
     use super::{_rebuild, _rebuild_paged};
+    #[pymodule_export]
+    use crate::concurrent::{
+        ConcurrentDirectMapBool, ConcurrentDirectMapF32, ConcurrentDirectMapF64,
+        ConcurrentDirectMapI32, ConcurrentDirectMapI64, ConcurrentDirectMapU32,
+        ConcurrentDirectMapU64, ConcurrentSparseMapBool, ConcurrentSparseMapF32,
+        ConcurrentSparseMapF64, ConcurrentSparseMapI32, ConcurrentSparseMapI64,
+        ConcurrentSparseMapU32, ConcurrentSparseMapU64, ConcurrentSparseSet,
+    };
     #[pymodule_export]
     use crate::deque::{PagedDeque, PagedDequeIterator};
     #[pymodule_export]
