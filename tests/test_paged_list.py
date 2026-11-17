@@ -896,3 +896,111 @@ def test_review_array_dtype_property_can_mutate(typed_cls):
         pass  # NumPy may refuse the proxy; it must not be a borrow error
     except RuntimeError as err:  # pragma: no cover - the bug being guarded
         pytest.fail(f"borrow held during astype: {err}")
+
+
+@pytest.mark.parametrize("op", [operator.lt, operator.le, operator.gt, operator.ge])
+@pytest.mark.parametrize("left,right", [([], []), ([], [1]), ([1], []), ([1], [1]),
+                                        ([1], [1, 2]), ([1, 2], [1]),
+                                        ([1, 3], [1, 2]), ([1, 2], [2])])
+def test_ordering_matches_list(list_cls, op, left, right):
+    left, right = data(list_cls, left), data(list_cls, right)
+    assert op(list_cls(left), list_cls(right)) == op(left, right)
+
+
+@pytest.mark.parametrize("op,name", [(operator.lt, "__lt__"), (operator.le, "__le__"),
+                                     (operator.gt, "__gt__"), (operator.ge, "__ge__")])
+def test_ordering_foreign_types_and_reflection(list_cls, op, name):
+    value = list_cls(data(list_cls, [1]))
+    others = (cls(data(cls, [1])) for cls in CLASSES if cls is not list_cls)
+    for other in ([1], (1,), object(), *others):
+        assert getattr(value, name)(other) is NotImplemented
+        with pytest.raises(TypeError):
+            op(value, other)
+        with pytest.raises(TypeError):
+            op(other, value)
+
+    class Reflected:
+        def __lt__(self, other):
+            return "reflected"
+        __le__ = __gt__ = __ge__ = __lt__
+
+    assert op(value, Reflected()) == "reflected"
+
+
+@pytest.mark.parametrize("op", [operator.lt, operator.le, operator.gt, operator.ge])
+def test_ordering_subclasses_bypass_iter(list_cls, op):
+    class SubList(list_cls):
+        def __iter__(self):
+            raise AssertionError("list ordering does not use __iter__")
+
+    class SubBuiltin(list):
+        def __iter__(self):
+            raise AssertionError("list ordering does not use __iter__")
+
+    for left, right in (([1], [1, 2]), ([2], [1]), ([1], [1])):
+        left, right = data(list_cls, left), data(list_cls, right)
+        assert op(SubList(left), list_cls(right)) == op(SubBuiltin(left), list(right))
+        assert op(list_cls(left), SubList(right)) == op(list(left), SubBuiltin(right))
+
+
+@pytest.mark.parametrize("op", [operator.lt, operator.le, operator.gt, operator.ge])
+def test_object_ordering_callback_mutation_matches_list(op):
+    def exercise(cls):
+        left, right = cls(), cls()
+        events = []
+
+        class Value:
+            def __eq__(self, other):
+                events.append("eq")
+                left.clear()
+                right.clear()
+                return False
+
+            def __lt__(self, other):
+                events.append("lt")
+                left.append(8)
+                return True
+
+            def __le__(self, other):
+                events.append("le")
+                left.append(8)
+                return True
+
+            def __gt__(self, other):
+                events.append("gt")
+                left.append(8)
+                return False
+
+            def __ge__(self, other):
+                events.append("ge")
+                left.append(8)
+                return False
+
+        left.append(Value())
+        right.append(Value())
+        return op(left, right), events, list(left), list(right)
+
+    assert exercise(pc.PagedList) == exercise(list)
+
+
+def test_object_ordering_returns_element_result_and_propagates_exceptions():
+    marker = object()
+
+    class Value:
+        def __lt__(self, other):
+            return marker
+
+        def __le__(self, other):
+            raise LookupError("comparison failed")
+
+    a, b = Value(), Value()
+    assert (pc.PagedList([a]) < pc.PagedList([b])) is ([a] < [b]) is marker
+    with pytest.raises(LookupError, match="comparison failed"):
+        pc.PagedList([a]) <= pc.PagedList([b])
+
+
+@pytest.mark.parametrize("cls", [pc.PagedListF64, pc.PagedListF32])
+@pytest.mark.parametrize("op", [operator.lt, operator.le, operator.gt, operator.ge])
+def test_typed_ordering_nan(cls, op):
+    # Separate NaN objects avoid list's object-identity equality shortcut.
+    assert op(cls([float("nan")]), cls([float("nan")])) == op([float("nan")], [float("nan")])

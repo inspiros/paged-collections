@@ -56,7 +56,7 @@ impl<V: Copy> CopyMap<V> for RustDirectMap<Key, V> {
 /// clear require exclusive access and raise RuntimeError ("Already borrowed")
 /// if another call holds a shared borrow. Uses the default Rust page size
 /// and Flat directory; there are no guards, views or pickle support.
-#[pyclass(module = "paged_collections._core")]
+#[pyclass(module = "paged_collections._core", weakref)]
 pub(crate) struct ConcurrentSparseSet {
     set: RustSparseSet<Key>,
 }
@@ -162,7 +162,7 @@ macro_rules! concurrent_map {
             "Snapshots can omit insertions in flight; direct snapshots are consistent ",
             "per page only. Batch calls are not transactions."
         )]
-        #[pyclass(module = "paged_collections._core")]
+        #[pyclass(module = "paged_collections._core", weakref)]
         pub(crate) struct $name {
             map: $inner,
         }

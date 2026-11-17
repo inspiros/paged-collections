@@ -102,10 +102,10 @@ assert_eq!(in_range, [10, 20]);
 `Hive::id_of` turns a reference to an element back into its id, by address,
 in time proportional to the number of pages. To visit elements in order,
 `sorted_ids` (and `_by`, `_by_key`) returns the live ids sorted by element
-and moves nothing. `sort` (and `_by`, `_by_key`) instead reorders the
-elements across the occupied slots, so iteration yields them sorted. Ids
-name slots, so after `sort` each id names whatever element moved into its
-slot.
+and moves nothing. `sort` (and `_by`, `_by_key`, `_by_cached_key`, and the
+`sort_unstable*` variants) instead reorders the elements across the
+occupied slots, so iteration yields them sorted. Ids name slots, so after
+`sort` each id names whatever element moved into its slot.
 
 ```rust
 use paged_collections::hive::Hive;
@@ -185,6 +185,15 @@ arrays are rejected, and batch insertion still rejects out-of-range keys.
 `SparseSet` holds keys, `SparseMap` maps keys to any objects, and
 `SparseMapF64`, `SparseMapI64` and the other typed maps (or
 `sparse_map(dtype)`) store numbers unboxed.
+
+`SparseSet` supports set algebra, subset comparisons and iterable methods like
+`set`. Algebra operators require `SparseSet` operands; methods accept iterables
+of keys. Copied results use the receiver's page size and retain surviving
+receiver order, followed by new keys in operand iteration order.
+`difference_update` and `-=` use the same swap removal as `discard`; other
+in-place algebra retains surviving receiver order. In-place algebra raises
+`BufferError` while a view is alive.
+
 Typed containers store values, not objects, so NaN != NaN as in NumPy:
 a typed list or map containing NaN does not compare equal even to itself.
 
@@ -263,7 +272,12 @@ names[c]                          # "new"
 form: `insert` returns an id, removing a value makes its id stale for good,
 and a freed slot is reused with the next generation. Iteration is in slot
 order; pickles and copies keep every id and the generation history. An
-`IdMap` keyed by hive ids makes a side table.
+`IdMap` keyed by hive ids makes a side table. `sort(key=None, reverse=False)`
+stably reorders values within occupied slots: ids name slots, so their values
+can change after a sort. `sorted_ids(key=None, reverse=False)` returns ids in
+stable value/key order without moving values. Both preserve equal-key order
+with `reverse=True`; callback errors leave the hive unchanged except for
+callback mutations, which are detected with `RuntimeError`.
 
 ```python
 from paged_collections import Hive
@@ -279,8 +293,10 @@ hive[c]                              # "d"
 
 `PagedList` is a list stored in pages of elements, so appending never
 moves existing elements; `paged_list(dtype)` picks a typed list (float64,
-int64 and the other map dtypes). Slices are copies. A typed list's
-`page_view(i)` is a zero-copy NumPy view of one page that stays valid while
+int64 and the other map dtypes). Slices are copies. Ordering comparisons
+are lexicographic like `list`, between instances of the same concrete list
+type (including subclasses). A typed list's `page_view(i)` is a zero-copy
+NumPy view of one page that stays valid while
 the list grows; while any view is alive, operations that remove, move or
 reorder elements raise `BufferError`.
 
@@ -293,6 +309,8 @@ page[0] = 4.0                     # updates values[0]
 values.extend(range(5000))        # allowed: existing pages never move
 values.pop()                      # BufferError while `page` is alive
 ```
+
+All public container classes support weak references.
 
 Every paged class takes a keyword-only `page_size`, one of
 `paged_collections.PAGE_SIZES` (by default 256, 512, 1024, 2048 and 4096),

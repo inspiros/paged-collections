@@ -589,3 +589,174 @@ def test_review_many_single_inserts_are_fast():
     ids = [hive.insert(i) for i in range(200_000)]
     assert time.perf_counter() - start < 5
     assert len(hive) == 200_000 and hive[ids[-1]] == 199_999
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("use_key", [False, True])
+def test_sort_and_sorted_ids_match_builtin(reverse, use_key):
+    values = [(2, "a"), (1, "a"), (2, "b"), (1, "b"), (3, "a")]
+    hive = Hive(values)
+    dead = list(hive)[2]
+    del hive[dead]  # Sorting must leave the hole and ids unchanged.
+    before = hive.items()
+    key = (lambda value: value[0]) if use_key else None
+    expected = sorted(hive.values(), key=key, reverse=reverse)
+    expected_ids = sorted(list(hive), key=lambda id: key(hive[id]) if key else hive[id],
+                          reverse=reverse)
+    assert hive.sorted_ids(key=key, reverse=reverse) == expected_ids
+    assert hive.items() == before
+    ids = list(hive)
+    assert hive.sort(key=key, reverse=reverse) is None
+    assert list(hive) == ids
+    assert hive.values() == expected
+    assert dead not in hive and hive.occupant(id_index(dead)) is None
+    assert hive.get_many(ids) == expected  # Ids name slots, not objects.
+
+
+@pytest.mark.parametrize("method", ["sort", "sorted_ids"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_sort_stability_only_uses_less_than(method, reverse):
+    class Key:
+        def __init__(self, value):
+            self.value = value
+
+        def __eq__(self, other):
+            raise AssertionError("sort must not use equality")
+
+        def __lt__(self, other):
+            return self.value < other.value
+
+    values = [(i % 3, i) for i in range(30)]
+    hive = Hive(values)
+    expected = sorted(values, key=lambda v: Key(v[0]), reverse=reverse)
+    calls = []
+
+    def key(value):
+        calls.append(value)
+        assert len(hive) == len(values)  # No PyRef is held during callbacks.
+        return Key(value[0])
+
+    result = getattr(hive, method)(key=key, reverse=reverse)
+    assert calls == values
+    assert (hive.get_many(result) if method == "sorted_ids" else hive.values()) == expected
+
+
+@pytest.mark.parametrize("method", ["sort", "sorted_ids"])
+def test_sorted_ids_distinguishes_repeated_object_slots(method):
+    value = object()
+    hive = Hive([value, value, value])
+    ids = list(hive)
+    keys = iter([2, 0, 1])
+    result = getattr(hive, method)(key=lambda _: next(keys))
+    if method == "sorted_ids":
+        assert result == [ids[1], ids[2], ids[0]]
+    assert all(v is value for v in hive.values())
+
+
+@pytest.mark.parametrize("method", ["sort", "sorted_ids"])
+@pytest.mark.parametrize("failure", ["key", "compare"])
+def test_sort_exceptions_leave_state_unchanged(method, failure):
+    hive = Hive([3, 1, 2])
+    before = hive.items()
+
+    class Key:
+        def __lt__(self, other):
+            assert hive.items() == before
+            raise LookupError("comparison failed")
+
+    def key(value):
+        assert hive.items() == before
+        if failure == "key" and value == 1:
+            raise LookupError("key failed")
+        return Key()
+
+    with pytest.raises(LookupError, match="failed"):
+        getattr(hive, method)(key=key)
+    assert hive.items() == before
+
+
+@pytest.mark.parametrize("method", ["sort", "sorted_ids"])
+@pytest.mark.parametrize("mutation", ["replace", "insert", "remove", "reinit", "restore"])
+def test_sort_rejects_callback_mutation(method, mutation):
+    hive = Hive([3, 1, 2])
+    ids = list(hive)
+    calls = 0
+
+    def key(value):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if mutation == "replace":
+                hive[ids[0]] = 9
+            elif mutation == "insert":
+                hive.insert(4)
+            elif mutation == "remove":
+                del hive[ids[1]]
+            elif mutation == "reinit":
+                hive.__init__([8], _state=([], [], []))
+            else:
+                hive[ids[0]] = 9
+                hive[ids[0]] = 3  # Detect mutations even if state was restored.
+        return value
+
+    with pytest.raises(RuntimeError, match="Hive changed during"):
+        getattr(hive, method)(key=key)
+    assert hive.values() == {
+        "replace": [9, 1, 2], "insert": [3, 1, 2, 4], "remove": [3, 2],
+        "reinit": [8], "restore": [3, 1, 2],
+    }[mutation]
+
+
+@pytest.mark.parametrize("method", ["sort", "sorted_ids"])
+def test_sort_comparison_and_key_destructor_mutation(method):
+    for during in ("compare", "del"):
+        hive = Hive([3, 1, 2])
+        first = next(iter(hive))
+
+        class Key:
+            def __init__(self, value):
+                self.value = value
+
+            def __lt__(self, other):
+                if during == "compare":
+                    hive[first] = 9
+                return self.value < other.value
+
+            def __del__(self):
+                if during == "del":
+                    hive[first] = 9
+
+        with pytest.raises(RuntimeError, match="Hive changed during"):
+            getattr(hive, method)(key=Key)
+        assert hive.values() == [9, 1, 2]
+
+
+def test_sort_subclass_and_keyword_signature():
+    class SubHive(Hive):
+        def __iter__(self):
+            raise AssertionError("sort uses slots")
+
+    hive = SubHive([3, 1, 2])
+    ids = Hive.sorted_ids(hive)
+    assert hive.get_many(ids) == [1, 2, 3]
+    hive.sort()
+    assert hive.values() == [1, 2, 3]
+    for method in (hive.sort, hive.sorted_ids):
+        with pytest.raises(TypeError):
+            method(None)
+        with pytest.raises(TypeError):
+            method(reverse="yes")
+
+
+@pytest.mark.parametrize("method", ["sort", "sorted_ids"])
+def test_hive_sort_reverse_index_protocol(method):
+    class Reverse:
+        def __index__(self):
+            return 1
+
+    hive = Hive([2, 1, 3])
+    result = getattr(hive, method)(reverse=Reverse())
+    expected = sorted([2, 1, 3], reverse=Reverse())
+    assert (hive.values() if method == "sort" else hive.get_many(result)) == expected
+    with pytest.raises(OverflowError):
+        getattr(hive, method)(reverse=2**100)

@@ -8,6 +8,7 @@ use paged_collections::paged_vec::PagedVec;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyIndexError, PyMemoryError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::pyclass::CompareOp;
 use pyo3::types::slice::PySliceIndices;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySlice, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
@@ -77,15 +78,10 @@ fn remove_positions<T, const PAGE: usize>(
     removed
 }
 
-/// `list.sort`'s `reverse`: any int (bools included), by truth value.
-fn sort_reverse(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
-    if obj.cast::<pyo3::types::PyInt>().is_err() {
-        return Err(PyTypeError::new_err(format!(
-            "'{}' object cannot be interpreted as an integer",
-            obj.get_type().name()?
-        )));
-    }
-    obj.is_truthy()
+/// `list.sort`'s `reverse`: convert through Python's integer index protocol
+/// into a C int, before borrowing (including calls to subclass __index__).
+pub(crate) fn sort_reverse(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(obj.extract::<i32>()? != 0)
 }
 
 fn position(i: isize, len: usize, name: &str) -> PyResult<usize> {
@@ -347,6 +343,55 @@ impl PagedList {
         out.list.extend(values);
         Ok(out)
     }
+    // Like list_richcompare: inspect live positions, bypass subclass iterator
+    // overrides, and release both borrows before equality/ordering callbacks.
+    fn ordering(
+        slf: &Bound<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let Ok(other) = other.cast::<Self>() else {
+            return Ok(py.NotImplemented());
+        };
+        let mut i = 0;
+        loop {
+            let a = Self::at(slf, i)?;
+            let b = Self::at(other, i)?;
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    if !equal_objects(a.bind(py), b.bind(py))? {
+                        // As list_richcompare: `__eq__` may have resized either
+                        // list, so recheck the bounds and compare the live items.
+                        if let (Some(a), Some(b)) = (Self::at(slf, i)?, Self::at(other, i)?) {
+                            return Ok(a.bind(py).rich_compare(b.bind(py), op)?.unbind());
+                        }
+                        return Self::compare_lengths(slf, other, op);
+                    }
+                }
+                _ => return Self::compare_lengths(slf, other, op),
+            }
+            i += 1;
+        }
+    }
+
+    fn compare_lengths(
+        slf: &Bound<'_, Self>,
+        other: &Bound<'_, Self>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let a = slf.try_borrow()?.list.len();
+        let b = other.try_borrow()?.list.len();
+        match op {
+            CompareOp::Lt => a < b,
+            CompareOp::Le => a <= b,
+            CompareOp::Gt => a > b,
+            CompareOp::Ge => a >= b,
+            _ => unreachable!(),
+        }
+        .into_py_any(slf.py())
+    }
+
     /// Clone one element and release the borrow before any Python comparison.
     fn at(slf: &Bound<'_, Self>, i: usize) -> PyResult<Option<Py<PyAny>>> {
         Ok(slf.try_borrow()?.list.get(i).map(|v| v.clone_ref(slf.py())))
@@ -594,6 +639,18 @@ impl PagedList {
         } else {
             (!eq.bind(slf.py()).is_truthy()?).into_py_any(slf.py())
         }
+    }
+    fn __lt__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::ordering(slf, other, CompareOp::Lt)
+    }
+    fn __le__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::ordering(slf, other, CompareOp::Le)
+    }
+    fn __gt__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::ordering(slf, other, CompareOp::Gt)
+    }
+    fn __ge__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Self::ordering(slf, other, CompareOp::Ge)
     }
     fn __add__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let Ok(other) = other.cast::<Self>() else {
@@ -852,7 +909,7 @@ macro_rules! typed_list {
             "appending and value writes are allowed; removing or moving elements raises BufferError.\n\n",
             "Typed containers store values, not objects, so NaN != NaN as in NumPy; ",
             "a typed list containing NaN does not compare equal even to itself.")]
-        #[pyclass(module = "paged_collections._core", name = $pyname, subclass)]
+        #[pyclass(module = "paged_collections._core", name = $pyname, subclass, weakref)]
         pub(crate) struct $name {
             list: ListInner<ValueCell<$t>>,
             exports: Exports,
@@ -1030,6 +1087,26 @@ macro_rules! typed_list {
             fn __ne__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
                 let eq = self.__eq__(py, other)?;
                 if eq.is(py.NotImplemented()) { Ok(eq) } else { (!eq.bind(py).is_truthy()?).into_py_any(py) }
+            }
+            fn __lt__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+                let Ok(other) = other.cast::<Self>() else { return Ok(py.NotImplemented()); };
+                let other = other.try_borrow()?;
+                self.snapshot().partial_cmp(&other.snapshot()).is_some_and(|order| order.is_lt()).into_py_any(py)
+            }
+            fn __le__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+                let Ok(other) = other.cast::<Self>() else { return Ok(py.NotImplemented()); };
+                let other = other.try_borrow()?;
+                self.snapshot().partial_cmp(&other.snapshot()).is_some_and(|order| order.is_le()).into_py_any(py)
+            }
+            fn __gt__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+                let Ok(other) = other.cast::<Self>() else { return Ok(py.NotImplemented()); };
+                let other = other.try_borrow()?;
+                self.snapshot().partial_cmp(&other.snapshot()).is_some_and(|order| order.is_gt()).into_py_any(py)
+            }
+            fn __ge__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+                let Ok(other) = other.cast::<Self>() else { return Ok(py.NotImplemented()); };
+                let other = other.try_borrow()?;
+                self.snapshot().partial_cmp(&other.snapshot()).is_some_and(|order| order.is_ge()).into_py_any(py)
             }
             fn __add__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
                 let Ok(other) = other.cast::<Self>() else { return Ok(slf.py().NotImplemented()); };

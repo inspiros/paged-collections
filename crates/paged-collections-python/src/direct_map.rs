@@ -693,7 +693,7 @@ macro_rules! typed_direct_map {
             "Typed containers store values, not objects, so NaN != NaN as in NumPy; ",
             "a typed map containing NaN does not compare equal even to itself."
         )]
-        #[pyclass(module = "paged_collections._core", name = $pyname, subclass)]
+        #[pyclass(module = "paged_collections._core", name = $pyname, subclass, weakref)]
         pub(crate) struct $name {
             map: DirectInner<$t>,
             /// Changes on every structural change, so iterators can detect them.

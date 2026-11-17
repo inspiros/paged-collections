@@ -412,3 +412,213 @@ def test_seeded_set_model():
         assert len(s) == len(model), step
         assert list(s) == dense, step
         assert set(s) == model, step
+
+
+@pytest.mark.parametrize("method", ["union", "intersection", "difference"])
+@pytest.mark.parametrize("others", [[], [[]], [[1, 4, 4, 6]], [[1, 4, 6], [4, 8]],
+                                     [[], [1, 2, 3]]])
+def test_algebra_methods_match_set(method, others):
+    from paged_collections import PAGE_SIZES
+
+    source = [9, 4, 1, 7]
+    actual = SparseSet(source, page_size=PAGE_SIZES[0])
+    expected = getattr(set(source), method)(*others)
+    result = getattr(actual, method)(*(iter(other) for other in others))
+    assert type(result) is SparseSet
+    assert set(result) == expected
+    assert result.page_size == actual.page_size
+    assert list(actual) == source
+    candidates = list(dict.fromkeys(source + [k for other in others for k in other]))
+    assert list(result) == [k for k in candidates if k in expected]
+    assert result is not actual
+
+
+@pytest.mark.parametrize("method", ["union", "intersection", "difference", "symmetric_difference"])
+@pytest.mark.parametrize("form", [list, tuple, iter, set, SparseSet])
+def test_algebra_any_key_iterable(method, form):
+    source, other = [9, 4, 1, 7], [1, 6, 6, 4]
+    actual = SparseSet(source)
+    result = getattr(actual, method)(form(other))
+    assert set(result) == getattr(set(source), method)(other)
+
+
+@pytest.mark.parametrize("method,builtin", [
+    ("update", "update"), ("intersection_update", "intersection_update"),
+    ("difference_update", "difference_update"),
+    ("symmetric_difference_update", "symmetric_difference_update"),
+])
+def test_inplace_methods_match_set_and_order(method, builtin):
+    source, other = [9, 4, 1, 7], [1, 6, 6, 4]
+    actual, expected = SparseSet(source), set(source)
+    assert getattr(actual, method)(iter(other)) is getattr(expected, builtin)(other) is None
+    candidates = list(dict.fromkeys(source + other))
+    assert list(actual) == [k for k in candidates if k in expected]
+    assert set(actual) == expected
+    if method != "symmetric_difference_update":
+        actual, expected = SparseSet(source), set(source)
+        assert getattr(actual, method)() is getattr(expected, builtin)() is None
+        assert list(actual) == source
+        getattr(actual, method)([1, 6], iter([6, 9]))
+        getattr(expected, builtin)([1, 6], [6, 9])
+        assert set(actual) == expected
+
+
+@pytest.mark.parametrize("name", ["issubset", "issuperset", "isdisjoint"])
+@pytest.mark.parametrize("other", [[], [1], [9, 4, 1, 7], [1, 6, 4], [1, 2**100, -1],
+                                    [1.0, 4.0], ["foreign", None]])
+def test_set_predicates_any_iterable(name, other):
+    source = [9, 4, 1, 7]
+    assert getattr(SparseSet(source), name)(iter(other)) == getattr(set(source), name)(iter(other))
+
+
+@pytest.mark.parametrize("left,right", [([], []), ([], [1]), ([1], []), ([1], [1]),
+                                        ([1], [1, 2]), ([1, 2], [1]), ([1, 3], [2])])
+def test_set_operators_match_builtin(left, right):
+    import operator
+
+    for op in (operator.or_, operator.and_, operator.sub, operator.xor):
+        actual = op(SparseSet(left), SparseSet(right))
+        assert set(actual) == op(set(left), set(right))
+        assert type(actual) is SparseSet
+    for op in (operator.lt, operator.le, operator.gt, operator.ge, operator.eq, operator.ne):
+        assert op(SparseSet(left), SparseSet(right)) == op(set(left), set(right))
+    for op in (operator.ior, operator.iand, operator.isub, operator.ixor):
+        actual, expected = SparseSet(left), set(left)
+        result = op(actual, SparseSet(right))
+        assert result is actual
+        assert set(actual) == op(expected, set(right))
+
+
+@pytest.mark.parametrize("name", ["__or__", "__and__", "__sub__", "__xor__",
+                                  "__ior__", "__iand__", "__isub__", "__ixor__",
+                                  "__lt__", "__le__", "__gt__", "__ge__"])
+def test_operators_reject_foreign_types_and_allow_reflection(name):
+    import operator
+
+    actual = SparseSet([1, 2])
+    op = {"__or__": operator.or_, "__and__": operator.and_, "__sub__": operator.sub,
+          "__xor__": operator.xor, "__ior__": operator.ior, "__iand__": operator.iand,
+          "__isub__": operator.isub, "__ixor__": operator.ixor, "__lt__": operator.lt,
+          "__le__": operator.le, "__gt__": operator.gt, "__ge__": operator.ge}[name]
+    for other in ([1], iter([1]), {1}, frozenset([1]), object()):
+        assert getattr(actual, name)(other) is NotImplemented
+        with pytest.raises(TypeError):
+            op(actual, other)
+    assert actual != {1, 2}
+    assert list(actual) == [1, 2]
+
+
+@pytest.mark.parametrize("name", ["update", "intersection_update", "difference_update",
+                                  "symmetric_difference_update", "__ior__", "__iand__",
+                                  "__isub__", "__ixor__"])
+def test_inplace_algebra_respects_exports(name):
+    actual = SparseSet([9, 4, 1])
+    view = actual.view()
+    other = SparseSet([4, 7])
+    with pytest.raises(BufferError):
+        getattr(actual, name)(other)
+    assert view.tolist() == list(actual) == [9, 4, 1]
+    # Even no-op in-place algebra checks exports; copied results remain allowed.
+    with pytest.raises(BufferError):
+        getattr(actual, name)(actual)
+    assert set(actual.union(other)) == {9, 4, 1, 7}
+    del view
+    getattr(actual, name)(other)
+
+
+def test_algebra_subclasses_bypass_iter_and_return_base():
+    class SubSet(SparseSet):
+        def __iter__(self):
+            raise AssertionError("native set algebra must bypass subclass __iter__")
+
+    class SubBuiltin(set):
+        def __iter__(self):
+            raise AssertionError("native set algebra must bypass subclass __iter__")
+
+    import operator
+    for op in (operator.or_, operator.and_, operator.sub, operator.xor):
+        result = op(SubSet([9, 4, 1]), SubSet([4, 7]))
+        assert type(result) is SparseSet
+        assert set(result) == op(SubBuiltin([9, 4, 1]), SubBuiltin([4, 7]))
+    for method in ("union", "intersection", "difference", "symmetric_difference"):
+        result = getattr(SubSet([9, 4, 1]), method)(SubSet([4, 7]))
+        assert type(result) is SparseSet
+        assert set(result) == getattr(SubBuiltin([9, 4, 1]), method)(SubBuiltin([4, 7]))
+    assert SubSet([1]) < SparseSet([1, 2])
+    assert SparseSet([1, 2]) > SubSet([1])
+
+
+@pytest.mark.parametrize("name", ["update", "intersection_update", "difference_update",
+                                  "symmetric_difference_update"])
+def test_algebra_callbacks_run_unborrowed_and_do_not_overwrite_mutations(name):
+    actual = SparseSet([1, 2, 3])
+
+    def keys():
+        assert list(actual) == [1, 2, 3]
+        actual.add(8)
+        yield 2
+
+    if name in ("update", "difference_update"):
+        getattr(actual, name)(keys())
+        assert set(actual) == ({1, 2, 3, 8} if name == "update" else {1, 3, 8})
+    else:
+        with pytest.raises(RuntimeError, match="SparseSet changed during"):
+            getattr(actual, name)(keys())
+        assert list(actual) == [1, 2, 3, 8]
+
+
+@pytest.mark.parametrize("method", ["union", "intersection", "difference", "symmetric_difference"])
+def test_algebra_propagates_iterator_failure(method):
+    actual = SparseSet([1, 2, 3])
+
+    def broken():
+        yield 2
+        raise LookupError("iterator failed")
+
+    with pytest.raises(LookupError, match="iterator failed"):
+        getattr(actual, method)(broken())
+    assert list(actual) == [1, 2, 3]
+
+
+@pytest.mark.parametrize("name", ["update", "difference_update", "intersection_update",
+                                  "symmetric_difference_update"])
+def test_update_iterator_error_progress_matches_builtin(name):
+    def broken():
+        yield 2
+        yield 6
+        raise LookupError("iterator failed")
+
+    actual, expected = SparseSet([1, 2, 3]), {1, 2, 3}
+    for value in (actual, expected):
+        with pytest.raises(LookupError, match="iterator failed"):
+            getattr(value, name)(broken())
+    assert set(actual) == expected
+
+
+def test_streaming_updates_expose_progress_to_callbacks():
+    for name in ("update", "difference_update"):
+        def exercise(cls):
+            value = cls([1, 2, 3])
+            observed = []
+
+            def keys():
+                yield 2
+                observed.append(set(value))
+                yield 6
+                observed.append(set(value))
+
+            getattr(value, name)(keys())
+            return set(value), observed
+
+        assert exercise(SparseSet) == exercise(set)
+
+
+def test_difference_update_swap_order_and_float_membership():
+    actual = SparseSet([9, 4, 1, 7])
+    actual.difference_update([4.0])
+    assert list(actual) == [9, 7, 1]
+    expected = {9, 4, 1, 7}
+    expected.difference_update([4.0])
+    assert set(actual) == expected
+    with pytest.raises(TypeError):
+        actual.difference_update([[]])

@@ -2,9 +2,11 @@
 
 use crate::storage::SetInner;
 use numpy::PyArray1;
-use pyo3::exceptions::PyKeyError;
+use pyo3::IntoPyObjectExt;
+use pyo3::exceptions::{PyKeyError, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::pyclass::CompareOp;
+use pyo3::types::{PyDict, PyInt, PyList, PySet, PyTuple};
 
 use crate::convert::{Key, KeyBatch, insert_key, lookup_key};
 use crate::export::{Exports, read_only_view};
@@ -17,18 +19,36 @@ const NAME: &str = "SparseSet";
 ///
 /// Memory follows the key ranges in use: keys are indexed through pages of
 /// configurable size, allocated on first use. Keys keep insertion order until a
-/// removal, which moves the last key into the gap.
+/// removal, which moves the last key into the gap. Copied algebra results retain
+/// surviving receiver keys in dense order, then append new keys in operand
+/// iteration order (duplicates appear once). Results use the receiver's page
+/// size and are always base ``SparseSet`` instances, including for subclasses.
+/// ``difference_update`` and ``-=`` use the same swap-removal order as
+/// ``discard``; other in-place algebra keeps surviving receiver order.
 ///
 /// Batch methods (``add_many``, ``discard_many``, ``contains_many``) take
 /// NumPy arrays or sequences of integers. ``view()`` returns a zero-copy,
 /// read-only array of the keys; while any view is alive, methods that would
 /// resize or reorder the set raise ``BufferError``.
-#[pyclass(module = "paged_collections._core", name = "SparseSet", subclass)]
+#[pyclass(
+    module = "paged_collections._core",
+    name = "SparseSet",
+    subclass,
+    weakref
+)]
 pub(crate) struct SparseSet {
     pub(crate) set: SetInner<Key>,
     pub(crate) exports: Exports,
     /// Changes on every structural change, so iterators can detect them.
     pub(crate) mods: u64,
+}
+
+#[derive(Clone, Copy)]
+enum Algebra {
+    Union,
+    Intersection,
+    Difference,
+    SymmetricDifference,
 }
 
 impl SparseSet {
@@ -46,6 +66,157 @@ impl SparseSet {
 
     pub(crate) fn dense_keys(&self) -> &[Key] {
         self.set.as_slice()
+    }
+
+    // Builtin sets bypass a set subclass's __iter__ for set operands. Snapshot
+    // our native storage too; arbitrary iterable callbacks run unborrowed.
+    fn operand<'py>(other: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        if let Ok(other) = other.cast::<Self>() {
+            let keys = other.try_borrow()?.set.as_slice().to_vec();
+            Ok(PyList::new(other.py(), keys)?.into_any())
+        } else {
+            Ok(other.clone())
+        }
+    }
+
+    fn operand_set<'py>(other: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PySet>> {
+        let set = PySet::empty(other.py())?;
+        set.call_method1("update", (Self::operand(other)?,))?;
+        Ok(set)
+    }
+
+    fn algebra(
+        slf: &Bound<'_, Self>,
+        others: &[Bound<'_, PyAny>],
+        op: Algebra,
+        inplace: bool,
+    ) -> PyResult<Self> {
+        let (mut keys, page_size, mods) = {
+            let this = slf.try_borrow()?;
+            if inplace {
+                this.exports.check(NAME)?;
+            }
+            (
+                this.set.as_slice().to_vec(),
+                this.set.page_size(),
+                this.mods,
+            )
+        };
+        for other in others {
+            match op {
+                Algebra::Union | Algebra::SymmetricDifference => {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut incoming = Vec::new();
+                    for key in Self::operand(other)?.try_iter()? {
+                        let key = insert_key(&key?)?;
+                        if seen.insert(key) {
+                            incoming.push(key);
+                        }
+                    }
+                    let present: std::collections::HashSet<_> = keys.iter().copied().collect();
+                    if matches!(op, Algebra::SymmetricDifference) {
+                        keys.retain(|key| !seen.contains(key));
+                    }
+                    keys.extend(incoming.into_iter().filter(|key| !present.contains(key)));
+                }
+                Algebra::Intersection | Algebra::Difference => {
+                    let other = Self::operand_set(other)?;
+                    let mut retained = Vec::with_capacity(keys.len());
+                    for key in keys {
+                        if other.contains(key)? == matches!(op, Algebra::Intersection) {
+                            retained.push(key);
+                        }
+                    }
+                    keys = retained;
+                }
+            }
+        }
+        let mut out = Self::empty();
+        out.set.set_page_size(page_size)?;
+        out.set
+            .try_reserve(keys.len())
+            .map_err(crate::reserve_error)?;
+        out.set.extend(keys);
+        if inplace {
+            let mut this = slf.try_borrow_mut()?;
+            this.exports.check(NAME)?;
+            if this.mods != mods {
+                return Err(PyRuntimeError::new_err(
+                    "SparseSet changed during set operation",
+                ));
+            }
+            if this.set.as_slice() != out.set.as_slice() {
+                this.set
+                    .try_reserve(out.set.len())
+                    .map_err(crate::reserve_error)?;
+                this.set.clear();
+                this.set.extend(out.set.iter().copied());
+                this.changed();
+            }
+        }
+        Ok(out)
+    }
+
+    // Like set.update/difference_update, commit each yielded key so a failing
+    // iterator preserves earlier changes. Advance, hash, convert and compare
+    // only outside borrows; callbacks can read or mutate the live receiver.
+    fn streaming_update(
+        slf: &Bound<'_, Self>,
+        others: &[Bound<'_, PyAny>],
+        remove: bool,
+    ) -> PyResult<()> {
+        slf.try_borrow()?.exports.check(NAME)?;
+        for other in others {
+            for key in Self::operand(other)?.try_iter()? {
+                let key = key?;
+                if !remove {
+                    let key = insert_key(&key)?;
+                    let mut this = slf.try_borrow_mut()?;
+                    this.exports.check(NAME)?;
+                    if !this.set.contains(key) {
+                        this.set.try_reserve(1).map_err(crate::reserve_error)?;
+                        this.set.insert(key);
+                        this.changed();
+                    }
+                } else {
+                    // Exact ints are the usual case. For other hashable keys,
+                    // use Python set membership (e.g. 1.0 compares equal to 1).
+                    let removed = if key.is_exact_instance_of::<PyInt>() {
+                        lookup_key(&key).into_iter().collect::<Vec<_>>()
+                    } else {
+                        let probe = PySet::new(slf.py(), [&key])?;
+                        let keys = slf.try_borrow()?.set.as_slice().to_vec();
+                        let mut removed = Vec::new();
+                        for key in keys {
+                            if probe.contains(key)? {
+                                removed.push(key);
+                            }
+                        }
+                        removed
+                    };
+                    let mut this = slf.try_borrow_mut()?;
+                    this.exports.check(NAME)?;
+                    for key in removed {
+                        if this.set.remove(key) {
+                            this.changed();
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn subset_order(&self, other: &Self, op: CompareOp) -> bool {
+        let subset = || self.set.iter().all(|&key| other.set.contains(key));
+        let superset = || other.set.iter().all(|&key| self.set.contains(key));
+        match op {
+            CompareOp::Lt => self.set.len() < other.set.len() && subset(),
+            CompareOp::Le => self.set.len() <= other.set.len() && subset(),
+            CompareOp::Gt => self.set.len() > other.set.len() && superset(),
+            CompareOp::Ge => self.set.len() >= other.set.len() && superset(),
+            _ => unreachable!(),
+        }
     }
 
     /// Adds every key of `keys`; returns how many were new.
@@ -106,6 +277,172 @@ impl SparseSet {
 
     fn __eq__(&self, other: PyRef<'_, Self>) -> bool {
         self.set == other.set
+    }
+
+    /// Return a base SparseSet in surviving receiver order, then new operand
+    /// keys in iteration order, with the receiver's page size.
+    #[pyo3(signature = (*others))]
+    fn union(slf: &Bound<'_, Self>, others: &Bound<'_, PyTuple>) -> PyResult<Self> {
+        Self::algebra(
+            slf,
+            &others.iter().collect::<Vec<_>>(),
+            Algebra::Union,
+            false,
+        )
+    }
+    /// Return a base SparseSet in surviving receiver order, then new operand
+    /// keys in iteration order, with the receiver's page size.
+    #[pyo3(signature = (*others))]
+    fn intersection(slf: &Bound<'_, Self>, others: &Bound<'_, PyTuple>) -> PyResult<Self> {
+        Self::algebra(
+            slf,
+            &others.iter().collect::<Vec<_>>(),
+            Algebra::Intersection,
+            false,
+        )
+    }
+    /// Return a base SparseSet in surviving receiver order, then new operand
+    /// keys in iteration order, with the receiver's page size.
+    #[pyo3(signature = (*others))]
+    fn difference(slf: &Bound<'_, Self>, others: &Bound<'_, PyTuple>) -> PyResult<Self> {
+        Self::algebra(
+            slf,
+            &others.iter().collect::<Vec<_>>(),
+            Algebra::Difference,
+            false,
+        )
+    }
+    /// Return keys in exactly one operand, in surviving receiver order then
+    /// new operand iteration order, with the receiver's page size.
+    fn symmetric_difference(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Self::algebra(
+            slf,
+            std::slice::from_ref(other),
+            Algebra::SymmetricDifference,
+            false,
+        )
+    }
+    /// Add keys as they are yielded; iterator errors preserve earlier additions.
+    #[pyo3(signature = (*others))]
+    fn update(slf: &Bound<'_, Self>, others: &Bound<'_, PyTuple>) -> PyResult<()> {
+        Self::streaming_update(slf, &others.iter().collect::<Vec<_>>(), false)
+    }
+    #[pyo3(signature = (*others))]
+    fn intersection_update(slf: &Bound<'_, Self>, others: &Bound<'_, PyTuple>) -> PyResult<()> {
+        Self::algebra(
+            slf,
+            &others.iter().collect::<Vec<_>>(),
+            Algebra::Intersection,
+            true,
+        )?;
+        Ok(())
+    }
+    /// Discard keys as yielded, using swap removal. Iterator errors preserve
+    /// earlier removals, like builtin set.difference_update.
+    #[pyo3(signature = (*others))]
+    fn difference_update(slf: &Bound<'_, Self>, others: &Bound<'_, PyTuple>) -> PyResult<()> {
+        Self::streaming_update(slf, &others.iter().collect::<Vec<_>>(), true)
+    }
+    fn symmetric_difference_update(
+        slf: &Bound<'_, Self>,
+        other: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        Self::algebra(
+            slf,
+            std::slice::from_ref(other),
+            Algebra::SymmetricDifference,
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn issubset(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let other = Self::operand_set(other)?;
+        let keys = slf.try_borrow()?.set.as_slice().to_vec();
+        for key in keys {
+            if !other.contains(key)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn issuperset(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let keys = slf.try_borrow()?.set.as_slice().to_vec();
+        let own = PySet::new(slf.py(), keys)?;
+        own.call_method1("issuperset", (Self::operand(other)?,))?
+            .extract()
+    }
+
+    fn isdisjoint(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let keys = slf.try_borrow()?.set.as_slice().to_vec();
+        let own = PySet::new(slf.py(), keys)?;
+        own.call_method1("isdisjoint", (Self::operand(other)?,))?
+            .extract()
+    }
+    fn __or__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<Self> {
+        Self::algebra(slf, &[other.as_any().clone()], Algebra::Union, false)
+    }
+    fn __ior__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<()> {
+        Self::streaming_update(slf, &[other.as_any().clone()], false)
+    }
+    fn __and__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<Self> {
+        Self::algebra(slf, &[other.as_any().clone()], Algebra::Intersection, false)
+    }
+    fn __iand__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<()> {
+        Self::algebra(slf, &[other.as_any().clone()], Algebra::Intersection, true)?;
+        Ok(())
+    }
+    fn __sub__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<Self> {
+        Self::algebra(slf, &[other.as_any().clone()], Algebra::Difference, false)
+    }
+    fn __isub__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<()> {
+        Self::streaming_update(slf, &[other.as_any().clone()], true)
+    }
+    fn __xor__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<Self> {
+        Self::algebra(
+            slf,
+            &[other.as_any().clone()],
+            Algebra::SymmetricDifference,
+            false,
+        )
+    }
+    fn __ixor__(slf: &Bound<'_, Self>, other: &Bound<'_, Self>) -> PyResult<()> {
+        Self::algebra(
+            slf,
+            &[other.as_any().clone()],
+            Algebra::SymmetricDifference,
+            true,
+        )?;
+        Ok(())
+    }
+    fn __lt__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let Ok(other) = other.cast::<Self>() else {
+            return Ok(py.NotImplemented());
+        };
+        let other = other.try_borrow()?;
+        self.subset_order(&other, CompareOp::Lt).into_py_any(py)
+    }
+    fn __le__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let Ok(other) = other.cast::<Self>() else {
+            return Ok(py.NotImplemented());
+        };
+        let other = other.try_borrow()?;
+        self.subset_order(&other, CompareOp::Le).into_py_any(py)
+    }
+    fn __gt__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let Ok(other) = other.cast::<Self>() else {
+            return Ok(py.NotImplemented());
+        };
+        let other = other.try_borrow()?;
+        self.subset_order(&other, CompareOp::Gt).into_py_any(py)
+    }
+    fn __ge__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let Ok(other) = other.cast::<Self>() else {
+            return Ok(py.NotImplemented());
+        };
+        let other = other.try_borrow()?;
+        self.subset_order(&other, CompareOp::Ge).into_py_any(py)
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {

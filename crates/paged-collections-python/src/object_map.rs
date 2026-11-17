@@ -33,7 +33,7 @@ macro_rules! object_map {
             "``BufferError``. Do not store a view of a map in that map: NumPy arrays\n",
             "are invisible to the garbage collector, so the cycle is never freed."
         )]
-        #[pyclass(module = "paged_collections._core", name = $pyname, subclass)]
+        #[pyclass(module = "paged_collections._core", name = $pyname, subclass, weakref)]
         pub(crate) struct $name {
             map: MapInner<$K, Py<PyAny>>,
             exports: Exports,

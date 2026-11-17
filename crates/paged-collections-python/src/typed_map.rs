@@ -113,7 +113,7 @@ macro_rules! typed_map {
             "Typed containers store values, not objects, so NaN != NaN as in NumPy; ",
             "a typed map containing NaN does not compare equal even to itself."
         )]
-        #[pyclass(module = "paged_collections._core", name = $pyname, subclass)]
+        #[pyclass(module = "paged_collections._core", name = $pyname, subclass, weakref)]
         pub(crate) struct $name {
             /// Values are atomic cells so they can be exported to NumPy and still
             /// be written by Rust (see [`crate::export`]).

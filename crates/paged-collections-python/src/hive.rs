@@ -7,7 +7,7 @@ use paged_collections::id_alloc::{Id, MAX_INDICES};
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyKeyError, PyOverflowError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyCFunction, PyDict, PyList, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 
 use crate::convert::{KeyBatch, PyKey};
@@ -25,11 +25,14 @@ fn exhausted() -> PyErr {
 pub(crate) struct Hive {
     hive: HiveInner<Py<PyAny>>,
     mods: u64,
+    // Includes value replacement without invalidating slot-id iterators.
+    revision: u64,
 }
 
 impl Hive {
     fn changed(&mut self) {
         self.mods = self.mods.wrapping_add(1);
+        self.revision = self.revision.wrapping_add(1);
     }
 
     fn snapshot(&self, py: Python<'_>) -> Vec<(u64, Py<PyAny>)> {
@@ -37,6 +40,39 @@ impl Hive {
             .iter()
             .map(|(id, value)| (id.to_bits(), value.clone_ref(py)))
             .collect()
+    }
+
+    // Sort indices with CPython's stable, reverse-stable list.sort. Keys are
+    // evaluated once in slot order, with no hive borrow held. Keeping indices
+    // distinct matters when the same object appears in more than one slot.
+    fn permutation(
+        py: Python<'_>,
+        values: &[(u64, Py<PyAny>)],
+        key: Option<&Bound<'_, PyAny>>,
+        reverse: bool,
+    ) -> PyResult<Vec<usize>> {
+        let keys: Vec<Py<PyAny>> = values
+            .iter()
+            .map(|(_, value)| match key {
+                Some(key) => key.call1((value,)).map(Bound::unbind),
+                None => Ok(value.clone_ref(py)),
+            })
+            .collect::<PyResult<_>>()?;
+        let indices = PyList::new(py, 0..values.len())?;
+        let index_key = PyCFunction::new_closure(
+            py,
+            None,
+            None,
+            move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+                let index: usize = args.get_item(0)?.extract()?;
+                Ok::<_, PyErr>(keys[index].clone_ref(args.py()))
+            },
+        )?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("key", index_key)?;
+        kwargs.set_item("reverse", reverse)?;
+        indices.call_method("sort", (), Some(&kwargs))?;
+        indices.extract()
     }
 
     // Fast path: unused indices alone cover the batch. Near the index limit,
@@ -183,6 +219,7 @@ impl Hive {
         Self {
             hive: HiveInner::default(),
             mods: 0,
+            revision: 0,
         }
     }
 
@@ -253,7 +290,9 @@ impl Hive {
                 .hive
                 .get_mut(key)
                 .ok_or_else(|| PyKeyError::new_err(id.clone().unbind()))?;
-            std::mem::replace(slot, value)
+            let old = std::mem::replace(slot, value);
+            this.revision = this.revision.wrapping_add(1);
+            old
         };
         drop(old);
         Ok(())
@@ -372,6 +411,66 @@ impl Hive {
         )
     }
 
+    /// Stably sort values within occupied slots, using Python ``<`` on keys.
+    /// Ids name slots, not values: after sorting an id may retrieve a different
+    /// value. Holes and generation history stay unchanged. ``reverse=True``
+    /// preserves equal-key order. Key/comparison errors leave the hive unchanged
+    /// except for callback mutations; callback mutations raise ``RuntimeError``.
+    #[pyo3(signature = (*, key=None, reverse=false))]
+    fn sort(
+        slf: &Bound<'_, Self>,
+        key: Option<&Bound<'_, PyAny>>,
+        #[pyo3(from_py_with = crate::paged_list::sort_reverse)] reverse: bool,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let (values, revision) = {
+            let this = slf.try_borrow()?;
+            (this.snapshot(py), this.revision)
+        };
+        let order = Self::permutation(py, &values, key, reverse)?;
+        let removed = {
+            let mut this = slf.try_borrow_mut()?;
+            if this.revision != revision {
+                return Err(PyRuntimeError::new_err("Hive changed during sort"));
+            }
+            let removed: Vec<_> = values
+                .iter()
+                .zip(order)
+                .map(|((id, _), source)| {
+                    std::mem::replace(
+                        this.hive.get_mut(Id::from_bits(*id).unwrap()).unwrap(),
+                        values[source].1.clone_ref(py),
+                    )
+                })
+                .collect();
+            this.changed();
+            removed
+        };
+        drop(removed);
+        Ok(())
+    }
+
+    /// Return ids in stable value/key order without moving any values.
+    /// ``reverse=True`` preserves equal-key order. Ids still name the original
+    /// slots. Key/comparison errors propagate; callback mutations are preserved
+    /// and detected with ``RuntimeError`` before returning ids.
+    #[pyo3(signature = (*, key=None, reverse=false))]
+    fn sorted_ids(
+        slf: &Bound<'_, Self>,
+        key: Option<&Bound<'_, PyAny>>,
+        #[pyo3(from_py_with = crate::paged_list::sort_reverse)] reverse: bool,
+    ) -> PyResult<Vec<u64>> {
+        let (values, revision) = {
+            let this = slf.try_borrow()?;
+            (this.snapshot(slf.py()), this.revision)
+        };
+        let order = Self::permutation(slf.py(), &values, key, reverse)?;
+        if slf.try_borrow()?.revision != revision {
+            return Err(PyRuntimeError::new_err("Hive changed during sorted_ids"));
+        }
+        Ok(order.into_iter().map(|i| values[i].0).collect())
+    }
+
     /// Shallow copy preserving ids and all generation history.
     fn copy(&self, py: Python<'_>) -> Self {
         Self {
@@ -394,6 +493,7 @@ impl Hive {
             )
             .expect("valid Hive state"),
             mods: 0,
+            revision: 0,
         }
     }
 
