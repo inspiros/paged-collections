@@ -22,7 +22,7 @@ struct Page<K: DirectKey, V> {
 struct PageData<K: DirectKey, V> {
     slots: Box<[Slot<K, V>]>,
     occupied: usize,
-    // This page's directory number: its length stripe.
+    // This page's directory number: its length stripe without `std`.
     number: usize,
 }
 
@@ -189,9 +189,9 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
 
     /// Number of entries; exact when no write is in flight.
     ///
-    /// The count is split over per-page-group counters so that writers on
-    /// different pages do not contend on one cache line. While writes are in
-    /// flight, the sum may combine counters read at different moments and
+    /// The count is split over per-thread counters (per page group without
+    /// `std`) so that writers do not contend on one cache line. While writes
+    /// are in flight, the sum may combine counters read at different moments and
     /// so differ from every count the map actually held (for example, 0 for
     /// a map that was never empty), though it never exceeds the number of
     /// entries inserted.

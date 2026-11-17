@@ -1,10 +1,14 @@
-//! Shared-write scaling of the concurrent sparse and direct maps, without
-//! Python. Usage: concurrent_scaling [N] [REPEAT]
+//! Shared-write scaling of the concurrent containers, without Python.
+//! Usage: concurrent_scaling [N] [REPEAT] [FILTER]; FILTER keeps the rows
+//! whose name contains it.
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use paged_collections::concurrent::{ConcurrentDirectMap, ConcurrentSparseMap};
+use paged_collections::concurrent::{
+    AtomicDirectMap, ConcurrentAppendHive, ConcurrentDirectMap, ConcurrentHive,
+    ConcurrentIdAllocator, ConcurrentSparseMap,
+};
 
 fn permutation(n: usize) -> Vec<u32> {
     let mut keys: Vec<u32> = (0..n as u32).collect();
@@ -50,6 +54,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let n: usize = args.next().map_or(2_000_000, |a| a.parse().unwrap());
     let repeat: usize = args.next().map_or(5, |a| a.parse().unwrap());
+    let filter = args.next().unwrap_or_default();
     let keys = permutation(n);
     let direct_full = || {
         let m = ConcurrentDirectMap::<u32, f64>::new();
@@ -69,6 +74,9 @@ fn main() {
     println!("| Workload | T=1 (M/s) | T=2 | T=4 | T=8 | speedup T=4 |");
     println!("|---|---:|---:|---:|---:|---:|");
     let row = |name: &str, f: &dyn Fn(usize) -> f64| {
+        if !name.contains(filter.as_str()) {
+            return;
+        }
         let rates: Vec<f64> = [1, 2, 4, 8]
             .iter()
             .map(|&t| n as f64 / f(t) / 1e6)
@@ -139,6 +147,80 @@ fn main() {
                 black_box(m.with(k, |v| *v));
             }
         })
+    });
+    row("atomic direct insert (fresh)", &|t| {
+        time(repeat, t, &keys, AtomicDirectMap::<1024>::new, |m, ks| {
+            for &k in ks {
+                black_box(m.insert(k as usize, 1));
+            }
+        })
+    });
+    row("hive insert (fresh)", &|t| {
+        time(repeat, t, &keys, ConcurrentHive::<u64>::new, |h, ks| {
+            for &k in ks {
+                black_box(h.insert(u64::from(k)));
+            }
+        })
+    });
+    row("hive remove", &|t| {
+        time(
+            repeat,
+            t,
+            &keys,
+            || {
+                let h = ConcurrentHive::<u64>::new();
+                let ids: Vec<_> = (0..n as u64).map(|v| h.insert(v)).collect();
+                (h, ids)
+            },
+            |(h, ids), ks| {
+                for &k in ks {
+                    black_box(h.remove(ids[k as usize]));
+                }
+            },
+        )
+    });
+    row("append hive insert (fresh)", &|t| {
+        time(
+            repeat,
+            t,
+            &keys,
+            ConcurrentAppendHive::<u64>::new,
+            |h, ks| {
+                for &k in ks {
+                    black_box(h.insert(u64::from(k)));
+                }
+            },
+        )
+    });
+    row("id allocate (fresh)", &|t| {
+        time(
+            repeat,
+            t,
+            &keys,
+            ConcurrentIdAllocator::<1024>::new,
+            |a, ks| {
+                for _ in ks {
+                    black_box(a.allocate());
+                }
+            },
+        )
+    });
+    row("id free", &|t| {
+        time(
+            repeat,
+            t,
+            &keys,
+            || {
+                let a = ConcurrentIdAllocator::<1024>::new();
+                let ids: Vec<_> = (0..n).map(|_| a.allocate()).collect();
+                (a, ids)
+            },
+            |(a, ids), ks| {
+                for &k in ks {
+                    black_box(a.free(ids[k as usize]));
+                }
+            },
+        )
     });
     row("shared counter fetch_add only", &|t| {
         time(

@@ -4,7 +4,8 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::atomic::{AtomicU32, AtomicUsize, Ordering};
+use super::atomic::{AtomicU32, Ordering};
+use super::count::StripedLen;
 use super::free_stack::FreeStack;
 use super::spine::Spine;
 use crate::id_alloc::{Id, IdAllocator, MAX_INDICES, generation_of, live_version};
@@ -42,7 +43,7 @@ struct Page {
 pub struct ConcurrentIdAllocator<const PAGE: usize = DEFAULT_PAGE> {
     pages: Spine<Page, CHUNKS>,
     free: FreeStack,
-    len: AtomicUsize,
+    len: StripedLen,
 }
 
 impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
@@ -59,7 +60,7 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
         Self {
             pages: Spine::new(),
             free: FreeStack::new(),
-            len: AtomicUsize::new(0),
+            len: StripedLen::new(),
         }
     }
 
@@ -112,10 +113,9 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
             if previous % 2 == 1 || (reused.is_some() && previous == 0) {
                 continue;
             }
-            // Relaxed: accounting only. Increment before publication so even
-            // a guessed id freed immediately after publication cannot
-            // underflow len; undone if the claim is lost.
-            self.len.fetch_add(1, Ordering::Relaxed);
+            // Relaxed: accounting only. Increment before publication, so any
+            // free of this id is counted after it; undone if the claim is lost.
+            self.len.increment(index as usize / PAGE);
             let version = previous + 1;
             // Release publishes this generation; a successful free's Acquire
             // observes the preceding count increment. Acquire on failure:
@@ -127,7 +127,7 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
             {
                 return Some(Id::new(index, generation_of(version)));
             }
-            self.len.fetch_sub(1, Ordering::Relaxed);
+            self.len.decrement(index as usize / PAGE);
         }
     }
 
@@ -153,7 +153,7 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
         }
         // Relaxed: accounting only; decrement before push so a later owner
         // cannot accumulate arbitrarily many pending decrements on this index.
-        self.len.fetch_sub(1, Ordering::Relaxed);
+        self.len.decrement(id.index() as usize / PAGE);
         if vacant != 0 {
             self.free.push(id.index(), &slot.next);
         }
@@ -173,9 +173,13 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
 
     /// Number of live ids; approximate while other threads allocate or free.
     /// Exact when no operation is in flight. This is not a publication barrier.
+    ///
+    /// It sums per-thread counters (per page group without `std`). While
+    /// operations are in flight it may combine counters read at different
+    /// moments and differ from every count the allocator held; it never
+    /// exceeds the number of insertions.
     pub fn len(&self) -> usize {
-        // Relaxed: this count does not grant access to any slot or page.
-        self.len.load(Ordering::Relaxed)
+        self.len.get()
     }
 
     /// Whether no ids are live; approximate while other threads run.
@@ -236,7 +240,7 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
 
 impl<const PAGE: usize> From<IdAllocator> for ConcurrentIdAllocator<PAGE> {
     fn from(inner: IdAllocator) -> Self {
-        let result = Self::new();
+        let mut result = Self::new();
         let (versions, free) = inner.raw_parts();
         for &version in versions {
             let index = result.free.fresh(MAX_INDICES).expect("valid index bound");
@@ -251,7 +255,7 @@ impl<const PAGE: usize> From<IdAllocator> for ConcurrentIdAllocator<PAGE> {
             result.free.push(index, &slot.next);
         }
         // Relaxed: result is not shared until the conversion returns.
-        result.len.store(inner.len(), Ordering::Relaxed);
+        result.len.set(inner.len());
         result
     }
 }

@@ -11,7 +11,8 @@ use core::mem;
 use core::num::NonZeroU32;
 use core::ops::{Bound, RangeBounds};
 
-use super::atomic::{AtomicU64, AtomicUsize, Ordering};
+use super::atomic::{AtomicU64, Ordering};
+use super::count::StripedLen;
 use super::directory::{SharedDirectory, SharedPages};
 use crate::direct_map::PagedDirectMap;
 use crate::id_alloc::Id;
@@ -23,11 +24,11 @@ struct Page {
 
 struct Words<const PAGE: usize, D: SharedDirectory> {
     pages: D::Pages<Page>,
-    len: AtomicUsize,
+    len: StripedLen,
 }
 
 // SAFETY: both sealed directories own their pages, which contain only atomic
-// slots; moving Words transfers ownership and its counter is also atomic.
+// slots; moving Words transfers ownership and its counters are also atomic.
 unsafe impl<const PAGE: usize, D: SharedDirectory> Send for Words<PAGE, D> {}
 // SAFETY: both sealed directories synchronize page publication; all shared
 // slot and counter accesses are atomic, and page reclamation is exclusive.
@@ -41,7 +42,7 @@ impl<const PAGE: usize, D: SharedDirectory> Words<PAGE, D> {
         );
         Self {
             pages: D::Pages::<Page>::new(),
-            len: AtomicUsize::new(0),
+            len: StripedLen::new(),
         }
     }
 
@@ -67,22 +68,18 @@ impl<const PAGE: usize, D: SharedDirectory> Words<PAGE, D> {
             .map_or(0, |slot| slot.load(Ordering::Acquire))
     }
 
-    fn count_change(&self, old: u64, new: u64) {
+    fn count_change(&self, index: usize, old: u64, new: u64) {
         // Count after the slot's linearization point. A removal can reach
-        // this counter before the insertion it undoes, so wrap deliberately.
+        // the counters before the insertion it undoes; they wrap.
         match (old == 0, new == 0) {
-            (true, false) => {
-                self.len.fetch_add(1, Ordering::Relaxed);
-            }
-            (false, true) => {
-                self.len.fetch_sub(1, Ordering::Relaxed);
-            }
+            (true, false) => self.len.increment(index / PAGE),
+            (false, true) => self.len.decrement(index / PAGE),
             _ => {}
         }
     }
 
     fn len(&self) -> usize {
-        (self.len.load(Ordering::Relaxed) as isize).max(0) as usize
+        self.len.get()
     }
 
     fn swap(&self, index: usize, new: u64, name: &str) -> u64 {
@@ -95,7 +92,7 @@ impl<const PAGE: usize, D: SharedDirectory> Words<PAGE, D> {
             self.ensure_slot(index, name)
         };
         let old = slot.swap(new, Ordering::AcqRel);
-        self.count_change(old, new);
+        self.count_change(index, old, new);
         old
     }
 
@@ -103,7 +100,7 @@ impl<const PAGE: usize, D: SharedDirectory> Words<PAGE, D> {
         let slot = self.ensure_slot(index, name);
         match slot.compare_exchange(0, new, Ordering::AcqRel, Ordering::Acquire) {
             Ok(old) => {
-                self.count_change(old, new);
+                self.count_change(index, old, new);
                 Ok(())
             }
             Err(actual) => Err(actual),
@@ -147,7 +144,7 @@ impl<const PAGE: usize, D: SharedDirectory> Words<PAGE, D> {
             };
             match target.compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(previous) => {
-                    self.count_change(previous, new);
+                    self.count_change(index, previous, new);
                     return Ok(previous);
                 }
                 Err(actual) => old = actual,
@@ -186,12 +183,12 @@ impl<const PAGE: usize, D: SharedDirectory> Words<PAGE, D> {
                 slot.store(0, Ordering::Relaxed);
             }
         }
-        self.len.store(0, Ordering::Relaxed);
+        self.len.reset();
     }
 
     fn reset(&mut self) {
         self.pages.clear();
-        self.len.store(0, Ordering::Relaxed);
+        self.len.reset();
     }
 }
 
@@ -243,10 +240,10 @@ fn decode_direct(word: u64) -> Option<u64> {
 /// proportional to installed pages, and looks up pages in O(depth). `PAGE`
 /// must be nonzero and its atomic storage must fit in `isize::MAX` bytes.
 ///
-/// Length uses a wrapping counter updated after each occupancy change. A
-/// removal can be counted before the insertion it undoes; [`len`](Self::len)
-/// interprets the counter as signed and clamps negatives to zero. It is exact
-/// when no write is in flight. Traversals are weakly consistent, visit ascending
+/// Length uses wrapping counters, one per thread (per page group without
+/// `std`), updated after each occupancy change. A removal can be counted
+/// before the insertion it undoes, or on another counter; [`len`](Self::len)
+/// reads their sum as signed and clamps negatives to zero. It is exact when no write is in flight. Traversals are weakly consistent, visit ascending
 /// slots and load each visited slot once; they do not provide a snapshot.
 ///
 /// ```
@@ -289,7 +286,12 @@ impl<const PAGE: usize, D: SharedDirectory> AtomicDirectMap<PAGE, D> {
     }
 
     /// Number of entries; exact when no write is in flight.
-    /// Interprets the wrapping counter as signed and clamps negatives to zero.
+    ///
+    /// Sums per-thread counters (per page group without `std`), reading the
+    /// sum as signed and clamping negatives to zero. While writes are in
+    /// flight, the counters may be
+    /// read at different moments, so the result can differ from every count
+    /// the map held, though it never exceeds the number of insertions.
     pub fn len(&self) -> usize {
         self.words.len()
     }
@@ -452,10 +454,10 @@ fn id_update(id: Id, old: u64, new: Option<u32>) -> u64 {
 /// return absent; inserting outside the spine range panics. `PAGE` must be
 /// nonzero and its atomic slot storage must fit in `isize::MAX` bytes.
 ///
-/// Length uses a wrapping counter updated after each occupancy change. A
-/// removal can be counted before the insertion it undoes; [`len`](Self::len)
-/// interprets the counter as signed and clamps negatives to zero. It is exact
-/// when no write is in flight. Traversals are weakly consistent, visit ascending
+/// Length uses wrapping counters, one per thread (per page group without
+/// `std`), updated after each occupancy change. A removal can be counted
+/// before the insertion it undoes, or on another counter; [`len`](Self::len)
+/// reads their sum as signed and clamps negatives to zero. It is exact when no write is in flight. Traversals are weakly consistent, visit ascending
 /// indices and load each visited slot once; they do not provide a snapshot.
 ///
 /// ```
@@ -489,7 +491,12 @@ impl<const PAGE: usize> AtomicIdMap<PAGE> {
     }
 
     /// Number of entries; exact when no write is in flight.
-    /// Interprets the wrapping counter as signed and clamps negatives to zero.
+    ///
+    /// Sums per-thread counters (per page group without `std`), reading the
+    /// sum as signed and clamping negatives to zero. While writes are in
+    /// flight, the counters may be
+    /// read at different moments, so the result can differ from every count
+    /// the map held, though it never exceeds the number of insertions.
     pub fn len(&self) -> usize {
         self.words.len()
     }

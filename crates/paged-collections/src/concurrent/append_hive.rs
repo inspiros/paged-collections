@@ -14,7 +14,8 @@ use core::mem::MaybeUninit;
 use core::ops::Index;
 use core::ptr;
 
-use super::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, UnsafeCell};
+use super::atomic::{AtomicU32, AtomicU64, Ordering, UnsafeCell};
+use super::count::StripedLen;
 use super::free_stack::FreeStack;
 use super::recycle::PageStack;
 use super::spine::Spine;
@@ -118,7 +119,7 @@ pub struct ConcurrentAppendHive<T, const PAGE: usize = DEFAULT_PAGE> {
     free: FreeStack,
     /// Pages freed by `shrink_to_fit`, below the reservation bound.
     recycled: PageStack,
-    len: AtomicUsize,
+    len: StripedLen,
 }
 
 // SAFETY: moving the hive transfers its owned cells; no borrowed reference
@@ -172,7 +173,7 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
             pages: Spine::new(),
             free: FreeStack::new(),
             recycled: PageStack::new(),
-            len: AtomicUsize::new(0),
+            len: StripedLen::new(),
         }
     }
 
@@ -263,7 +264,7 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
     }
 
     // The caller owns this empty cell through a claim or exclusive conversion.
-    fn write_value(&self, slot: &Slot<T>, live: u32, value: T) {
+    fn write_value(&self, slot: &Slot<T>, index: u32, live: u32, value: T) {
         slot.value.with_mut(|cell| {
             // SAFETY: the claim CAS or exclusive construction grants sole
             // ownership of this uninitialized cell. MaybeUninit has T's layout.
@@ -271,13 +272,13 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
         });
         // Relaxed accounting precedes publication; len is exact once no
         // insertion is in flight, but does not itself grant value access.
-        self.len.fetch_add(1, Ordering::Relaxed);
+        self.len.increment(index as usize / PAGE);
         // Release publishes the initialized value to matching Acquire reads.
         slot.state.store(u64::from(live), Ordering::Release);
     }
 
     fn publish(&self, mut owner: Busy<'_, T, PAGE>, live: u32, value: T) -> Id {
-        self.write_value(owner.slot, live, value);
+        self.write_value(owner.slot, owner.index, live, value);
         owner.armed = false;
         Id::new(owner.index, generation_of(live))
     }
@@ -394,9 +395,12 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
 
     /// Number of live values; approximate during shared insertion.
     /// Exact when no insertion is in flight; this is no publication barrier.
+    ///
+    /// It sums per-thread counters (per page group without `std`), which only
+    /// grow while shared, so it lies between the counts at the start and the
+    /// end of the call.
     pub fn len(&self) -> usize {
-        // Relaxed: accounting does not grant page or value access.
-        self.len.load(Ordering::Relaxed)
+        self.len.get()
     }
 
     /// Whether the hive is empty; approximate during shared insertion.
@@ -454,7 +458,7 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
             self.free.push(id.index(), &slot.next);
         }
         // Relaxed accounting completes before user destruction can run.
-        self.len.fetch_sub(1, Ordering::Relaxed);
+        self.len.decrement(id.index() as usize / PAGE);
         Some(value)
     }
 
@@ -713,7 +717,7 @@ impl<T, const PAGE: usize> From<Hive<T, PAGE>> for ConcurrentAppendHive<T, PAGE>
         for (id, value) in hive.drain() {
             let live = live_version(id.generation()).expect("Hive issues valid generations");
             let slot = out.slot(id.index()).expect("copied slot has a page");
-            out.write_value(slot, live, value);
+            out.write_value(slot, id.index(), live, value);
         }
         out
     }

@@ -14,7 +14,8 @@ use core::mem::MaybeUninit;
 use core::ops::Deref;
 use core::ptr;
 
-use super::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, UnsafeCell, spin_loop};
+use super::atomic::{AtomicU32, AtomicU64, Ordering, UnsafeCell, spin_loop};
+use super::count::StripedLen;
 use super::free_stack::FreeStack;
 use super::recycle::PageStack;
 use super::spine::Spine;
@@ -103,7 +104,7 @@ pub struct ConcurrentHive<T, const PAGE: usize = DEFAULT_PAGE> {
     free: FreeStack,
     /// Pages freed by `shrink_to_fit`, below the reservation bound.
     recycled: PageStack,
-    len: AtomicUsize,
+    len: StripedLen,
 }
 
 // SAFETY: moving the hive transfers its owned cells; no guard outlives its
@@ -159,7 +160,7 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
             pages: Spine::new(),
             free: FreeStack::new(),
             recycled: PageStack::new(),
-            len: AtomicUsize::new(0),
+            len: StripedLen::new(),
         }
     }
 
@@ -255,23 +256,23 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
     }
 
     // The caller owns this empty cell through a claim or exclusive conversion.
-    fn write_value(&self, slot: &Slot<T>, live: u32, value: T) {
+    fn write_value(&self, slot: &Slot<T>, index: u32, live: u32, value: T) {
         slot.value.with_mut(|cell| {
             // SAFETY: the claim CAS or exclusive construction grants sole
             // ownership of this uninitialized cell. MaybeUninit<T> has T's
             // layout/alignment.
             unsafe { ptr::write(cell.cast::<T>(), value) };
         });
-        // Relaxed accounting precedes publication so even a guessed id removed
-        // immediately after publication cannot decrement an uncounted value.
-        self.len.fetch_add(1, Ordering::Relaxed);
+        // Relaxed accounting precedes publication, so any removal of this
+        // value, even through a guessed id, is counted after it.
+        self.len.increment(index as usize / PAGE);
         // Release publishes the initialized value and preceding accounting;
         // every successful reader/remover CAS acquires that publication.
         slot.state.store(u64::from(live), Ordering::Release);
     }
 
     fn publish(&self, mut owner: Busy<'_, T, PAGE>, live: u32, value: T) -> Id {
-        self.write_value(owner.slot, live, value);
+        self.write_value(owner.slot, owner.index, live, value);
         owner.armed = false;
         Id::new(owner.index, generation_of(live))
     }
@@ -407,7 +408,7 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
                 Ok(_) => {
                     // Relaxed accounting: logically removed now, before any
                     // user destructor (which may panic or reenter the hive).
-                    self.len.fetch_sub(1, Ordering::Relaxed);
+                    self.len.decrement(id.index() as usize / PAGE);
                     if direct {
                         let owner = self.busy(slot, id.index(), vacant(live));
                         self.drop_owned(&owner);
@@ -455,7 +456,7 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
             }
         }
         // Relaxed accounting: the mark is the logical removal point.
-        self.len.fetch_sub(1, Ordering::Relaxed);
+        self.len.decrement(id.index() as usize / PAGE);
         let mut spins = 0;
         loop {
             // Acquire observes guard releases before exclusive extraction.
@@ -488,9 +489,13 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
 
     /// Number of logically live values; approximate during shared operations.
     /// Exact when no operation is in flight; this is no publication barrier.
+    ///
+    /// It sums per-thread counters (per page group without `std`). While
+    /// operations are in flight it may combine counters read at different
+    /// moments and differ from every count the hive held; it never
+    /// exceeds the number of insertions.
     pub fn len(&self) -> usize {
-        // Relaxed: accounting does not grant page or value access.
-        self.len.load(Ordering::Relaxed)
+        self.len.get()
     }
 
     /// Whether the hive is empty; approximate during shared operations.
@@ -855,7 +860,7 @@ impl<T, const PAGE: usize> From<Hive<T, PAGE>> for ConcurrentHive<T, PAGE> {
         for (id, value) in hive.drain() {
             let live = live_version(id.generation()).expect("Hive issues valid generations");
             let slot = out.slot(id.index()).expect("copied slot has a page");
-            out.write_value(slot, live, value);
+            out.write_value(slot, id.index(), live, value);
         }
         out
     }
