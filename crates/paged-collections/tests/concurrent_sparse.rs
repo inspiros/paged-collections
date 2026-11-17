@@ -8,12 +8,13 @@
 ))]
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use paged_collections::concurrent::{ConcurrentSparseMap, ConcurrentSparseSet, SharedDirectory};
@@ -646,4 +647,264 @@ fn auto_traits_need_only_shared_directory() {
     }
     check::<Flat>();
     check::<Radix>();
+}
+
+fn batched_oracle<const PAGE: usize, D: SharedDirectory>() {
+    let set = ConcurrentSparseSet::<usize, PAGE, D>::new();
+    let map = ConcurrentSparseMap::<usize, isize, PAGE, D>::new();
+    let mut oracle = BTreeMap::new();
+    assert_eq!(set.insert_many(core::iter::empty()), 0);
+    assert_eq!(map.try_insert_many(core::iter::empty()), 0);
+    assert!(set.is_empty() && map.is_empty());
+    assert_eq!(set.iter().count(), 0);
+    assert_eq!(map.iter().count(), 0);
+    // Spread sparse keys over many pages; dense writes also cross pages and
+    // bitmap words. In particular PAGE=63/65 clips a word at the page end.
+    let key = |i: usize| i * 131;
+    let initial: Vec<_> = (0..300).map(|i| (key(i), i as isize + 10_000)).collect();
+    assert_eq!(set.insert_many(initial.iter().map(|&(k, _)| k)), 300);
+    assert_eq!(map.try_insert_many(initial.iter().copied()), 300);
+    oracle.extend(initial);
+    // More than two full batches claim NOTHING before fresh keys appear.
+    // A previous implementation stopped on the first such batch.
+    let input: Vec<_> = (0..600)
+        .map(|i| (key(i % 300), -1))
+        .chain((300..1000).flat_map(|i| [(key(i), i as isize), (key(i), -(i as isize))]))
+        .collect();
+    let before = oracle.len();
+    for &(key, value) in &input {
+        oracle.entry(key).or_insert(value);
+    }
+    let expected = oracle.len() - before;
+    assert_eq!(set.insert_many(input.iter().map(|&(k, _)| k)), expected);
+    assert_eq!(map.try_insert_many(input.iter().copied()), expected);
+    assert_eq!(set.len(), oracle.len());
+    assert_eq!(map.len(), oracle.len());
+    assert_eq!(set.iter().count(), oracle.len());
+    assert_eq!(map.iter().count(), oracle.len());
+    let mut keys: Vec<_> = set.iter().copied().collect();
+    keys.sort_unstable();
+    assert!(keys.into_iter().eq(oracle.keys().copied()));
+    assert_eq!(
+        map.iter()
+            .map(|(&k, &v)| (k, v))
+            .collect::<BTreeMap<_, _>>(),
+        oracle
+    );
+    for (&key, value) in &oracle {
+        assert!(set.contains(key));
+        assert_eq!(map.get(&key), Some(value));
+    }
+    // Empty calls on populated collections reserve no positions, either.
+    assert_eq!(set.insert_many([]), 0);
+    assert_eq!(map.try_insert_many([]), 0);
+    assert_eq!(set.len(), oracle.len());
+    assert_eq!(map.len(), oracle.len());
+    assert_eq!(set.pages().flatten().count(), oracle.len());
+    let plain = map.into_inner();
+    assert_eq!(plain.len(), oracle.len());
+    assert_eq!(
+        plain
+            .iter()
+            .map(|(&k, &v)| (k, v))
+            .collect::<BTreeMap<_, _>>(),
+        oracle
+    );
+}
+
+#[test]
+fn batched_set_and_map_match_oracle_at_page_and_word_boundaries() {
+    batched_oracle::<3, Flat>();
+    batched_oracle::<63, Flat>();
+    batched_oracle::<64, Flat>();
+    batched_oracle::<65, Flat>();
+    batched_oracle::<128, Flat>();
+    batched_oracle::<65, Radix>();
+}
+
+#[test]
+fn batch_iterator_panic_keeps_completed_batches_and_rolls_back_partial_batch() {
+    const COMPLETED: usize = 256;
+    const PANIC_AT: usize = COMPLETED + 19;
+    let set = ConcurrentSparseSet::<usize, 3>::new();
+    let map = ConcurrentSparseMap::<usize, usize, 3>::new();
+    let key = |i| i * 17;
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            set.insert_many((0..512).map(|i| {
+                assert_ne!(i, PANIC_AT, "iterator failed");
+                key(i)
+            }));
+        }))
+        .is_err()
+    );
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            map.try_insert_many((0..512).map(|i| {
+                assert_ne!(i, PANIC_AT, "iterator failed");
+                (key(i), i)
+            }));
+        }))
+        .is_err()
+    );
+    let mut oracle: BTreeMap<_, _> = (0..COMPLETED).map(|i| (key(i), i)).collect();
+    assert_eq!(set.len(), COMPLETED);
+    assert_eq!(map.len(), COMPLETED);
+    assert!(set.iter().copied().eq(oracle.keys().copied()));
+    assert_eq!(
+        map.iter()
+            .map(|(&k, &v)| (k, v))
+            .collect::<BTreeMap<_, _>>(),
+        oracle
+    );
+    for i in COMPLETED..PANIC_AT {
+        assert!(!set.contains(key(i)));
+        assert_eq!(set.position(key(i)), None);
+        assert_eq!(map.get(&key(i)), None);
+    }
+    let retry: Vec<_> = (COMPLETED..300).map(|i| (key(i), i + 1000)).collect();
+    assert_eq!(set.insert_many(retry.iter().map(|&(k, _)| k)), retry.len());
+    assert_eq!(map.try_insert_many(retry.iter().copied()), retry.len());
+    oracle.extend(retry);
+    assert_eq!(set.len(), oracle.len());
+    assert_eq!(map.len(), oracle.len());
+    assert_eq!(set.iter().count(), oracle.len());
+    assert_eq!(map.iter().count(), oracle.len());
+    assert!(set.iter().copied().eq(oracle.keys().copied()));
+    assert_eq!(
+        map.iter()
+            .map(|(&k, &v)| (k, v))
+            .collect::<BTreeMap<_, _>>(),
+        oracle
+    );
+    for (&key, value) in &oracle {
+        assert!(set.contains(key));
+        assert_eq!(map.get(&key), Some(value));
+    }
+}
+
+#[test]
+fn batch_sparse_allocation_range_panic_rolls_back_earlier_claims() {
+    let set = ConcurrentSparseSet::<usize, 3>::new();
+    let map = ConcurrentSparseMap::<usize, usize, 3>::new();
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            set.insert_many([0, 3, usize::MAX]);
+        }))
+        .is_err()
+    );
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            map.try_insert_many([(0, 10), (3, 30), (usize::MAX, 0)]);
+        }))
+        .is_err()
+    );
+    assert_eq!(set.len(), 0);
+    assert_eq!(map.len(), 0);
+    assert_eq!(set.iter().count(), 0);
+    assert_eq!(map.iter().count(), 0);
+    assert_eq!(set.insert_many([0, 3]), 2);
+    assert_eq!(map.try_insert_many([(0, 10), (3, 30)]), 2);
+    assert!(set.contains(0) && set.contains(3));
+    assert_eq!(map.get(&0), Some(&10));
+    assert_eq!(map.get(&3), Some(&30));
+    assert_eq!(set.len(), 2);
+    assert_eq!(map.len(), 2);
+}
+
+#[test]
+fn four_scoped_batch_writers_match_overlapping_range_oracle() {
+    let set = ConcurrentSparseSet::<usize, 65>::new();
+    let map = ConcurrentSparseMap::<usize, usize, 65>::new();
+    let gate = Barrier::new(4);
+    let width = if cfg!(miri) { 260 } else { 1024 };
+    let stride = width / 2;
+    let oracle: BTreeMap<_, _> = (0..4)
+        .flat_map(|worker| (worker * stride..worker * stride + width).map(|i| (i * 17, i)))
+        .collect();
+    let counts = thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for worker in 0..4 {
+            let (set, map, gate) = (&set, &map, &gate);
+            workers.push(scope.spawn(move || {
+                gate.wait();
+                let entries: Vec<_> = (worker * stride..worker * stride + width)
+                    .rev()
+                    .flat_map(|i| [(i * 17, i), (i * 17, i)])
+                    .collect();
+                let sets = set.insert_many(entries.iter().map(|&(k, _)| k));
+                let maps = map.try_insert_many(entries);
+                (sets, maps)
+            }));
+        }
+        workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(counts.iter().map(|c| c.0).sum::<usize>(), oracle.len());
+    assert_eq!(counts.iter().map(|c| c.1).sum::<usize>(), oracle.len());
+    assert_eq!(set.len(), oracle.len());
+    assert_eq!(map.len(), oracle.len());
+    let mut keys: Vec<_> = set.iter().copied().collect();
+    assert_eq!(keys.len(), oracle.len());
+    keys.sort_unstable();
+    assert!(keys.into_iter().eq(oracle.keys().copied()));
+    assert_eq!(map.iter().count(), oracle.len());
+    assert_eq!(
+        map.iter()
+            .map(|(&k, &v)| (k, v))
+            .collect::<BTreeMap<_, _>>(),
+        oracle
+    );
+    for (&key, value) in &oracle {
+        assert!(set.contains(key));
+        assert_eq!(map.get(&key), Some(value));
+    }
+}
+
+#[test]
+fn batch_keeps_first_duplicate_after_competing_factory_rolls_back() {
+    // Regression for the first-wins contract: the first entry is deferred
+    // while another writer owns the slot, which rolls back before entry two.
+    let map = ConcurrentSparseMap::<u32, &'static str, 2>::new();
+    thread::scope(|scope| {
+        let (started, ready) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let writer = &map;
+        let owner = scope.spawn(move || {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    writer.get_or_insert_with(1, || {
+                        started.send(()).unwrap();
+                        wait.recv().unwrap();
+                        panic!("competing factory rolls back");
+                    });
+                }))
+                .is_err()
+            );
+        });
+        ready.recv().unwrap();
+        let mut owner = Some(owner);
+        let mut step = 0;
+        let entries = core::iter::from_fn(move || {
+            step += 1;
+            match step {
+                1 => Some((1, "first")),
+                2 => {
+                    // next() is called only after the first entry tried the
+                    // still-reserved slot. Complete rollback before yielding
+                    // the second entry; this iterator never inserts itself.
+                    release.send(()).unwrap();
+                    owner.take().unwrap().join().unwrap();
+                    Some((1, "second"))
+                }
+                _ => None,
+            }
+        });
+        assert_eq!(map.try_insert_many(entries), 1);
+    });
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.iter().count(), 1);
+    assert_eq!(map.get(&1), Some(&"first"));
 }

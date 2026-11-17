@@ -5,6 +5,7 @@
 //! reserved. Removal and moving values require exclusive access.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::iter::FusedIterator;
 use core::mem::MaybeUninit;
 use core::ptr;
@@ -170,17 +171,22 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
         loop {
             // Acquire: sees every slot below the returned watermark.
             let c = self.committed.load(Ordering::Acquire);
-            // Acquire observes the write behind a set bit; a missing page
-            // is not ready.
-            if !self.ready(c, Ordering::Acquire) {
+            // Acquire observes the write behind each set bit; a missing page
+            // is not ready. Advancing over the whole ready run at once costs
+            // one contended CAS per run rather than per position.
+            let mut end = c;
+            while self.ready(end, Ordering::Acquire) {
+                end += 1;
+            }
+            if end == c {
                 break;
             }
             // AcqRel publishes the extended prefix and carries what this
-            // helper acquired (the bit at `c`) to later readers of
+            // helper acquired (the bits in c..end) to later readers of
             // `committed`. On failure another helper advanced: rescan.
             let _ = self
                 .committed
-                .compare_exchange(c, c + 1, Ordering::AcqRel, Ordering::Acquire);
+                .compare_exchange(c, end, Ordering::AcqRel, Ordering::Acquire);
         }
     }
 
@@ -189,6 +195,70 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
             return Err(value);
         };
         self.publish(pos, page, value);
+        Ok(pos)
+    }
+
+    /// Appends all `values` at consecutive positions with one reservation
+    /// and one helping pass, returning the first position. Fails, returning
+    /// the values, if they do not all fit below `limit`. An empty batch
+    /// reserves nothing and returns the current reservation count.
+    pub(crate) fn push_many(&self, values: Vec<T>, limit: usize) -> Result<usize, Vec<T>> {
+        let n = values.len();
+        // Acquire: as in `claim`, only the CAS decides ownership.
+        let mut pos = self.reserved.load(Ordering::Acquire);
+        if n == 0 {
+            return Ok(pos);
+        }
+        loop {
+            if pos > limit || limit - pos < n {
+                return Err(values);
+            }
+            // Allocate every page of the block BEFORE claiming it: capacity or
+            // allocation panics cannot strand holes. Pages installed for a
+            // lost CAS stay for later claims.
+            for page in pos / PAGE..=(pos + n - 1) / PAGE {
+                self.pages
+                    .get_or_insert_with(page, || Box::new(Page::new(PAGE)));
+            }
+            // AcqRel: the winner uniquely owns pos..pos + n.
+            match self
+                .reserved
+                .compare_exchange(pos, pos + n, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => pos = actual,
+            }
+        }
+        // No user code runs from the claim until every slot is ready: moving
+        // out of a Vec and raw writes cannot panic.
+        for (i, value) in values.into_iter().enumerate() {
+            let at = pos + i;
+            let page = self.pages.get(at / PAGE).expect("claimed page installed");
+            page.slots[at % PAGE].with_mut(|cell| {
+                // SAFETY: the block reservation uniquely owns this
+                // uninitialized slot; shared operations never overwrite an
+                // initialized slot.
+                unsafe { ptr::write(cell.cast::<T>(), value) };
+            });
+        }
+        let (mut at, end) = (pos, pos + n);
+        while at < end {
+            let page = self.pages.get(at / PAGE).expect("claimed page installed");
+            let offset = at % PAGE;
+            let bit = offset % 64;
+            // Bits of this word within both the block and the page.
+            let count = (64 - bit).min(end - at).min(PAGE - offset);
+            let mask = if count == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << count) - 1) << bit
+            };
+            // Release publishes these writes, as the single-bit RMW in
+            // `publish` does for one.
+            page.ready[offset / 64].fetch_or(mask, Ordering::Release);
+            at += count;
+        }
+        self.help();
         Ok(pos)
     }
 

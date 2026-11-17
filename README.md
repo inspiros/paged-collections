@@ -131,7 +131,7 @@ under `&mut self` or on drop, so no epochs or hazard pointers are needed.
 | `ConcurrentHive<T>` | insert, remove, lookup | Lookups return a `Ref` guard that pins the value |
 | `ConcurrentAppendHive<T>` | insert, lookup | Lookups return plain `&T`; removal needs `&mut self` |
 | `ConcurrentPagedVec<T>` | push, lookup | `len` and iteration cover the hole-free prefix |
-| `ConcurrentSparseSet<K>`, `ConcurrentSparseMap<K, V>` | insert-only, lookup | Plain `&V` references; removal needs `&mut self` |
+| `ConcurrentSparseSet<K>`, `ConcurrentSparseMap<K, V>` | insert-only, lookup | Plain `&V` references; removal needs `&mut self`; batch `insert_many`/`try_insert_many` scale across threads, single inserts do not |
 | `ConcurrentDirectMap<K, V>` | insert, replace, remove, entry | One reader-writer lock per page |
 | `AtomicDirectMap`, `AtomicIdMap` | lock-free one-word updates | `usize -> u64` (below `u64::MAX`), `Id -> u32` |
 | `ConcurrentIdAllocator` | allocate, free | Generational ids, as `IdAllocator` |
@@ -329,7 +329,8 @@ while shared, and existing sparse map values are preserved. Batch methods
 release the GIL; single-key calls do not. Free-threaded builds are not yet
 published. Results are copies; there are no guards or views. Sparse removal
 and `clear` are exclusive: a conflicting exclusive call raises `RuntimeError`
-(`Already borrowed`). Direct map snapshots are ordered by key.
+(`Already borrowed`). Direct map snapshots are ordered by key. `len()` is exact
+only when no write is in flight.
 
 ## Layout
 

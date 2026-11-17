@@ -1,6 +1,7 @@
 //! Insert-only shared sparse collections; editing requires exclusive access.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::fmt;
 use core::iter::FusedIterator;
 
@@ -90,29 +91,123 @@ impl<const PAGE: usize, D: SharedDirectory> Index<PAGE, D> {
         }
     }
 
+    /// One attempt to reserve the slot, never waiting.
+    fn try_claim(slot: &AtomicU32) -> Claim<'_> {
+        // Acquire sees the winning entry or a rollback from RESERVED to 0.
+        match slot.load(Ordering::Acquire) {
+            0 => {
+                // AcqRel grants one caller ownership and observes any
+                // previous rollback; failure acquires the competing state.
+                match slot.compare_exchange(0, RESERVED, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => Claim::Owned(Reservation { slot, armed: true }),
+                    // Failure means the slot is no longer 0.
+                    Err(RESERVED) => Claim::Busy,
+                    Err(word) => Claim::Present(word as usize - 1),
+                }
+            }
+            RESERVED => Claim::Busy,
+            word => Claim::Present(word as usize - 1),
+        }
+    }
+
     fn claim(&self, index: usize) -> Result<Reservation<'_>, usize> {
         let slot = self.ensure_slot(index);
         let mut spins = 0;
         loop {
-            // Acquire sees the winning entry or a rollback from RESERVED to 0.
-            match slot.load(Ordering::Acquire) {
-                0 => {
-                    // AcqRel grants one caller ownership and observes any
-                    // previous rollback; failure acquires the competing state.
-                    if slot
-                        .compare_exchange(0, RESERVED, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        return Ok(Reservation { slot, armed: true });
+            match Self::try_claim(slot) {
+                Claim::Owned(owner) => return Ok(owner),
+                Claim::Present(pos) => return Err(pos),
+                // Same-slot insertions wait for publication or rollback.
+                // Other slots proceed independently. A factory must not
+                // recursively insert into its own reserved slot.
+                Claim::Busy => retry(&mut spins),
+            }
+        }
+    }
+}
+
+enum Claim<'a> {
+    Owned(Reservation<'a>),
+    Present(usize),
+    Busy,
+}
+
+/// Keys per batch reservation in [`ConcurrentSparseSet::insert_many`] and
+/// [`ConcurrentSparseMap::try_insert_many`]: large enough to amortize the
+/// shared append counters, small enough to bound held reservations.
+const BATCH: usize = 256;
+
+/// Inserts `items` in batches. Each batch claims vacant slots without
+/// waiting, appends all claimed entries with one reservation, then publishes
+/// their positions. Slots another writer holds (including an earlier
+/// duplicate in this batch) are deferred and inserted one at a time with the
+/// waiting path once this batch holds no reservations, so two batches never
+/// wait on each other. Returns the number inserted.
+fn insert_batched<'a, K: Key, T, const PAGE: usize, D: SharedDirectory>(
+    index: &'a Index<PAGE, D>,
+    dense: &AppendLog<T, PAGE>,
+    items: impl IntoIterator<Item = T>,
+    key_of: impl Fn(&T) -> K,
+    insert_one: impl Fn(T) -> bool,
+    full: &str,
+) -> usize {
+    let mut items = items.into_iter();
+    let mut inserted = 0;
+    // Values are dropped only while this call holds no reservation, since a
+    // destructor may insert into the map. `owners` is declared last so that
+    // unwinding releases the reservations before dropping any value.
+    let mut rejected: Vec<T> = Vec::new();
+    let mut deferred: Vec<T> = Vec::new();
+    let mut entries: Vec<T> = Vec::with_capacity(BATCH);
+    let mut owners: Vec<Reservation<'a>> = Vec::with_capacity(BATCH);
+    loop {
+        // User iterator code runs here, holding reservations: it must not
+        // insert into this map (as with a factory). A panic rolls back.
+        let mut taken = 0;
+        for item in items.by_ref().take(BATCH) {
+            taken += 1;
+            let key_index = key_of(&item).index();
+            // A later copy of a deferred key is deferred too: if the other
+            // writer rolls back, the earlier copy must still win.
+            if deferred.iter().any(|d| key_of(d).index() == key_index) {
+                deferred.push(item);
+                continue;
+            }
+            let slot = index.ensure_slot(key_index);
+            match Index::<PAGE, D>::try_claim(slot) {
+                Claim::Owned(owner) => {
+                    owners.push(owner);
+                    entries.push(item);
+                }
+                Claim::Present(_) => rejected.push(item),
+                Claim::Busy => deferred.push(item),
+            }
+        }
+        if !owners.is_empty() {
+            let batch = core::mem::replace(&mut entries, Vec::with_capacity(BATCH));
+            match dense.push_many(batch, DENSE_LIMIT) {
+                Ok(start) => {
+                    inserted += owners.len();
+                    for (i, owner) in owners.drain(..).enumerate() {
+                        owner.publish(start + i);
                     }
                 }
-                RESERVED => {}
-                word => return Err(word as usize - 1),
+                Err(batch) => {
+                    owners.clear();
+                    drop(batch);
+                    panic!("{full}");
+                }
             }
-            // Same-slot insertions wait for publication or rollback. Other
-            // slots proceed independently. A factory must not recursively
-            // insert into its own reserved slot.
-            retry(&mut spins);
+        }
+        // No reservation is held from here on.
+        rejected.clear();
+        for item in deferred.drain(..) {
+            inserted += usize::from(insert_one(item));
+        }
+        // Only an exhausted input ends the loop: a batch of present keys
+        // claims nothing but more input may follow.
+        if taken < BATCH {
+            return inserted;
         }
     }
 }
@@ -198,6 +293,29 @@ impl<K: Key, const PAGE: usize, D: SharedDirectory> ConcurrentSparseSet<K, PAGE,
             }
         }
         true
+    }
+
+    /// Adds every key whose slot is vacant, returning how many were added.
+    /// Earlier duplicates win. Batches share one dense reservation, which
+    /// scales across threads far better than repeated [`insert`](Self::insert).
+    /// Positions need not follow input order.
+    ///
+    /// The iterator runs while this call holds slot reservations: it must not
+    /// insert into this set (that may deadlock). It may panic; reservations
+    /// it holds roll back and earlier batches stay inserted.
+    ///
+    /// # Panics
+    ///
+    /// As [`insert`](Self::insert).
+    pub fn insert_many(&self, keys: impl IntoIterator<Item = K>) -> usize {
+        insert_batched(
+            &self.index,
+            &self.dense,
+            keys,
+            |&key| key,
+            |key| self.insert(key),
+            "ConcurrentSparseSet cannot hold more than u32::MAX - 1 keys",
+        )
     }
 
     /// Dense position of this key, including a completed insertion beyond
@@ -429,6 +547,29 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentSparseMap<K, V,
             Ok(owner) => Ok(self.append(owner, key, value)),
             Err(_) => Err((key, value)),
         }
+    }
+
+    /// Adds every entry whose slot is vacant, dropping the others, and returns
+    /// how many were added. Existing entries and earlier duplicates win.
+    /// Batches share one dense reservation, which scales across threads far
+    /// better than repeated [`try_insert`](Self::try_insert).
+    ///
+    /// The iterator runs while this call holds slot reservations: it must not
+    /// insert into this map (that may deadlock). It may panic; reservations
+    /// it holds roll back and earlier batches stay inserted.
+    ///
+    /// # Panics
+    ///
+    /// As [`try_insert`](Self::try_insert).
+    pub fn try_insert_many(&self, entries: impl IntoIterator<Item = (K, V)>) -> usize {
+        insert_batched(
+            &self.index,
+            &self.dense,
+            entries,
+            |(key, _)| *key,
+            |(key, value)| self.try_insert(key, value).is_ok(),
+            "ConcurrentSparseMap cannot hold more than u32::MAX - 1 entries",
+        )
     }
 
     /// The value for this key, including completed appends beyond `len`.

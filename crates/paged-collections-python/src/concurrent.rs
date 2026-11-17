@@ -100,7 +100,7 @@ impl ConcurrentSparseSet {
 
     fn insert_many(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<usize> {
         let keys = KeyBatch::<Key>::new(keys)?.to_insert_keys()?;
-        Ok(py.detach(|| keys.into_iter().filter(|&key| self.set.insert(key)).count()))
+        Ok(py.detach(|| self.set.insert_many(keys)))
     }
 
     fn contains_many<'py>(
@@ -281,11 +281,7 @@ macro_rules! sparse_map {
             ) -> PyResult<usize> {
                 let keys = KeyBatch::<Key>::new(keys)?.to_insert_keys()?;
                 let values = value_batch::<$t>(values, keys.len())?;
-                Ok(py.detach(|| {
-                    keys.into_iter().zip(values)
-                        .filter(|&(key, value)| self.map.try_insert(key, value).is_ok())
-                        .count()
-                }))
+                Ok(py.detach(|| self.map.try_insert_many(keys.into_iter().zip(values))))
             }
 
             /// Remove with exclusive access, returning the value or None.
