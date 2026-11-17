@@ -6,7 +6,7 @@ use core::fmt;
 
 use super::atomic::{AtomicU32, Ordering};
 use super::count::StripedLen;
-use super::free_stack::FreeStack;
+use super::free_stack::{FreeStack, block_for};
 use super::spine::Spine;
 use crate::id_alloc::{Id, IdAllocator, MAX_INDICES, generation_of, live_version};
 use crate::page::DEFAULT_PAGE;
@@ -32,7 +32,8 @@ struct Page {
 /// A thread-safe, paged allocator of generational [`Id`]s.
 ///
 /// Shared access can allocate, free, and check ids. Freed indices are reused
-/// through a tagged LIFO stack; their generations never wrap. As with
+/// through tagged LIFO stacks, one per thread group (a thread with none
+/// steals another's); their generations never wrap. As with
 /// [`IdAllocator`], ids carry no allocator identity, and the stale-id
 /// guarantee applies within one allocation history. Conversions preserve it.
 ///
@@ -94,13 +95,12 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
     /// A concurrent free may make room immediately after the stack is checked.
     pub fn try_allocate(&self) -> Option<Id> {
         loop {
-            let reused = self
-                .free
-                .pop(|index| &self.slot(index).expect("free index has a page").next);
-            let index = match reused {
-                Some(index) => index,
-                None => self.free.fresh(MAX_INDICES)?,
-            };
+            let (index, reused) = self.free.next_index(
+                |index| &self.slot(index).expect("free index has a page").next,
+                || None,
+                MAX_INDICES,
+                block_for(PAGE),
+            )?;
             let slot = self.ensure_slot(index);
             // Acquire observes the previous owner's vacant version after pop.
             // A fresh reservation uniquely owns its never-used zero version.
@@ -110,7 +110,7 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
             // (2^32 pops inside one stalled pop), it could hand out a live
             // or retired index; that index is skipped here, so a wrap can
             // leak indices but can never issue one id twice.
-            if previous % 2 == 1 || (reused.is_some() && previous == 0) {
+            if previous % 2 == 1 || (reused && previous == 0) {
                 continue;
             }
             // Relaxed: accounting only. Increment before publication, so any
@@ -189,6 +189,10 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
 
     /// One past the highest reserved index, including reservations in flight.
     /// This does not imply that every reserved index's page is installed yet.
+    ///
+    /// Threads that contend for fresh indices reserve them in blocks of
+    /// about one page, so the bound may exceed the indices handed out by up
+    /// to one block per thread.
     pub fn index_bound(&self) -> u32 {
         self.free.index_bound()
     }
@@ -211,28 +215,42 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
         }
     }
 
-    /// Converts to the plain allocator, preserving ids and LIFO reuse order.
+    /// Converts to the plain allocator, preserving ids, and LIFO reuse order
+    /// within each thread group's stack. Indices reserved in a block but
+    /// never handed out become free, with generation 1 spent.
     /// Takes O(number of indices ever reserved) time and temporary storage.
-    pub fn into_inner(self) -> IdAllocator {
+    pub fn into_inner(mut self) -> IdAllocator {
         let bound = self.index_bound() as usize;
+        let mut unissued = self.free.unissued();
+        let mut spare = Vec::new();
         // By index, not by installed page: a reservation whose page
-        // allocation unwound has no page and keeps version 0 (never issued),
-        // so later indices keep their own generations.
+        // allocation unwound has no page and keeps version 0 (retired, as it
+        // cannot be told apart from a retired index). Block indices never
+        // handed out become vacancies with generation 1 spent.
         let versions: Vec<u32> = (0..bound as u32)
             .map(|index| {
                 // Relaxed: self is exclusively owned, with no operations in flight.
-                self.slot(index)
-                    .map_or(0, |slot| slot.version.load(Ordering::Relaxed))
+                let version = self
+                    .slot(index)
+                    .map_or(0, |slot| slot.version.load(Ordering::Relaxed));
+                if unissued.contains(index) {
+                    debug_assert_eq!(version, 0, "unissued index was used");
+                    spare.push(index);
+                    2
+                } else {
+                    version
+                }
             })
             .collect();
-        let mut free = Vec::new();
-        while let Some(index) = self
+        // The plain allocator pops from the end: stack tops last, spare
+        // block indices first (lowest last among them).
+        let mut free = self
             .free
-            .pop(|index| &self.slot(index).expect("free index has a page").next)
-        {
-            free.push(index);
-        }
+            .drain(|index| &self.slot(index).expect("free index has a page").next);
         free.reverse();
+        spare.reverse();
+        spare.append(&mut free);
+        let free = spare;
         IdAllocator::try_from_raw_parts(versions, free)
             .expect("concurrent allocator maintains valid raw parts")
     }
@@ -243,7 +261,10 @@ impl<const PAGE: usize> From<IdAllocator> for ConcurrentIdAllocator<PAGE> {
         let mut result = Self::new();
         let (versions, free) = inner.raw_parts();
         for &version in versions {
-            let index = result.free.fresh(MAX_INDICES).expect("valid index bound");
+            let index = result
+                .free
+                .fresh(MAX_INDICES, block_for(PAGE))
+                .expect("valid index bound");
             // Release publishes the imported generation, just as allocation does.
             result
                 .ensure_slot(index)
@@ -278,6 +299,31 @@ impl<const PAGE: usize> fmt::Debug for ConcurrentIdAllocator<PAGE> {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unissued_block_tail_becomes_free_with_generation_one_spent() {
+        let ids: ConcurrentIdAllocator<4> = ConcurrentIdAllocator::new();
+        let a = ids.allocate();
+        let b = ids.allocate();
+        ids.free.force_blocks();
+        let c = ids.allocate();
+        assert_eq!((a.index(), b.index(), c.index()), (0, 1, 2));
+        assert_eq!(ids.index_bound(), 64);
+        assert!(ids.free(b));
+        let plain = ids.into_inner();
+        let (versions, free) = plain.raw_parts();
+        assert_eq!(&versions[..3], &[1, 2, 1]);
+        assert!(versions[3..].iter().all(|&v| v == 2));
+        assert_eq!(free.len(), 62);
+        assert_eq!(plain.retired_len(), 0);
+        assert!(!plain.is_alive(b) && plain.is_alive(a) && plain.is_alive(c));
+        let back = ConcurrentIdAllocator::<4>::from(plain);
+        for _ in 0..62 {
+            let id = back.allocate();
+            assert!(id.index() < 64 && id != b);
+        }
+        assert_eq!(back.index_bound(), 64);
+    }
 
     #[test]
     fn a_live_index_on_the_free_stack_is_never_reissued() {

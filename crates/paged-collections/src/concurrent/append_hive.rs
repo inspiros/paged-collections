@@ -16,7 +16,7 @@ use core::ptr;
 
 use super::atomic::{AtomicU32, AtomicU64, Ordering, UnsafeCell};
 use super::count::StripedLen;
-use super::free_stack::FreeStack;
+use super::free_stack::{FreeStack, block_for};
 use super::recycle::PageStack;
 use super::spine::Spine;
 use crate::hive::{Hive, RawPage, RawSlot};
@@ -200,8 +200,11 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
     /// free stack and returns the first, for the caller to claim by CAS.
     ///
     /// The popper is the page's only installer: the free stack holds none of
-    /// its indices (it was rebuilt when the page was freed) and fresh
-    /// reservation never goes below the bound. Its slots are unreachable
+    /// its indices (it was rebuilt when the page was freed), and fresh
+    /// reservation never hands out an index in a freed page: the counter
+    /// never goes below the bound, and indices reserved in a thread's block
+    /// but not handed out keep state 0, which stops their page from being
+    /// freed (uninstalled pages are never freed). Its slots are unreachable
     /// until pushed, so this thread owns them while pushing.
     fn recycle(&self) -> Option<u32> {
         let (page, floor) = self.recycled.pop()?;
@@ -223,19 +226,17 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
 
     fn claim(&self) -> Option<(Busy<'_, T, PAGE>, u32)> {
         loop {
-            let popped = self
-                .free
-                .pop(|index| &self.slot(index).expect("free index has a page").next);
-            let reused = popped.or_else(|| self.recycle());
-            let index = match reused {
-                Some(index) => index,
-                None => self.free.fresh(MAX_INDICES)?,
-            };
+            let (index, reused) = self.free.next_index(
+                |index| &self.slot(index).expect("free index has a page").next,
+                || self.recycle(),
+                MAX_INDICES,
+                block_for(PAGE),
+            )?;
             let slot = self.ensure_slot(index);
             // Acquire observes the completed vacancy, independently of the
             // free-stack hint. Only even versions without BUSY may be claimed.
             let old = slot.state.load(Ordering::Acquire);
-            if old & !VERSION != 0 || old & 1 != 0 || (reused.is_some() && old == 0) {
+            if old & !VERSION != 0 || old & 1 != 0 || (reused && old == 0) {
                 continue;
             }
             // AcqRel claims sole ownership and observes the preceding vacant
@@ -410,6 +411,10 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
 
     /// One past the highest reserved index, including insertions in flight.
     /// A reserved index's page may not have been installed yet.
+    ///
+    /// Threads that contend for fresh indices reserve them in blocks of
+    /// about one page, so the bound may exceed the indices handed out by up
+    /// to one block per thread.
     pub fn index_bound(&self) -> u32 {
         self.free.index_bound()
     }
@@ -525,8 +530,10 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
     /// kept). It remembers its highest version, so ids it issued stay dead:
     /// shared inserts reuse freed pages, lowest first, after the free slots
     /// of the remaining pages, with generations above every earlier one.
-    /// That order is exact only for one inserter: while one insert is
-    /// relinking a reused page, a concurrent insert can take a fresh index
+    /// That order is exact only for one inserter that has not contended
+    /// with others: a thread first uses up a block of fresh indices it
+    /// reserved under contention, and while one insert is relinking a
+    /// reused page, a concurrent insert can take a fresh index
     /// instead (and fail at the index limit even though slots are about to
     /// be freed). The free slots are relinked in index order. The page directory's own
     /// small arrays stay allocated.
@@ -588,7 +595,8 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
     ///
     /// Every slot below the bound is represented explicitly: zero states
     /// become retired vacancies, even versions become reusable vacancies,
-    /// and odd versions keep their values. A page freed by
+    /// and odd versions keep their values. Indices reserved for a thread's
+    /// block but never handed out become reusable vacancies at version 2. A page freed by
     /// [`shrink_to_fit`](Self::shrink_to_fit) becomes an empty raw page with
     /// its floor; other floors are zero. Offsets beyond the bound have never
     /// issued ids and need no history.
@@ -600,6 +608,7 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
     /// them again, including if allocation unwinds.
     pub fn into_hive(mut self) -> Hive<T, PAGE> {
         let bound = self.index_bound() as usize;
+        let mut unissued = self.free.unissued();
         let mut pages = Vec::with_capacity(bound.div_ceil(PAGE));
         for base in (0..bound).step_by(PAGE) {
             if let Some(floor) = self.recycled.floor_of(base / PAGE) {
@@ -613,7 +622,13 @@ impl<T, const PAGE: usize> ConcurrentAppendHive<T, PAGE> {
             let end = base + PAGE.min(bound - base);
             let mut slots = Vec::with_capacity(end - base);
             for index in base..end {
-                let version = self.slot(index as u32).map_or(0, Slot::exclusive_version);
+                let mut version = self.slot(index as u32).map_or(0, Slot::exclusive_version);
+                if unissued.contains(index as u32) {
+                    // Reserved in a block, never handed out: reusable, with
+                    // generation 1 spent (a zero would read as retired).
+                    debug_assert_eq!(version, 0, "unissued index was used");
+                    version = 2;
+                }
                 slots.push(if version & 1 != 0 {
                     let id = Id::new(index as u32, generation_of(version));
                     RawSlot::Occupied {
@@ -872,6 +887,40 @@ mod tests {
     use super::*;
     use crate::id_alloc::MAX_GENERATION;
     use core::num::NonZeroU32;
+
+    /// Versions of a converted hive's first page-group, slot by slot.
+    fn raw_versions<T>(plain: &Hive<T, 4>) -> Vec<u32> {
+        plain
+            .raw_pages()
+            .flat_map(|page| page.slots)
+            .map(|slot| match slot {
+                RawSlot::Occupied { version, .. } | RawSlot::Vacant { version } => version,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unissued_block_tail_becomes_reusable_vacancies() {
+        let mut hive = ConcurrentAppendHive::<u32, 4>::new();
+        let a = hive.insert(0);
+        let b = hive.insert(1);
+        hive.free.force_blocks();
+        let c = hive.insert(2);
+        assert_eq!((a.index(), b.index(), c.index()), (0, 1, 2));
+        assert_eq!(hive.index_bound(), 64);
+        assert_eq!(hive.remove(b), Some(1));
+        hive.shrink_to_fit();
+        let plain = hive.into_hive();
+        let versions = raw_versions(&plain);
+        assert_eq!(versions.len(), 64);
+        assert_eq!(&versions[..3], &[1, 2, 1]);
+        assert!(versions[3..].iter().all(|&v| v == 2), "{versions:?}");
+        assert!(plain.get(b).is_none());
+        let back = ConcurrentAppendHive::from(plain);
+        let fresh: Vec<Id> = (0..62).map(|v| back.insert(v)).collect();
+        assert!(fresh.iter().all(|id| id.index() < 64 && *id != b));
+        assert!(back.get(b).is_none());
+    }
 
     #[test]
     fn last_live_version_retires_and_even_a_stale_hint_cannot_revive_it() {

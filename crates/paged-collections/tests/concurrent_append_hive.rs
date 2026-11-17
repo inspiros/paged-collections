@@ -95,7 +95,9 @@ fn eight_inserters_publish_to_a_concurrent_reader() {
         }
     });
     assert_eq!(hive.len(), THREADS * rounds);
-    assert_eq!(hive.index_bound() as usize, THREADS * rounds);
+    // Contending threads reserve blocks of 64 fresh indices (PAGE < 64).
+    let bound = hive.index_bound() as usize;
+    assert!((THREADS * rounds..=THREADS * rounds + THREADS * 64).contains(&bound));
     let actual: BTreeMap<_, _> = hive.iter().map(|(id, value)| (id, *value)).collect();
     assert_eq!(actual, received);
     let mut contents: Vec<_> = actual.into_values().collect();

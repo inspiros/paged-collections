@@ -10,6 +10,9 @@ use paged_collections::concurrent::{
     ConcurrentIdAllocator, ConcurrentSparseMap,
 };
 
+/// Live ids each thread keeps in the churn rows (FIFO reuse).
+const WINDOW: usize = 64;
+
 fn permutation(n: usize) -> Vec<u32> {
     let mut keys: Vec<u32> = (0..n as u32).collect();
     let mut s = 0x9E37_79B9_7F4A_7C15_u64;
@@ -179,6 +182,17 @@ fn main() {
             },
         )
     });
+    row("hive churn (64 live per thread)", &|t| {
+        time(repeat, t, &keys, ConcurrentHive::<u64>::new, |h, ks| {
+            let mut live = std::collections::VecDeque::with_capacity(WINDOW);
+            for &k in ks {
+                live.push_back(h.insert(u64::from(k)));
+                if live.len() == WINDOW {
+                    black_box(h.remove(live.pop_front().unwrap()));
+                }
+            }
+        })
+    });
     row("append hive insert (fresh)", &|t| {
         time(
             repeat,
@@ -218,6 +232,23 @@ fn main() {
             |(a, ids), ks| {
                 for &k in ks {
                     black_box(a.free(ids[k as usize]));
+                }
+            },
+        )
+    });
+    row("id churn (64 live per thread)", &|t| {
+        time(
+            repeat,
+            t,
+            &keys,
+            ConcurrentIdAllocator::<1024>::new,
+            |a, ks| {
+                let mut live = std::collections::VecDeque::with_capacity(WINDOW);
+                for _ in ks {
+                    live.push_back(a.allocate());
+                    if live.len() == WINDOW {
+                        black_box(a.free(live.pop_front().unwrap()));
+                    }
                 }
             },
         )

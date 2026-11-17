@@ -950,3 +950,40 @@ fn shrink_to_fit_finalizes_forgotten_guards_once() {
     drop(hive);
     assert_eq!(drops.load(Ordering::SeqCst), 5);
 }
+
+#[test]
+fn contended_blocks_leave_no_retired_holes_after_conversion() {
+    const THREADS: usize = 8;
+    let rounds = if cfg!(miri) { 40 } else { 5_000 };
+    let hive = ConcurrentHive::<usize, 64>::new();
+    thread::scope(|scope| {
+        for worker in 0..THREADS {
+            let hive = &hive;
+            scope.spawn(move || {
+                for round in 0..rounds {
+                    hive.insert(worker * rounds + round);
+                }
+            });
+        }
+    });
+    let bound = hive.index_bound() as usize;
+    assert!((THREADS * rounds..=THREADS * rounds + THREADS * 64).contains(&bound));
+    let mut plain = hive.into_hive();
+    assert_eq!(plain.len(), THREADS * rounds);
+    let retired = plain
+        .raw_pages()
+        .flat_map(|page| page.slots)
+        .filter(|slot| {
+            matches!(
+                slot,
+                paged_collections::hive::RawSlot::Vacant { version: 0 }
+            )
+        })
+        .count();
+    assert_eq!(retired, 0, "never-issued indices must stay reusable");
+    // The former holes are reused before the plain hive grows.
+    for value in 0..bound - THREADS * rounds {
+        let id = plain.insert(value);
+        assert!((id.index() as usize) < bound);
+    }
+}

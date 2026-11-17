@@ -3,9 +3,14 @@
 #[cfg(not(loom))]
 pub(super) use core::hint::spin_loop;
 #[cfg(not(loom))]
-pub(super) use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+pub(super) use core::sync::atomic::{
+    AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 #[cfg(loom)]
 pub(super) use loom::hint::spin_loop;
+// Loom models SeqCst accesses as AcqRel but supports SeqCst fences.
+#[cfg(loom)]
+pub(super) use loom::sync::atomic::fence;
 #[cfg(loom)]
 pub(super) use loom::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 

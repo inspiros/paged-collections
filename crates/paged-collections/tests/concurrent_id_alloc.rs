@@ -193,3 +193,37 @@ fn empty_default_and_debug() {
 fn zero_page_is_rejected() {
     let _ = ConcurrentIdAllocator::<0>::new();
 }
+
+#[test]
+fn contended_blocks_leave_no_retired_holes_after_conversion() {
+    const THREADS: usize = 8;
+    let rounds = if cfg!(miri) { 40 } else { 5_000 };
+    let ids = ConcurrentIdAllocator::<64>::new();
+    let issued: Vec<Id> = thread::scope(|scope| {
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| scope.spawn(|| (0..rounds).map(|_| ids.allocate()).collect::<Vec<_>>()))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect()
+    });
+    let bound = ids.index_bound() as usize;
+    // Threads that contend reserve blocks of 64; at most one open per thread.
+    assert!((THREADS * rounds..=THREADS * rounds + THREADS * 64).contains(&bound));
+    let mut plain = ids.into_inner();
+    assert_eq!(plain.len(), THREADS * rounds);
+    assert_eq!(plain.index_bound(), bound);
+    // Never-issued block indices became free, not retired.
+    assert_eq!(plain.retired_len(), 0);
+    let holes = plain.free_len();
+    assert_eq!(holes, bound - THREADS * rounds);
+    assert!(issued.iter().all(|&id| plain.is_alive(id)));
+    // Reusing the former holes issues ids no thread ever saw.
+    let seen: BTreeSet<Id> = issued.into_iter().collect();
+    for _ in 0..holes {
+        let id = plain.alloc();
+        assert!(!seen.contains(&id));
+        assert!((id.index() as usize) < bound);
+    }
+}

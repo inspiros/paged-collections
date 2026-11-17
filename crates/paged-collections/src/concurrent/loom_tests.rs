@@ -114,14 +114,14 @@ fn fresh_reservations_do_not_cross_the_limit() {
     model(|| {
         let stack = Arc::new(FreeStack::new());
         let contender = stack.clone();
-        let a = thread::spawn(move || contender.fresh(1));
+        let a = thread::spawn(move || contender.fresh(1, 1));
         let contender = stack.clone();
-        let b = thread::spawn(move || contender.fresh(1));
+        let b = thread::spawn(move || contender.fresh(1, 1));
         let results = [a.join().unwrap(), b.join().unwrap()];
         assert_eq!(results.iter().filter(|&&i| i == Some(0)).count(), 1);
         assert_eq!(results.iter().filter(|i| i.is_none()).count(), 1);
         assert_eq!(stack.index_bound(), 1);
-        assert_eq!(stack.fresh(1), None);
+        assert_eq!(stack.fresh(1, 1), None);
     });
 }
 
@@ -177,9 +177,9 @@ fn stack_aba_preserves_exclusive_index_ownership() {
         let second = stack.pop(|i| &links[i as usize]).unwrap();
         assert_ne!(first, second);
         assert!(stack.pop(|i| &links[i as usize]).is_none());
-        assert_eq!(stack.fresh(2), Some(0));
-        assert_eq!(stack.fresh(2), Some(1));
-        assert_eq!(stack.fresh(2), None);
+        assert_eq!(stack.fresh(2, 1), Some(0));
+        assert_eq!(stack.fresh(2, 1), Some(1));
+        assert_eq!(stack.fresh(2, 1), None);
         assert_eq!(stack.index_bound(), 2);
     });
     assert!(REACHED.load(std::sync::atomic::Ordering::Relaxed));

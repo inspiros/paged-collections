@@ -259,4 +259,7 @@ mod loom_hive;
 mod loom_radix;
 
 #[cfg(all(test, loom))]
+mod loom_shards;
+
+#[cfg(all(test, loom))]
 mod loom_tests;

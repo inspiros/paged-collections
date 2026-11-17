@@ -34,13 +34,15 @@ pub(crate) struct StripedLen {
     stripes: [Stripe; STRIPES],
 }
 
-/// The calling thread's stripe, assigned round-robin on its first update.
+/// A small number per thread, assigned round-robin on first use and shared
+/// by every concurrent container, so a thread uses the same stripe (and
+/// free-stack shard) everywhere. Threads that start one after another get
+/// distinct numbers until the numbers wrap modulo a container's stripes.
 #[cfg(all(feature = "std", not(loom)))]
 #[inline]
-fn stripe_index(_hint: usize) -> usize {
+pub(super) fn thread_index() -> usize {
     use core::cell::Cell;
     use core::sync::atomic::AtomicUsize;
-    // Shared by all counters: a thread uses the same stripe in each of them.
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     std::thread_local! {
         static INDEX: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -48,13 +50,21 @@ fn stripe_index(_hint: usize) -> usize {
     INDEX
         .try_with(|index| {
             if index.get() == usize::MAX {
-                // Relaxed: only distinctness matters, not ordering.
-                index.set(NEXT.fetch_add(1, Ordering::Relaxed) % STRIPES);
+                // Relaxed: only distinctness matters, not ordering. The mask
+                // keeps the sentinel unreachable after wrapping.
+                index.set(NEXT.fetch_add(1, Ordering::Relaxed) & (usize::MAX >> 1));
             }
             index.get()
         })
-        // During thread teardown any stripe is correct, just slower.
+        // During thread teardown any number is correct, just slower.
         .unwrap_or(0)
+}
+
+/// The calling thread's stripe.
+#[cfg(all(feature = "std", not(loom)))]
+#[inline]
+fn stripe_index(_hint: usize) -> usize {
+    thread_index() % STRIPES
 }
 
 #[cfg(not(all(feature = "std", not(loom))))]
