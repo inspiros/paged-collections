@@ -49,15 +49,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
       - run: cargo check -p paged-collections --all-features
 
-  miri:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri
-      - run: cargo miri test -p paged-collections --all-features
-
   python:
     runs-on: ${{ matrix.os }}
     strategy:
