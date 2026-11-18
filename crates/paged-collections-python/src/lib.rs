@@ -188,14 +188,35 @@ fn reduce_list<'py>(
 
 /// The state of a subclass instance beyond its contents, or `None` if it
 /// has none: `__getstate__()` where defined (Python 3.11+ defines it for
-/// every object, covering `__slots__`), else the instance `__dict__`.
+/// every object, covering `__slots__`), else what Python 3.10's
+/// `object.__reduce_ex__` builds: the instance `__dict__`, or
+/// `(__dict__ or None, {slot: value})` when set slots exist. Pickle and
+/// `copy` restore both forms without a `__setstate__`.
 fn extra_state<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny>>> {
     let state = match obj.getattr_opt("__getstate__")? {
         Some(getstate) => getstate.call0()?,
-        None => match obj.getattr_opt("__dict__")? {
-            Some(dict) => dict,
-            None => return Ok(None),
-        },
+        None => {
+            let py = obj.py();
+            let dict = obj.getattr_opt("__dict__")?;
+            let names = py
+                .import("copyreg")?
+                .call_method1("_slotnames", (obj.get_type(),))?;
+            let slots = PyDict::new(py);
+            for name in names.try_iter()? {
+                let name = name?.cast_into::<pyo3::types::PyString>()?;
+                if let Some(value) = obj.getattr_opt(&name)? {
+                    slots.set_item(name, value)?;
+                }
+            }
+            match (dict, slots.is_empty()) {
+                (Some(dict), true) => dict,
+                (None, true) => return Ok(None),
+                (dict, false) => {
+                    let dict = dict.unwrap_or_else(|| py.None().into_bound(py));
+                    PyTuple::new(py, [dict, slots.into_any()])?.into_any()
+                }
+            }
+        }
     };
     let empty = state.is_none() || state.cast::<PyDict>().is_ok_and(|d| d.is_empty());
     Ok((!empty).then_some(state))
