@@ -6,8 +6,9 @@
 typed maps store numeric values unboxed and expose them as NumPy arrays.
 ``DirectMap`` and its typed variants keep entries in ascending key order and
 provide nearest-entry and range queries. ``IdMap`` and its typed variants
-map generational ids to values. ``sparse_map(dtype)``, ``direct_map(dtype)``
-and ``id_map(dtype)`` pick the map class for a dtype.
+map generational ids to values. ``sparse_map(dtype)``, ``direct_map(dtype)``,
+``id_map(dtype)``, ``concurrent_sparse_map(dtype)`` and
+``concurrent_direct_map(dtype)`` pick the map class for a dtype.
 
 ``PagedList`` stores arbitrary objects in pages; typed variants store numbers
 unboxed and expose individual pages as NumPy views. ``paged_list(dtype)``
@@ -17,6 +18,12 @@ picks the list class for a dtype. ``PagedDeque`` is a paged
 ``PriorityQueue`` (int64 priorities) and ``PriorityQueueF64`` (float64) map
 integer keys to priorities; ``pop`` returns the greatest, or the least with
 ``min=True``. Pushing a present key changes its priority.
+``priority_queue(dtype)`` picks the queue class for a dtype.
+
+Every ``dtype`` argument takes anything ``numpy.dtype`` accepts: a name such
+as ``"float64"``, a scalar type such as ``np.float64``, a ``np.dtype``, or a
+Python type. ``int`` means NumPy's default integer, which is int32 on Windows
+with NumPy 1.x and int64 elsewhere; name the width to be portable.
 
 ``Hive`` stores objects in reusable slots and issues generational ids.
 Removing a value makes its id stale; insertions reuse slots with new generations.
@@ -34,6 +41,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from paged_collections._core import (
     DEFAULT_PAGE_SIZE,
@@ -155,7 +163,45 @@ _TYPED_LISTS = {
 }
 
 
-def _map_class(dtype: Any, object_class: Any, typed_maps: dict, kind: str) -> Any:
+_TYPED_CONCURRENT_SPARSE_MAPS = {
+    np.dtype(cls.dtype): cls
+    for cls in (
+        ConcurrentSparseMapF64,
+        ConcurrentSparseMapF32,
+        ConcurrentSparseMapI64,
+        ConcurrentSparseMapI32,
+        ConcurrentSparseMapU64,
+        ConcurrentSparseMapU32,
+        ConcurrentSparseMapBool,
+    )
+}
+
+_TYPED_CONCURRENT_DIRECT_MAPS = {
+    np.dtype(cls.dtype): cls
+    for cls in (
+        ConcurrentDirectMapF64,
+        ConcurrentDirectMapF32,
+        ConcurrentDirectMapI64,
+        ConcurrentDirectMapI32,
+        ConcurrentDirectMapU64,
+        ConcurrentDirectMapU32,
+        ConcurrentDirectMapBool,
+    )
+}
+
+_TYPED_PRIORITY_QUEUES = {np.dtype(cls.dtype): cls for cls in (PriorityQueue, PriorityQueueF64)}
+
+
+def _typed_class(dtype: npt.DTypeLike, typed: dict, kind: str) -> Any:
+    """Resolve a dtype for a family without an object-valued class."""
+    resolved = np.dtype(dtype)
+    if resolved in typed:
+        return typed[resolved]
+    supported = ", ".join(str(d) for d in typed)
+    raise TypeError(f"no {kind} for dtype {resolved}; supported: {supported}")
+
+
+def _map_class(dtype: npt.DTypeLike, object_class: Any, typed_maps: dict, kind: str) -> Any:
     """Resolve the value dtype shared by the map families."""
     if dtype is None or dtype is object:
         return object_class
@@ -168,7 +214,7 @@ def _map_class(dtype: Any, object_class: Any, typed_maps: dict, kind: str) -> An
     raise TypeError(f"no {kind} map for dtype {resolved}; supported: object, {supported}")
 
 
-def paged_list(dtype: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
+def paged_list(dtype: npt.DTypeLike = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
     """Create a paged list of objects or values of the given NumPy dtype.
 
     Supported typed dtypes are float64, float32, int64, int32, uint64,
@@ -188,7 +234,7 @@ def paged_list(dtype: Any = None, values: Any = None, *, page_size: int = DEFAUL
     return cls(page_size=page_size) if values is None else cls(values, page_size=page_size)
 
 
-def sparse_map(dtype: Any = None, keys: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
+def sparse_map(dtype: npt.DTypeLike = None, keys: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
     """Create a map whose values have ``dtype``.
 
     ``dtype=None`` or ``object`` gives a ``SparseMap`` of arbitrary objects.
@@ -202,7 +248,7 @@ def sparse_map(dtype: Any = None, keys: Any = None, values: Any = None, *, page_
     return cls(keys, values, page_size=page_size)
 
 
-def id_map(dtype: Any = None, keys: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
+def id_map(dtype: npt.DTypeLike = None, keys: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
     """Create a generational-id map whose values have ``dtype``.
 
     ``dtype=None`` or ``object`` gives an ``IdMap`` of arbitrary objects.
@@ -216,7 +262,7 @@ def id_map(dtype: Any = None, keys: Any = None, values: Any = None, *, page_size
     return cls(keys, values, page_size=page_size)
 
 
-def direct_map(dtype: Any = None, keys: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
+def direct_map(dtype: npt.DTypeLike = None, keys: Any = None, values: Any = None, *, page_size: int = DEFAULT_PAGE_SIZE) -> Any:
     """Create an ordered direct map whose values have ``dtype``.
 
     ``dtype=None`` or ``object`` gives a ``DirectMap`` of arbitrary objects.
@@ -230,6 +276,40 @@ def direct_map(dtype: Any = None, keys: Any = None, values: Any = None, *, page_
         return cls(page_size=page_size)
     return cls(keys, values, page_size=page_size)
 
+
+
+def concurrent_sparse_map(dtype: npt.DTypeLike) -> Any:
+    """Create an empty concurrent sparse map whose values have ``dtype``.
+
+    ``dtype`` must be one of float64, float32, int64, int32, uint64, uint32
+    or bool; there is no object-valued concurrent map.
+    """
+    return _typed_class(dtype, _TYPED_CONCURRENT_SPARSE_MAPS, "concurrent sparse map")()
+
+
+def concurrent_direct_map(dtype: npt.DTypeLike) -> Any:
+    """Create an empty concurrent direct map whose values have ``dtype``.
+
+    ``dtype`` must be one of float64, float32, int64, int32, uint64, uint32
+    or bool; there is no object-valued concurrent map.
+    """
+    return _typed_class(dtype, _TYPED_CONCURRENT_DIRECT_MAPS, "concurrent direct map")()
+
+
+def priority_queue(
+    dtype: npt.DTypeLike = "int64",
+    items: Any = None,
+    min: bool = False,
+    *,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> Any:
+    """Create a priority queue whose priorities have ``dtype``.
+
+    ``dtype`` is int64 (``PriorityQueue``) or float64 (``PriorityQueueF64``).
+    ``items`` and ``min`` are passed to the constructor.
+    """
+    cls = _typed_class(dtype, _TYPED_PRIORITY_QUEUES, "priority queue")
+    return cls(items, min, page_size=page_size)
 
 __all__ = [
     "DEFAULT_PAGE_SIZE",
@@ -291,12 +371,15 @@ __all__ = [
     "SparseMapU64",
     "SparseSet",
     "__version__",
+    "concurrent_direct_map",
+    "concurrent_sparse_map",
     "id_generation",
     "id_index",
     "id_indices",
     "id_map",
     "make_id",
     "paged_list",
+    "priority_queue",
     "sparse_map",
     "direct_map",
 ]

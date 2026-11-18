@@ -32,8 +32,14 @@ per element.
 `SparseMapF64`, `DirectMapF64`, `PagedListF64`, `IdMapF64` and the other typed
 classes store values unboxed in the dtype named by the suffix: `F64`, `F32`,
 `I64`, `I32`, `U64`, `U32`, `Bool`. `sparse_map(dtype)`, `direct_map(dtype)`,
-`id_map(dtype)` and `paged_list(dtype)` create an instance of the class for a
-dtype.
+`id_map(dtype)`, `paged_list(dtype)`, `concurrent_sparse_map(dtype)`,
+`concurrent_direct_map(dtype)` and `priority_queue(dtype)` create an instance
+of the class for a dtype.
+
+A `dtype` argument takes anything `numpy.dtype` accepts: `"float64"`,
+`np.float64`, `np.dtype("f8")` and `float` all select `F64`. Python's `int`
+means NumPy's default integer, which is int32 on Windows with NumPy 1.x, so
+name the width (`"int64"`) for portable code.
 
 Typed containers store values, not objects, so NaN != NaN as in NumPy: a
 typed container holding NaN does not compare equal even to itself.
