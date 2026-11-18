@@ -1,0 +1,15 @@
+[book]
+title = "paged-collections"
+language = "en"
+description = "Paged sparse sets, maps and stable-address containers for Rust and Python."
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+no-section-label = true
+git-repository-url = "https://github.com/inspiros/paged-collections"
+edit-url-template = "https://github.com/inspiros/paged-collections/edit/main/docs/site/{path}"
+site-url = "/paged-collections/"
+additional-css = ["theme/pc.css"]
+additional-js = ["theme/languages.js"]

@@ -1,0 +1,8 @@
+page size = 256
+items = [(7, 10), (2, 20)]
+weakref alive = True
+weakref cleared = True
+subclass = TaggedMap
+slot = scores
+subclass page size = 256
+subclass items = [(9, 30)]

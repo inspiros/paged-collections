@@ -1,0 +1,5 @@
+values = [0, 1, 2, 3, 4]
+index 2 = 2
+front = 0
+back = 4
+remaining = [1, 2, 3]

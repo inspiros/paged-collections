@@ -39,3 +39,7 @@ serde_json = "1"
 [[bench]]
 name = "directory"
 harness = false
+
+[[example]]
+name = "doc_concurrent"
+required-features = ["concurrent"]

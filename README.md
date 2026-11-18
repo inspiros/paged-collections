@@ -1,77 +1,37 @@
 # paged-collections
 
-Paged sparse sets, maps and stable-address containers for Rust, with Python
-bindings built on PyO3.
+<!-- Uncomment after the first release.
+[![crates.io](https://img.shields.io/crates/v/paged-collections)](https://crates.io/crates/paged-collections)
+[![docs.rs](https://img.shields.io/docsrs/paged-collections)](https://docs.rs/paged-collections)
+[![PyPI](https://img.shields.io/pypi/v/paged-collections)](https://pypi.org/project/paged-collections/)
+-->
+[![CI](https://img.shields.io/github/actions/workflow/status/inspiros/paged-collections/ci.yml?label=CI)](https://github.com/inspiros/paged-collections/actions/workflows/ci.yml)
+[![Documentation](https://img.shields.io/badge/docs-website-475d7a?logo=mdbook&logoColor=white)](https://inspiros.github.io/paged-collections/)
+[![License](https://img.shields.io/github/license/inspiros/paged-collections)](LICENSE)
 
-> Status: in development. Every collection below is implemented in Rust;
-> Python bindings cover the sparse sets and maps, `DirectMap`, `IdAllocator`,
-> `IdMap`, `Hive`, `PagedList`, `PagedDeque` and the priority queues
-> (`PriorityQueue`, `PriorityQueueF64`).
-> Python binds only the primitive-valued concurrent sets and maps. Nothing is published.
+Paged sparse sets, maps, a priority queue and stable-address containers for
+Rust (`no_std` + `alloc`), with Python bindings built on PyO3 and NumPy.
 
-## Why paging
+- **Paged index**: a key-indexed table split into pages allocated on first
+  use, so memory follows the occupied key ranges, not the largest key.
+- **Paged storage**: elements in pages that never move, so references stay
+  valid while the container grows.
 
-Paging serves two separate purposes:
+> Status: in development, not yet published.
 
-- **Paged index.** A table indexed by key is split into fixed-size pages
-  allocated on first use, so memory follows the occupied key ranges, not the
-  largest key. A plain sparse set with key `4_000_000_000` needs a 16 GB
-  sparse array; a paged one needs one page.
-- **Paged storage.** Elements live in fixed-size pages that never move, so
-  references stay valid while the collection grows and growth never copies
-  the whole buffer.
+## Install
 
-## Collections
+```sh
+cargo add paged-collections                         # features: std (default), serde, concurrent
+pip install paged-collections                       # Python 3.10+, NumPy 1.24+
+```
 
-| Type | Paging | Purpose |
-|---|---|---|
-| `PagedSparseSet<K>` | index (storage optional) | Integer set with O(1) insert, remove, contains, clear, and dense iteration |
-| `PagedSparseMap<K, V>` | index (storage optional) | Sparse set with a dense value array |
-| `PagedPriorityQueue<K, P>` | index | Indexed max-heap with priority changes and removal by key |
-| `PagedDirectMap<K, V>` | index | Direct-address map: values stored in place, iterated in slot-index (for integers, key) order |
-| `PagedVec<T>` | storage | Growable vector with stable addresses |
-| `PagedDeque<T>` | storage | Double-ended queue with stable addresses through pushes and pops at either end |
-| `Hive<T>` | storage | Unordered container with stable addresses (until `sort`) and generational handles |
-| `IdAllocator` | none | Generational id allocator for use as keys |
+Wheels cover CPython 3.10+ (`abi3`) and free-threaded 3.14t and 3.15t+.
+See [Installation](https://inspiros.github.io/paged-collections/installation.html).
 
-The indexed collections use `page::Flat` by default, for dense keys below a
-few billion. Choose `page::Radix` for wide keys spread over the `usize` range;
-its compressed radix directory uses memory proportional to allocated pages,
-plus a flat window over the low page numbers (up to about 8 times the
-allocated page count) that does not shrink below its highest live page.
-Choose `page::Tree` for a standard B-tree, or when benchmarks show it wins
-for your key pattern. The directory is the final type parameter, for example
-`PagedDirectMap<usize, u32, 1024, page::Radix>`.
+## Example
 
-## When to use
-
-Numbers come from the bench crate `crates/bench` (see
-`crates/bench/README.md`), one run per case; treat the ratios as indicative.
-
-| Container | Use it when | Pick something else when |
-|---|---|---|
-| `PagedSparseSet`, `PagedSparseMap`, `PagedDirectMap` | Keys come in runs or ranges: iteration is 2-10x faster than `HashMap`/`BTreeMap`, misses 2-3x faster. Dense `u32`-like keys with `page::Flat` work well too | Keys are spread uniformly over a wide range (use a `HashMap`). Dense hits are 1.1-2.5x slower than `HashSet`, and much slower than a plain `Vec<bool>` |
-| `PagedPriorityQueue` | You need `change_priority` or removal by key: push is 3-17x faster than the `priority-queue` crate | You never change priorities: `BinaryHeap` is 1.3-2x faster |
-| `PagedDeque` | Large queues (parity with `VecDeque` at 10 million elements) or stable addresses | Small queues: `VecDeque` is 1.4-1.7x faster |
-| `PagedVec` | You need stable addresses: iteration matches `Vec` | Random access dominates: `Vec` is 1.8-2.5x faster |
-| `Hive`; `IdAllocator` + `PagedSparseMap` (Python `IdMap`) | Generational handles with stable addresses: the allocator-plus-map pairing is within 1.2-4x of `SlotMap` and iterates faster at small and medium sizes | Raw lookup speed matters more than stable addresses: `SlotMap` is faster |
-
-- **Spread-out keys are the worst case.** Each key in a new page allocates
-  and zeroes a whole page, so uniformly spread keys made inserts 36-480x
-  slower and used far more memory.
-- **Clustered keys still cost memory.** Short runs (64 keys) fill about 6%
-  of a 1024-slot page, up to roughly 19x the memory of a `HashMap`. Long runs
-  and dense ranges do not have this problem.
-- **Pages are freed only when whole key ranges go.** Removing 90% of the
-  keys at random frees nothing, because nearly every page stays partly full.
-  There is no automatic page freeing, which keeps addresses stable.
-- **Radix** is for page numbers spread over 64 bits; use `page::Flat` when
-  keys are dense and below a few billion.
-
-## Rust
-
-A `Hive` owns elements at stable addresses and hands out generational ids;
-the ids are keys for the paged maps, which makes side tables:
+Rust:
 
 ```rust
 use paged_collections::direct_map::PagedDirectMap;
@@ -99,105 +59,7 @@ let in_range: Vec<u32> = score.range(a..=b).map(|(_, &s)| s).collect();
 assert_eq!(in_range, [10, 20]);
 ```
 
-`Hive::id_of` turns a reference to an element back into its id, by address,
-in time proportional to the number of pages. To visit elements in order,
-`sorted_ids` (and `_by`, `_by_key`) returns the live ids sorted by element
-and moves nothing. `sort` (and `_by`, `_by_key`, `_by_cached_key`, and the
-`sort_unstable*` variants) instead reorders the elements across the
-occupied slots, so iteration yields them sorted. Ids name slots, so after
-`sort` each id names whatever element moved into its slot.
-
-```rust
-use paged_collections::hive::Hive;
-
-let mut hive: Hive<u32> = Hive::new();
-let (x, y) = (hive.insert(30), hive.insert(10));
-assert_eq!(hive.id_of(&hive[y]), Some(y));
-assert_eq!(hive.sorted_ids(), [y, x]); // ids follow their elements
-hive.sort();
-assert_eq!(hive[x], 10);               // ids now name sorted slots
-```
-
-## Concurrent
-
-The `concurrent` feature adds separate types for shared (`&self`) mutation
-across threads. They use only `core` atomics and `alloc`, so they also work
-without `std`. One rule holds throughout: *grow shared, shrink exclusive*.
-Shared access may install pages and fill slots, but memory is freed only
-under `&mut self` or on drop, so no epochs or hazard pointers are needed.
-
-| Type | Shared operations | Notes |
-|---|---|---|
-| `ConcurrentHive<T>` | insert, remove, lookup | Lookups return a `Ref` guard that pins the value |
-| `ConcurrentAppendHive<T>` | insert, lookup | Lookups return plain `&T`; removal needs `&mut self` |
-| `ConcurrentPagedVec<T>` | push, lookup | `len` and iteration cover the hole-free prefix |
-| `ConcurrentSparseSet<K>`, `ConcurrentSparseMap<K, V>` | insert-only, lookup | Plain `&V` references; removal needs `&mut self`; batch `insert_many`/`try_insert_many` scale across threads, single inserts do not |
-| `ConcurrentDirectMap<K, V>` | insert, replace, remove, entry | One reader-writer lock per page |
-| `AtomicDirectMap`, `AtomicIdMap` | lock-free one-word updates | `usize -> u64` (below `u64::MAX`), `Id -> u32` |
-| `ConcurrentIdAllocator` | allocate, free | Generational ids, as `IdAllocator` |
-
-Each type converts to and from its plain counterpart under exclusive
-ownership (`into_inner`, or `into_hive` for the hives, and `From`), keeping
-every id and generation. Under `&mut self`, `shrink_to_fit` on both hives
-frees pages that are wholly empty. Later shared inserts reuse those pages
-with generations above any id they ever held, so a stale id stays dead. The sparse types, `ConcurrentDirectMap` and
-`AtomicDirectMap` take a final `SharedDirectory` parameter: `page::Flat` by
-default, or `page::Radix` for keys anywhere in the `usize` range.
-`page::Tree` has no concurrent form.
-
-```rust
-# #[cfg(feature = "concurrent")] {
-use paged_collections::concurrent::{AtomicDirectMap, ConcurrentSparseMap};
-use paged_collections::page::Radix;
-
-let names: ConcurrentSparseMap<usize, String, 1024, Radix> = ConcurrentSparseMap::new();
-let hits: AtomicDirectMap = AtomicDirectMap::new();
-std::thread::scope(|s| {
-    for t in 0..4usize {
-        let (names, hits) = (&names, &hits);
-        s.spawn(move || {
-            // Wide keys are fine with Radix.
-            let _ = names.try_insert(usize::MAX - t, format!("worker {t}"));
-            for _ in 0..100 {
-                let _ = hits.fetch_update(7, |n| Some(Some(n.unwrap_or(0) + 1)));
-            }
-        });
-    }
-});
-assert_eq!(names.len(), 4);
-assert_eq!(names.get(&(usize::MAX - 2)).map(String::as_str), Some("worker 2"));
-assert_eq!(hits.get(7), Some(400));
-
-// Exclusive ownership converts to the plain map, keeping the directory.
-let plain = names.into_inner();
-assert_eq!(plain.len(), 4);
-# }
-```
-
-## Python
-
-Keys are integers in `0 <= key < 2**32`. Batch lookups (`contains_many`,
-`discard_many`, and `get_many`) treat out-of-range integers as absent, even
-in Python sequences or object arrays containing arbitrarily large ints.
-`get_many` uses its default or raises `KeyError` for an absent key. Float key
-arrays are rejected, and batch insertion still rejects out-of-range keys.
-
-`SparseSet` holds keys, `SparseMap` maps keys to any objects, and
-`SparseMapF64`, `SparseMapI64` and the other typed maps (or
-`sparse_map(dtype)`) store numbers unboxed.
-
-`SparseSet` supports set algebra, subset comparisons and iterable methods like
-`set`. Algebra operators require `SparseSet` operands; methods accept iterables
-of keys. Copied results use the receiver's page size and retain surviving
-receiver order, followed by new keys in operand iteration order.
-`difference_update` and `-=` use the same swap removal as `discard`; other
-in-place algebra retains surviving receiver order. In-place algebra raises
-`BufferError` while a view is alive.
-
-Typed containers store values, not objects, so NaN != NaN as in NumPy:
-a typed list or map containing NaN does not compare equal even to itself.
-
-For example:
+Python:
 
 ```python
 import numpy as np
@@ -210,187 +72,52 @@ m.get_many([7, 1000])                            # array([2.5, 1. ])
 
 values = m.values_view()   # zero-copy, writeable
 values *= 2                # updates the map in place
-# While a view is alive, resizing the map raises BufferError.
-del values
+del values                 # resizing raises BufferError while a view is alive
 ```
 
-Views share memory with the collection, like a `memoryview` of a
-`bytearray`. NumPy releases the GIL inside many operations, so do not use a
-view in one thread while another thread reads or writes the collection or
-the view; synchronize such access yourself. A NumPy array stored inside the
-`SparseMap` it views is never garbage-collected (NumPy arrays are invisible
-to the collector).
+## Containers
 
-The classes can be subclassed. As with `dict`, the built-in methods do not
-call overridden methods (`set_many` and `update` do not go through your
-`__setitem__`), and `copy()` returns the base class, except on `PagedDeque`
-and the priority queues, whose `copy()` keeps the subclass. `pickle`,
-`copy.copy` and `copy.deepcopy` keep the subclass and its attributes, and
-never call the subclass's `__init__`.
+| Rust | Python | Paging | Purpose |
+|---|---|---|---|
+| `PagedSparseSet<K>` | `SparseSet` | index | Integer set: O(1) insert, remove, contains, clear; dense iteration |
+| `PagedSparseMap<K, V>` | `SparseMap`, `SparseMapF64`, ... | index | Sparse set with a dense value array |
+| `PagedDirectMap<K, V>` | `DirectMap`, `DirectMapF64`, ... | index | Values in place; key order and range queries |
+| `PagedPriorityQueue<K, P>` | `PriorityQueue`, `PriorityQueueF64` | index | Indexed heap: priority changes and removal by key |
+| `PagedVec<T>` | `PagedList`, `PagedListF64`, ... | storage | Growable vector with stable addresses |
+| `PagedDeque<T>` | `PagedDeque` | storage | Double-ended queue with stable addresses |
+| `Hive<T>` | `Hive` | storage | Unordered slots with generational ids |
+| `IdAllocator` | `IdAllocator`, `IdMap` | none | Generational ids for use as keys |
 
-`DirectMap` and its typed variants (or `direct_map(dtype)`) store values in
-pages at their key's slot and always visit entries in ascending key order.
-They support nearest-entry and half-open range queries whose bounds accept
-any object with `__index__`, including NumPy integer scalars. Array results
-are copies, and structural changes are always allowed.
+The `concurrent` feature adds thread-safe variants: `ConcurrentHive`,
+`ConcurrentAppendHive`, `ConcurrentPagedVec`, `ConcurrentSparseSet`/`Map`,
+`ConcurrentDirectMap`, `AtomicDirectMap`, `AtomicIdMap` and
+`ConcurrentIdAllocator`. Python binds the primitive-valued concurrent sets and
+maps.
 
-```python
-from paged_collections import direct_map
+## Documentation
 
-ordered = direct_map("float64", [2048, 7, 1024], [3.0, 1.0, 2.0])
-ordered.next_occupant(8)          # (1024, 2.0)
-ordered.items_range(7, 2048)      # [(7, 1.0), (1024, 2.0)]
-ordered.popitem()                 # (2048, 3.0)
-```
-
-`IdAllocator` issues generational ids as Python ints packed as
-`generation << 32 | index`. Freed indices are reused last freed first with
-the next generation, so a stale id is never alive again; pickles and copies
-keep the whole allocation history. Calling `__init__()` again clears live
-ids while preserving that history. Allocator arguments and the `id_*` helpers
-accept objects with `__index__`, including NumPy integer scalars. Store
-whole `uint64` ids in `IdMap` (or `id_map(dtype)` for typed values):
-inserting a new generation replaces the
-entry at that index, and stale ids no longer find it.
-
-```python
-from paged_collections import IdAllocator, IdMap, id_generation, id_index
-
-ids = IdAllocator()
-a, b = ids.alloc(), ids.alloc()
-names = IdMap([a], ["old"])
-ids.free(a)                       # True
-c = ids.alloc()                   # reuses index 0
-names[c] = "new"                  # replaces a's entry
-(id_index(c), id_generation(c))   # (0, 2)
-a in ids                          # False
-a in names                        # False
-names[c]                          # "new"
-```
-
-`Hive` stores any objects in reusable slots and hands out ids of the same
-form: `insert` returns an id, removing a value makes its id stale for good,
-and a freed slot is reused with the next generation. Iteration is in slot
-order; pickles and copies keep every id and the generation history. An
-`IdMap` keyed by hive ids makes a side table. `sort(key=None, reverse=False)`
-stably reorders values within occupied slots: ids name slots, so their values
-can change after a sort. `sorted_ids(key=None, reverse=False)` returns ids in
-stable value/key order without moving values. Both preserve equal-key order
-with `reverse=True`; callback errors leave the hive unchanged except for
-callback mutations, which are detected with `RuntimeError`.
-
-```python
-from paged_collections import Hive
-
-hive = Hive()
-a = hive.insert("a")
-ids = hive.insert_many(["b", "c"])   # array of uint64 ids
-del hive[a]
-c = hive.insert("d")                 # reuses a's slot, next generation
-a in hive                            # False
-hive[c]                              # "d"
-```
-
-`PagedList` is a list stored in pages of elements, so appending never
-moves existing elements; `paged_list(dtype)` picks a typed list (float64,
-int64 and the other map dtypes). Slices are copies. Ordering comparisons
-are lexicographic like `list`, between instances of the same concrete list
-type (including subclasses). A typed list's `page_view(i)` is a zero-copy
-NumPy view of one page that stays valid while
-the list grows; while any view is alive, operations that remove, move or
-reorder elements raise `BufferError`.
-
-```python
-from paged_collections import paged_list
-
-values = paged_list("float64", [1.0, 2.0, 3.0])
-page = values.page_view(0)
-page[0] = 4.0                     # updates values[0]
-values.extend(range(5000))        # allowed: existing pages never move
-values.pop()                      # BufferError while `page` is alive
-```
-
-All public container classes support weak references.
-
-Every paged class takes a keyword-only `page_size`, one of
-`paged_collections.PAGE_SIZES` (by default 256, 512, 1024, 2048 and 4096),
-with `DEFAULT_PAGE_SIZE` (1024) when omitted. Instances keep their size
-through `copy`, pickling and `repr`. Pickles from earlier versions load at
-1024.
-
-```python
-from paged_collections import SparseMap, PAGE_SIZES
-
-small = SparseMap(page_size=256)   # less memory per sparse cluster
-small.page_size                    # 256
-SparseMap(page_size=300)           # ValueError: not compiled in
-```
-
-Rust needs page sizes at compile time, so every size in the list is compiled
-into the extension, and each one adds code and build time. To build a wheel
-with other sizes, set these variables when building from source:
-
-```bash
-PAGED_COLLECTIONS_PAGE_SIZES=64,1024,16384 PAGED_COLLECTIONS_DEFAULT_PAGE_SIZE=1024 maturin build --release
-```
-
-Sizes are integers in `1..=1048576` without duplicates, and the default must
-be one of them. A pickle made with a size the reading build lacks raises
-`ValueError` when loaded.
-
-### Concurrent types
-
-`ConcurrentSparseSet` and the typed `ConcurrentSparseMap*` and
-`ConcurrentDirectMap*` classes support shared access from Python threads.
-They use the default page size and flat directory; sparse variants only insert
-while shared, and existing sparse map values are preserved. Batch methods
-release the GIL; single-key calls do not. Results are copies; there are no
-guards or views. Sparse removal
-and `clear` are exclusive: a conflicting exclusive call raises `RuntimeError`
-(`Already borrowed`). Direct map snapshots are ordered by key. `len()` is exact
-only when no write is in flight.
-
-### Free threading
-
-Wheels cover GIL CPython 3.10+ (`abi3`), free-threaded 3.14t, and
-free-threaded 3.15t+ (`abi3t`). Importing the package keeps the GIL
-disabled. The concurrent types above then run truly in parallel. The other
-classes are safe to share but not designed for it: a call that conflicts
-with another thread's call on the same object raises `RuntimeError`
-(`Already borrowed`), or `BufferError` while views exist. Guard such shared
-use with a lock. Free-threaded 3.13t is not supported.
+- [Paging model](https://inspiros.github.io/paged-collections/paging.html):
+  page sizes, `Flat`/`Radix`/`Tree` directories, memory behaviour.
+- [Choosing a container](https://inspiros.github.io/paged-collections/choosing.html):
+  when each container fits, and when a standard one is better.
+- [Benchmarks](https://inspiros.github.io/paged-collections/benchmarks.html):
+  reference measurements and the commands to reproduce them.
+- API: [docs.rs](https://docs.rs/paged-collections) (Rust),
+  [`_core.pyi`](python/paged_collections/_core.pyi) (Python).
 
 ## Layout
 
 ```text
-pyproject.toml                    Python package (maturin), at the repository root
-python/paged_collections/         Python sources and type stubs
-tests/                            Python tests
 crates/paged-collections/         Rust library (no_std + alloc)
 crates/paged-collections-python/  PyO3 bindings (the `_core` extension)
-crates/bench/                     Benchmarks (not a default member)
+crates/bench/                     Rust benchmarks (not a default member)
+python/paged_collections/         Python sources and type stubs
+tests/                            Python tests
+benchmarks/python/                Python benchmarks
+docs/site/                        mdBook documentation
 ```
 
-## Development
-
-Rust:
-
-```bash
-cargo test
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo build -p paged-collections --no-default-features
-```
-
-Python (from the repository root):
-
-```bash
-uv sync
-uv run pytest
-```
-
-`cargo build --workspace` fails to link the Python crate unless the Python
-development library is installed; build it through maturin (`uv sync` or
-`maturin develop`) instead. `cargo check` and `cargo clippy` work either way.
+Development commands are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

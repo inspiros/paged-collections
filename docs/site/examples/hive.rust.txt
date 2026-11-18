@@ -1,0 +1,9 @@
+removed = 30
+reused slot = (0, 2)
+stale = None
+id_of index = 1
+sorted indices = [1, 0]
+sorted values = [10, 20]
+slots before sort = [20, 10]
+slots after sort = [10, 20]
+reused id now names = 10

@@ -1,0 +1,7 @@
+len = 10000
+first = 1
+last = 10000
+same address = true
+popped = 10000
+removed = 99
+prefix = [1, 2, 3]

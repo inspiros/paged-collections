@@ -1,0 +1,5 @@
+reused slot = (0, 2)
+new side entry = None
+stale hive = None
+stale side = None
+range = [30, 20]

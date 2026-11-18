@@ -1,0 +1,6 @@
+freed = true
+reused slot = (0, 2)
+stale alive = false
+stale side = None
+scores = [30, 20]
+live ids = 2

@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="670" viewBox="0 0 900 670" role="img" aria-labelledby="title">
+  <title id="title">References after pushing to a Vec and a PagedVec</title>
+  <style>
+    text { font-family: system-ui, sans-serif; fill: #64748b; font-size: 16px; font-weight: 600; }
+    .small { font-size: 14px; }
+    .line { fill: none; stroke: #64748b; stroke-width: 2; }
+    .freed { fill: none; stroke: #94a3b8; stroke-width: 2; stroke-dasharray: 5 4; }
+    .muted { fill: #94a3b8; font-weight: 400; }
+    @media (prefers-color-scheme: dark) { text { fill: #94a3b8; } }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- Vec: growing the contiguous buffer moves its elements. -->
+  <text x="30" y="30">Vec&lt;T&gt;</text>
+  <text class="small" x="30" y="65">before</text>
+  <text class="small" x="470" y="65">after push(40)</text>
+
+  <rect class="line" x="30" y="105" width="90" height="42" rx="4"/>
+  <text class="small" x="75" y="131" text-anchor="middle">&amp;v[0]</text>
+  <path class="line" d="M 120 126 H 155" marker-end="url(#arrow)"/>
+  <rect class="line" x="155" y="105" width="195" height="42"/>
+  <path class="line" d="M 220 105 V 147 M 285 105 V 147"/>
+  <g text-anchor="middle">
+    <text x="187.5" y="132">10</text><text x="252.5" y="132">20</text><text x="317.5" y="132">30</text>
+  </g>
+  <text class="small" x="155" y="175">capacity 3</text>
+
+  <rect class="line" x="510" y="105" width="300" height="42"/>
+  <path class="line" d="M 560 105 V 147 M 610 105 V 147 M 660 105 V 147 M 710 105 V 147 M 760 105 V 147"/>
+  <g text-anchor="middle">
+    <text x="535" y="132">10</text><text x="585" y="132">20</text><text x="635" y="132">30</text>
+    <text x="685" y="132">40</text><text x="735" y="132">–</text><text x="785" y="132">–</text>
+  </g>
+  <text class="small" x="510" y="175">capacity 6 · all elements copied</text>
+  <rect class="line" x="390" y="210" width="90" height="42" rx="4"/>
+  <text class="small" x="435" y="236" text-anchor="middle">&amp;v[0]</text>
+  <path class="line" d="M 480 231 H 510" marker-end="url(#arrow)"/>
+  <rect class="freed" x="510" y="210" width="195" height="42"/>
+  <path class="freed" d="M 575 210 V 252 M 640 210 V 252"/>
+  <g class="muted" text-anchor="middle">
+    <text x="542.5" y="237">10</text><text x="607.5" y="237">20</text><text x="672.5" y="237">30</text>
+  </g>
+  <text class="small" x="390" y="280">dangles</text>
+  <text class="small muted" x="510" y="280">old buffer: freed</text>
+
+  <path class="line" d="M 30 306 H 870"/>
+
+  <!-- PagedVec: only the pointer array moves; existing pages stay put. -->
+  <text x="30" y="337">PagedVec&lt;T&gt; (PAGE = 3)</text>
+  <text class="small" x="30" y="368">before</text>
+  <text class="small" x="470" y="337">after push(40)</text>
+  <text class="small" x="470" y="368">pointer array reallocated</text>
+
+  <rect class="line" x="30" y="400" width="60" height="42"/>
+  <text class="small" x="60" y="426" text-anchor="middle">p0</text>
+  <text class="small" x="175" y="385">page 0</text>
+  <path class="line" d="M 90 421 H 175" marker-end="url(#arrow)"/>
+  <rect class="line" x="175" y="400" width="180" height="42"/>
+  <path class="line" d="M 235 400 V 442 M 295 400 V 442"/>
+  <g text-anchor="middle">
+    <text x="205" y="427">10</text><text x="265" y="427">20</text><text x="325" y="427">30</text>
+  </g>
+  <rect class="line" x="160" y="475" width="90" height="42" rx="4"/>
+  <text class="small" x="205" y="501" text-anchor="middle">&amp;v[0]</text>
+  <path class="line" d="M 205 475 V 442" marker-end="url(#arrow)"/>
+
+  <rect class="line" x="480" y="400" width="120" height="42"/>
+  <path class="line" d="M 540 400 V 442"/>
+  <text class="small" x="510" y="426" text-anchor="middle">p0</text>
+  <text class="small" x="570" y="426" text-anchor="middle">p1</text>
+  <text class="small" x="660" y="385">page 0 · unchanged</text>
+  <path class="line" d="M 510 400 V 390 H 640 V 421 H 660" marker-end="url(#arrow)"/>
+  <rect class="line" x="660" y="400" width="180" height="42"/>
+  <path class="line" d="M 720 400 V 442 M 780 400 V 442"/>
+  <g text-anchor="middle">
+    <text x="690" y="427">10</text><text x="750" y="427">20</text><text x="810" y="427">30</text>
+  </g>
+  <rect class="line" x="645" y="475" width="90" height="42" rx="4"/>
+  <text class="small" x="690" y="501" text-anchor="middle">&amp;v[0]</text>
+  <path class="line" d="M 690 475 V 442" marker-end="url(#arrow)"/>
+  <text class="small" x="755" y="501">valid</text>
+
+  <text class="small" x="660" y="540">page 1 · new</text>
+  <path class="line" d="M 570 442 V 576 H 660" marker-end="url(#arrow)"/>
+  <rect class="line" x="660" y="555" width="180" height="42"/>
+  <path class="line" d="M 720 555 V 597 M 780 555 V 597"/>
+  <g text-anchor="middle">
+    <text x="690" y="582">40</text><text x="750" y="582">–</text><text x="810" y="582">–</text>
+  </g>
+
+  <text class="small" x="30" y="645">PagedDeque and Hive use the same pages; a hive also reuses freed slots in place.</text>
+</svg>

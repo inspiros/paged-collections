@@ -1,0 +1,4 @@
+inserted = [3, 7, 11, 19]
+contains 7 = false
+dense = [3, 19, 11]
+cleared len = 0

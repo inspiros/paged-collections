@@ -1,0 +1,5 @@
+get 7 = 1.5
+removed = 2.5
+keys = [7, 9]
+values = [1.5, 3.5]
+object = (4, 5)

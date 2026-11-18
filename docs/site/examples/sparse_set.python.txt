@@ -1,0 +1,7 @@
+inserted = [3, 7, 11, 19]
+contains 7 = False
+dense = [3, 19, 11]
+union = [3, 11, 19, 23]
+intersection = [11]
+difference = [3, 19]
+cleared len = 0

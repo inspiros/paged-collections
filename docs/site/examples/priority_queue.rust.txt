@@ -1,0 +1,3 @@
+old priority = 10
+removed = 20
+pop order = [(7, 40), (2, 30), (4, 15)]
