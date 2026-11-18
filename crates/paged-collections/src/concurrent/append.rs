@@ -198,20 +198,28 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
         Ok(pos)
     }
 
+    /// Claims storage before taking a pending value from the caller.
+    pub(super) fn push_from(&self, value: &mut Option<T>, limit: usize) -> Option<usize> {
+        assert!(value.is_some(), "missing pending append");
+        let (pos, page) = self.claim(limit)?;
+        self.publish(pos, page, value.take().expect("pending append"));
+        Some(pos)
+    }
+
     /// Appends all `values` at consecutive positions with one reservation
-    /// and one helping pass, returning the first position. Fails, returning
-    /// the values, if they do not all fit below `limit`. An empty batch
-    /// reserves nothing and returns the current reservation count.
-    pub(crate) fn push_many(&self, values: Vec<T>, limit: usize) -> Result<usize, Vec<T>> {
+    /// and one helping pass, returning the first position. The caller
+    /// retains the values if storage preparation panics or the limit would
+    /// be exceeded. An empty batch reserves nothing.
+    pub(super) fn push_many_from(&self, values: &mut Vec<T>, limit: usize) -> Option<usize> {
         let n = values.len();
         // Acquire: as in `claim`, only the CAS decides ownership.
         let mut pos = self.reserved.load(Ordering::Acquire);
         if n == 0 {
-            return Ok(pos);
+            return Some(pos);
         }
         loop {
             if pos > limit || limit - pos < n {
-                return Err(values);
+                return None;
             }
             // Allocate every page of the block BEFORE claiming it: capacity or
             // allocation panics cannot strand holes. Pages installed for a
@@ -231,7 +239,7 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
         }
         // No user code runs from the claim until every slot is ready: moving
         // out of a Vec and raw writes cannot panic.
-        for (i, value) in values.into_iter().enumerate() {
+        for (i, value) in values.drain(..).enumerate() {
             let at = pos + i;
             let page = self.pages.get(at / PAGE).expect("claimed page installed");
             page.slots[at % PAGE].with_mut(|cell| {
@@ -259,7 +267,12 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
             at += count;
         }
         self.help();
-        Ok(pos)
+        Some(pos)
+    }
+
+    #[cfg(all(test, loom))]
+    pub(super) fn push_many(&self, mut values: Vec<T>, limit: usize) -> Result<usize, Vec<T>> {
+        self.push_many_from(&mut values, limit).ok_or(values)
     }
 
     fn ready(&self, pos: usize, ordering: Ordering) -> bool {
@@ -434,9 +447,8 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
 
 impl<T, const PAGE: usize> Drop for AppendLog<T, PAGE> {
     fn drop(&mut self) {
-        // Quiescence gives committed == reserved. Empty values before Spine
-        // destroys pages: its chunk cleanup may leak later pages if a page's
-        // destructor panics. This guard finishes the log on unwind instead.
+        // Quiescence gives committed == reserved. Empty values in the log's
+        // normal clear order, and finish that order on unwind.
         // Page::drop remains a fallback for every ready bit, independently of
         // the counters (also useful for deliberately split loom fixtures).
         struct Rest<'a, T, const PAGE: usize>(&'a mut AppendLog<T, PAGE>);

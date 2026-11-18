@@ -137,6 +137,12 @@ enum Claim<'a> {
 /// shared append counters, small enough to bound held reservations.
 const BATCH: usize = 256;
 
+/// Loom coverage: counts batch items deferred because another writer held
+/// their slot. Plain std atomic, outside the model.
+#[cfg(all(test, loom))]
+pub(super) static BATCH_BUSY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Inserts `items` in batches. Each batch claims vacant slots without
 /// waiting, appends all claimed entries with one reservation, then publishes
 /// their positions. Slots another writer holds (including an earlier
@@ -153,55 +159,57 @@ fn insert_batched<'a, K: Key, T, const PAGE: usize, D: SharedDirectory>(
 ) -> usize {
     let mut items = items.into_iter();
     let mut inserted = 0;
-    // Values are dropped only while this call holds no reservation, since a
-    // destructor may insert into the map. `owners` is declared last so that
-    // unwinding releases the reservations before dropping any value.
-    let mut rejected: Vec<T> = Vec::new();
-    let mut deferred: Vec<T> = Vec::new();
+    // Keep user values in buffers declared before the reservation guards,
+    // including while the dense log prepares storage. A value's destructor
+    // may insert into a slot that this batch reserved.
+    let mut pending = Vec::with_capacity(BATCH);
+    let mut deferred = Vec::new();
     let mut entries: Vec<T> = Vec::with_capacity(BATCH);
     let mut owners: Vec<Reservation<'a>> = Vec::with_capacity(BATCH);
     loop {
-        // User iterator code runs here, holding reservations: it must not
-        // insert into this map (as with a factory). A panic rolls back.
-        let mut taken = 0;
+        // Run the iterator, validate keys and allocate sparse slots before
+        // claiming anything. A panic here leaves earlier batches intact.
         for item in items.by_ref().take(BATCH) {
-            taken += 1;
             let key_index = key_of(&item).index();
+            let slot = index.ensure_slot(key_index);
+            pending.push((key_index, slot, Some(item)));
+        }
+        let taken = pending.len();
+        // Reserve space before claiming so that moving values cannot panic
+        // on a buffer allocation. Rejected values stay in `pending`.
+        deferred.reserve(taken);
+        for &mut (key_index, slot, ref mut item) in &mut pending {
             // A later copy of a deferred key is deferred too: if the other
             // writer rolls back, the earlier copy must still win.
-            if deferred.iter().any(|d| key_of(d).index() == key_index) {
-                deferred.push(item);
-                continue;
-            }
-            let slot = index.ensure_slot(key_index);
-            match Index::<PAGE, D>::try_claim(slot) {
-                Claim::Owned(owner) => {
-                    owners.push(owner);
-                    entries.push(item);
+            if deferred.iter().any(|(key, _)| *key == key_index) {
+                deferred.push((key_index, item.take().expect("prepared item")));
+            } else {
+                match Index::<PAGE, D>::try_claim(slot) {
+                    Claim::Owned(owner) => {
+                        owners.push(owner);
+                        entries.push(item.take().expect("prepared item"));
+                    }
+                    Claim::Present(_) => {}
+                    Claim::Busy => {
+                        #[cfg(all(test, loom))]
+                        BATCH_BUSY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        deferred.push((key_index, item.take().expect("prepared item")));
+                    }
                 }
-                Claim::Present(_) => rejected.push(item),
-                Claim::Busy => deferred.push(item),
             }
         }
         if !owners.is_empty() {
-            let batch = core::mem::replace(&mut entries, Vec::with_capacity(BATCH));
-            match dense.push_many(batch, DENSE_LIMIT) {
-                Ok(start) => {
-                    inserted += owners.len();
-                    for (i, owner) in owners.drain(..).enumerate() {
-                        owner.publish(start + i);
-                    }
-                }
-                Err(batch) => {
-                    owners.clear();
-                    drop(batch);
-                    panic!("{full}");
-                }
+            let Some(start) = dense.push_many_from(&mut entries, DENSE_LIMIT) else {
+                panic!("{full}");
+            };
+            inserted += owners.len();
+            for (i, owner) in owners.drain(..).enumerate() {
+                owner.publish(start + i);
             }
         }
         // No reservation is held from here on.
-        rejected.clear();
-        for item in deferred.drain(..) {
+        pending.clear();
+        for (_, item) in deferred.drain(..) {
             inserted += usize::from(insert_one(item));
         }
         // Only an exhausted input ends the loop: a batch of present keys
@@ -300,9 +308,8 @@ impl<K: Key, const PAGE: usize, D: SharedDirectory> ConcurrentSparseSet<K, PAGE,
     /// scales across threads far better than repeated [`insert`](Self::insert).
     /// Positions need not follow input order.
     ///
-    /// The iterator runs while this call holds slot reservations: it must not
-    /// insert into this set (that may deadlock). It may panic; reservations
-    /// it holds roll back and earlier batches stay inserted.
+    /// Each batch is read and its keys validated before any slots are reserved.
+    /// If the iterator panics, earlier batches stay inserted.
     ///
     /// # Panics
     ///
@@ -521,14 +528,12 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentSparseMap<K, V,
             .map(|_| pos)
     }
 
-    fn append(&self, owner: Reservation<'_>, key: K, value: V) -> &V {
-        let pos = match self.dense.push((key, value), DENSE_LIMIT) {
-            Ok(pos) => pos,
-            Err(entry) => {
-                drop(owner);
-                drop(entry);
-                panic!("ConcurrentSparseMap cannot hold more than u32::MAX - 1 entries");
-            }
+    fn append(&self, reservation: Reservation<'_>, key: K, value: V) -> &V {
+        let mut entry = Some((key, value));
+        // This guard must unwind before the entry if dense preparation panics.
+        let owner = reservation;
+        let Some(pos) = self.dense.push_from(&mut entry, DENSE_LIMIT) else {
+            panic!("ConcurrentSparseMap cannot hold more than u32::MAX - 1 entries");
         };
         owner.publish(pos);
         &self.dense.get(pos).expect("published entry is ready").1
@@ -554,9 +559,8 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentSparseMap<K, V,
     /// Batches share one dense reservation, which scales across threads far
     /// better than repeated [`try_insert`](Self::try_insert).
     ///
-    /// The iterator runs while this call holds slot reservations: it must not
-    /// insert into this map (that may deadlock). It may panic; reservations
-    /// it holds roll back and earlier batches stay inserted.
+    /// Each batch is read and its keys validated before any slots are reserved.
+    /// If the iterator panics, earlier batches stay inserted.
     ///
     /// # Panics
     ///

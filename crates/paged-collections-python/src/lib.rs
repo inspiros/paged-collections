@@ -39,6 +39,16 @@ fn _rebuild<'py>(
     args: &Bound<'py, PyTuple>,
     kwargs: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    rebuild(cls, base, args, kwargs, None)
+}
+
+fn rebuild<'py>(
+    cls: &Bound<'py, PyType>,
+    base: &Bound<'py, PyType>,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+    new_args: Option<(&Bound<'py, PyTuple>, &Bound<'py, PyDict>)>,
+) -> PyResult<Bound<'py, PyAny>> {
     if !cls.is_subclass(base)? {
         return Err(PyTypeError::new_err(format!(
             "{} is not a subclass of {}",
@@ -64,7 +74,16 @@ fn _rebuild<'py>(
         }
         kwargs => kwargs,
     };
-    let obj = cls.call_method1("__new__", (cls,))?;
+    let obj = match new_args {
+        Some((args, kwargs)) => {
+            let args: Vec<_> = std::iter::once(cls.clone().into_any())
+                .chain(args.iter())
+                .collect();
+            let args = PyTuple::new(cls.py(), args)?;
+            cls.call_method("__new__", args, Some(kwargs))?
+        }
+        None => cls.call_method1("__new__", (cls,))?,
+    };
     let init_args: Vec<_> = std::iter::once(obj.clone()).chain(args.iter()).collect();
     let init_args = PyTuple::new(cls.py(), init_args)?;
     base.getattr("__init__")?.call(init_args, kwargs)?;
@@ -89,6 +108,33 @@ fn _rebuild_paged<'py>(
     kwargs.set_item("page_size", page_size)?;
     let contents = PyTuple::new(cls.py(), args.iter().take(count))?;
     _rebuild(cls, base, &contents, Some(&kwargs))
+}
+
+/// Pickle entry point for subclasses that supply their own allocation args.
+/// Keep them separate from the base initializer's contents and page size.
+#[pyfunction]
+fn _rebuild_with_newargs<'py>(
+    cls: &Bound<'py, PyType>,
+    base: &Bound<'py, PyType>,
+    new_args: &Bound<'py, PyTuple>,
+    new_kwargs: &Bound<'py, PyDict>,
+    contents: &Bound<'py, PyTuple>,
+    page_size: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let kwargs = if page_size.is_none() {
+        None
+    } else {
+        let kwargs = PyDict::new(cls.py());
+        kwargs.set_item("page_size", extract_page_size(page_size)?)?;
+        Some(kwargs)
+    };
+    rebuild(
+        cls,
+        base,
+        contents,
+        kwargs.as_ref(),
+        Some((new_args, new_kwargs)),
+    )
 }
 
 /// The page size of every paged class before `page_size` was selectable.
@@ -145,31 +191,67 @@ fn reduce<'py>(
 ) -> PyResult<Bound<'py, PyTuple>> {
     let py = obj.py();
     let module = py.import("paged_collections._core")?;
-    let page_size = base.getattr_opt("page_size")?;
-    let rebuild = module.getattr(if page_size.is_some() {
-        "_rebuild_paged"
-    } else {
-        "_rebuild"
-    })?;
     let cls = obj.get_type();
+    let is_subclass = !cls.is(base);
+    // Read the base descriptor, bypassing subclass property overrides.
+    let page_size = base
+        .getattr_opt("page_size")?
+        .map(|descriptor| descriptor.call_method1("__get__", (obj, base)))
+        .transpose()?;
     let mut args = vec![cls.clone().into_any(), base.clone().into_any()];
-    args.extend(contents);
-    if let Some(descriptor) = page_size {
-        // Read the base descriptor, bypassing subclass property overrides.
-        args.push(descriptor.call_method1("__get__", (obj, base))?);
-    }
-    let args = PyTuple::new(py, args)?;
-    let state = if cls.is(base) {
-        None
-    } else {
-        extra_state(obj)?
-    };
+    let allocation = if is_subclass { new_args(obj)? } else { None };
     let none = || py.None().into_bound(py);
-    let mut parts = vec![rebuild, args.into_any(), state.unwrap_or_else(none)];
+    let rebuild = if let Some((new_args, new_kwargs)) = allocation {
+        args.extend([
+            new_args.into_any(),
+            new_kwargs.into_any(),
+            PyTuple::new(py, contents)?.into_any(),
+            page_size.unwrap_or_else(none),
+        ]);
+        "_rebuild_with_newargs"
+    } else {
+        args.extend(contents);
+        if let Some(size) = page_size {
+            args.push(size);
+            "_rebuild_paged"
+        } else {
+            "_rebuild"
+        }
+    };
+    let state = if is_subclass { extra_state(obj)? } else { None };
+    let mut parts = vec![
+        module.getattr(rebuild)?,
+        PyTuple::new(py, args)?.into_any(),
+        state.unwrap_or_else(none),
+    ];
     if let Some(items) = items {
         parts.extend([none(), items.into_any()]);
     }
     PyTuple::new(py, parts)
+}
+
+fn new_args<'py>(
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<Option<(Bound<'py, PyTuple>, Bound<'py, PyDict>)>> {
+    if let Some(method) = obj.getattr_opt("__getnewargs_ex__")? {
+        let result = method.call0()?.cast_into::<PyTuple>()?;
+        if result.len() != 2 {
+            return Err(PyTypeError::new_err(
+                "__getnewargs_ex__ must return a pair of positional and keyword arguments",
+            ));
+        }
+        Ok(Some((
+            result.get_item(0)?.cast_into::<PyTuple>()?,
+            result.get_item(1)?.cast_into::<PyDict>()?,
+        )))
+    } else if let Some(method) = obj.getattr_opt("__getnewargs__")? {
+        Ok(Some((
+            method.call0()?.cast_into::<PyTuple>()?,
+            PyDict::new(obj.py()),
+        )))
+    } else {
+        Ok(None)
+    }
 }
 
 /// List-item form of `reduce`: create the empty list before restoring its
@@ -197,7 +279,9 @@ fn extra_state<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny
         Some(getstate) => getstate.call0()?,
         None => {
             let py = obj.py();
-            let dict = obj.getattr_opt("__dict__")?;
+            let dict = obj
+                .getattr_opt("__dict__")?
+                .filter(|d| !d.cast::<PyDict>().is_ok_and(|dict| dict.is_empty()));
             let names = py
                 .import("copyreg")?
                 .call_method1("_slotnames", (obj.get_type(),))?;
@@ -218,8 +302,7 @@ fn extra_state<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyAny
             }
         }
     };
-    let empty = state.is_none() || state.cast::<PyDict>().is_ok_and(|d| d.is_empty());
-    Ok((!empty).then_some(state))
+    Ok((!state.is_none()).then_some(state))
 }
 
 /// The Python error for a failed reservation.
@@ -304,7 +387,7 @@ mod _core {
     use super::*;
 
     #[pymodule_export]
-    use super::{_rebuild, _rebuild_paged};
+    use super::{_rebuild, _rebuild_paged, _rebuild_with_newargs};
     #[pymodule_export]
     use crate::concurrent::{
         ConcurrentDirectMapBool, ConcurrentDirectMapF32, ConcurrentDirectMapF64,

@@ -370,6 +370,24 @@ pub(crate) trait TypedValue: Element + Copy + PartialEq + 'static {
     /// (floats into an integer map, anything but bool into a bool map) and
     /// integers out of range.
     fn convert(array: &Bound<'_, PyUntypedArray>) -> PyResult<Vec<Self>>;
+
+    /// Converts a one-dimensional input, with access to the original source
+    /// when NumPy's inferred dtype cannot preserve the values.
+    fn convert_sequence(
+        _obj: &Bound<'_, PyAny>,
+        array: &Bound<'_, PyUntypedArray>,
+    ) -> PyResult<Vec<Self>> {
+        if array.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Self::convert(array)
+        }
+    }
+
+    /// Whether a cell still holds the value read before a Python callback.
+    fn same_value(self, other: Self) -> bool {
+        self == other
+    }
 }
 
 fn wrong_kind(array: &Bound<'_, PyUntypedArray>, target: &str) -> PyErr {
@@ -397,6 +415,10 @@ macro_rules! float_value {
 
             fn store(cell: &Self::Atomic, value: Self) {
                 cell.store(value.to_bits(), Relaxed);
+            }
+
+            fn same_value(self, other: Self) -> bool {
+                self.to_bits() == other.to_bits()
             }
 
             fn convert(array: &Bound<'_, PyUntypedArray>) -> PyResult<Vec<Self>> {
@@ -442,6 +464,32 @@ macro_rules! int_value {
                         .collect(),
                     _ => Err(wrong_kind(array, $dtype)),
                 }
+            }
+
+            fn convert_sequence(
+                obj: &Bound<'_, PyAny>,
+                array: &Bound<'_, PyUntypedArray>,
+            ) -> PyResult<Vec<Self>> {
+                if !matches!(array.dtype().kind(), b'f' | b'O')
+                    || obj.cast::<PyUntypedArray>().is_ok()
+                {
+                    return Self::convert(array);
+                }
+                // Mixed signed/unsigned scalars can promote to float64,
+                // losing bits. Read the original elements, not those floats.
+                let index = obj.py().import("operator")?.getattr("index")?;
+                let len = array.len();
+                let mut values = Vec::with_capacity(len);
+                for item in obj.try_iter()? {
+                    if values.len() == len {
+                        return Err(PyValueError::new_err("values changed length during conversion"));
+                    }
+                    values.push(index.call1((item?,))?.extract::<$t>()?);
+                }
+                if values.len() != len {
+                    return Err(PyValueError::new_err("values changed length during conversion"));
+                }
+                Ok(values)
             }
         }
     )*};
@@ -499,9 +547,7 @@ pub(crate) fn value_batch<T: TypedValue>(obj: &Bound<'_, PyAny>, n: usize) -> Py
             "got {} values for {n} keys",
             array.len()
         ))),
-        // `asarray([])` is float64: allow it whatever the target dtype.
-        1 if n == 0 => Ok(Vec::new()),
-        1 => T::convert(&array),
+        1 => T::convert_sequence(obj, &array),
         ndim => Err(PyValueError::new_err(format!(
             "values must be a scalar or one-dimensional, got {ndim} dimensions"
         ))),

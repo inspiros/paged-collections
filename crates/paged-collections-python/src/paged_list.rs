@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use numpy::{PyArray1, PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
 use paged_collections::paged_vec::PagedVec;
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{PyIndexError, PyMemoryError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use pyo3::types::slice::PySliceIndices;
@@ -173,22 +173,22 @@ fn objects(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Py<PyAny>>> {
 /// scalar inputs. Convert the entire batch before borrowing or changing a list.
 fn typed_values<T: TypedValue>(obj: &Bound<'_, PyAny>) -> PyResult<Vec<T>> {
     let mut array = as_ndarray(obj)?;
-    if array.ndim() == 0 && obj.cast::<PyUntypedArray>().is_err() {
-        let list = obj
+    let materialized;
+    let source = if array.ndim() == 0 && obj.cast::<PyUntypedArray>().is_err() {
+        materialized = obj
             .py()
             .import("builtins")?
             .getattr("list")?
             .call1((obj,))?;
-        array = as_ndarray(&list)?;
-    }
+        array = as_ndarray(&materialized)?;
+        &materialized
+    } else {
+        obj
+    };
     if array.ndim() != 1 {
         return Err(PyValueError::new_err("values must be one-dimensional"));
     }
-    if array.is_empty() {
-        Ok(Vec::new())
-    } else {
-        T::convert(&array)
-    }
+    T::convert_sequence(source, &array)
 }
 
 /// Signed index batches, including unaligned, strided and non-native-endian
@@ -431,16 +431,20 @@ impl PagedList {
         #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
     ) -> PyResult<()> {
         // As `list.__init__`: always starts from empty.
-        let replacement = ListInner::new(page_size)?;
+        let mut replacement = ListInner::new(page_size)?;
         Self::clear(slf)?;
-        if slf.try_borrow()?.list.page_size() != page_size {
-            // clear drops objects outside the borrow; callbacks may append.
-            // Preserve those values while switching the empty storage policy.
-            let values = slf.try_borrow()?.snapshot(slf.py());
+        {
             let mut this = slf.try_borrow_mut()?;
-            this.list = replacement;
-            this.list.extend(values);
-            this.changed();
+            if this.list.page_size() != page_size {
+                // Finalizers from clear may have appended. Move the live
+                // values while holding the same borrow that switches storage.
+                replacement
+                    .try_reserve(this.list.len())
+                    .map_err(crate::reserve_error)?;
+                paged!(ListInner, &mut this.list, list => replacement.extend(list.drain(..)));
+                this.list = replacement;
+                this.changed();
+            }
         }
         match values {
             Some(values) => Self::extend(slf, values),
@@ -586,25 +590,40 @@ impl PagedList {
         Ok(count)
     }
     fn remove(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        if let Some(i) = Self::find(slf, value, 0, usize::MAX)? {
+        let mut i = 0;
+        loop {
+            let (item, mods) = {
+                let this = slf.try_borrow()?;
+                let Some(item) = this.list.get(i) else {
+                    break;
+                };
+                (item.clone_ref(slf.py()), this.mods)
+            };
+            let equal = equal_objects(item.bind(slf.py()), value)?;
+            drop(item);
+            if !equal {
+                i += 1;
+                continue;
+            }
             let removed = {
                 let mut this = slf.try_borrow_mut()?;
-                // A comparison can remove the matching position itself.
-                let removed = if i < this.list.len() {
-                    Some(this.list.remove(i))
-                } else {
-                    None
-                };
+                // As with list.remove, a comparison may clear the list.
+                if this.list.is_empty() {
+                    return Ok(());
+                }
+                if this.mods != mods {
+                    return Err(PyRuntimeError::new_err("PagedList mutated during remove"));
+                }
+                let removed = this.list.remove(i);
                 this.changed();
                 removed
             };
             drop(removed);
-            Ok(())
-        } else {
-            Err(PyValueError::new_err(
-                "PagedList.remove(x): x not in PagedList",
-            ))
+            return Ok(());
         }
+        Err(PyValueError::new_err(
+            "PagedList.remove(x): x not in PagedList",
+        ))
     }
     fn __eq__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
@@ -694,9 +713,9 @@ impl PagedList {
             return Ok(());
         }
         let py = slf.py();
-        let vals = slf.try_borrow()?.snapshot(py);
-        let total = repeat_len(vals.len(), n)?;
         let mut this = slf.try_borrow_mut()?;
+        let total = repeat_len(this.list.len(), n)?;
+        let vals = this.snapshot(py);
         this.list
             .try_reserve(total - vals.len())
             .map_err(crate::reserve_error)?;
@@ -715,8 +734,8 @@ impl PagedList {
     }
     fn extend(slf: &Bound<'_, Self>, iterable: &Bound<'_, PyAny>) -> PyResult<()> {
         if iterable.is(slf) {
-            let vals = slf.try_borrow()?.snapshot(slf.py());
             let mut this = slf.try_borrow_mut()?;
+            let vals = this.snapshot(slf.py());
             this.list
                 .try_reserve(vals.len())
                 .map_err(crate::reserve_error)?;
@@ -913,18 +932,30 @@ macro_rules! typed_list {
         pub(crate) struct $name {
             list: ListInner<ValueCell<$t>>,
             exports: Exports,
+            revision: u64,
         }
         impl $name {
-            fn empty() -> Self { Self { list: ListInner::default(), exports: Exports::default() } }
+            fn empty() -> Self {
+                Self { list: ListInner::default(), exports: Exports::default(), revision: 0 }
+            }
             fn from_values(vals: Vec<$t>, page_size: usize) -> PyResult<Self> {
-                let mut out = Self { list: ListInner::new(page_size)?, exports: Exports::default() };
+                let mut out = Self {
+                    list: ListInner::new(page_size)?,
+                    exports: Exports::default(),
+                    revision: 0,
+                };
                 out.extend_values(vals)?;
                 Ok(out)
             }
+            fn changed(&mut self) {
+                self.revision = self.revision.wrapping_add(1);
+            }
             fn extend_values(&mut self, vals: Vec<$t>) -> PyResult<()> {
+                if vals.is_empty() { return Ok(()); }
                 self.list.try_reserve(vals.len()).map_err(crate::reserve_error)?;
                 // push only touches the new last element; existing cells stay put.
                 for value in vals { self.list.push(ValueCell::new(value)); }
+                self.changed();
                 Ok(())
             }
             fn snapshot(&self) -> Vec<$t> { self.list.iter().map(ValueCell::get).collect() }
@@ -978,6 +1009,7 @@ macro_rules! typed_list {
                     let additional = vals.len().saturating_sub(this.list.len());
                     this.list.try_reserve(additional).map_err(crate::reserve_error)?;
                     this.list.clear();
+                    this.changed();
                     this.extend_values(vals)?;
                 }
                 Ok(())
@@ -1019,6 +1051,7 @@ macro_rules! typed_list {
                             this.list.try_reserve(vals.len().saturating_sub(s.slicelength)).map_err(crate::reserve_error)?;
                             let vals = vals.into_iter().map(ValueCell::new).collect();
                             paged!(ListInner, &mut this.list, list => splice(list, s.start as usize, s.slicelength, vals));
+                            this.changed();
                         }
                     }
                 }
@@ -1038,6 +1071,7 @@ macro_rules! typed_list {
                         paged!(ListInner, &mut this.list, list => remove_positions(list, slice_positions(&s).collect()));
                     }
                 }
+                this.changed();
                 Ok(())
             }
             fn __iter__(slf: &Bound<'_, Self>) -> PyResult<$iter> { $iter::new(slf, false) }
@@ -1070,14 +1104,41 @@ macro_rules! typed_list {
                 Ok(count)
             }
             fn remove(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-                slf.try_borrow()?.exports.check($pyname)?;
-                let found = Self::find(slf, value, 0, usize::MAX)?;
-                let mut this = slf.try_borrow_mut()?;
-                this.exports.check($pyname)?;
-                match found {
-                    Some(i) => { if i < this.list.len() { this.list.remove(i); } Ok(()) },
-                    None => Err(PyValueError::new_err(concat!($pyname, ".remove(x): x not in ", $pyname))),
+                let missing = || PyValueError::new_err(concat!($pyname, ".remove(x): x not in ", $pyname));
+                if let Some(value) = Self::probe(value)? {
+                    let mut this = slf.try_borrow_mut()?;
+                    this.exports.check($pyname)?;
+                    let i = this.find_typed(value, 0, usize::MAX).ok_or_else(missing)?;
+                    this.list.remove(i);
+                    this.changed();
+                    return Ok(());
                 }
+                slf.try_borrow()?.exports.check($pyname)?;
+                let mut i = 0;
+                loop {
+                    let (item, revision) = {
+                        let this = slf.try_borrow()?;
+                        let Some(cell) = this.list.get(i) else { break; };
+                        (cell.get(), this.revision)
+                    };
+                    if item.into_bound_py_any(slf.py())?.eq(value)? {
+                        let mut this = slf.try_borrow_mut()?;
+                        this.exports.check($pyname)?;
+                        if this.list.is_empty() { return Ok(()); }
+                        // Existing cells can also be written without reordering,
+                        // including via a NumPy view released by the callback.
+                        if this.revision != revision
+                            || !this.list.get(i).is_some_and(|cell| item.same_value(cell.get()))
+                        {
+                            return Err(PyRuntimeError::new_err(concat!($pyname, " mutated during remove")));
+                        }
+                        this.list.remove(i);
+                        this.changed();
+                        return Ok(());
+                    }
+                    i += 1;
+                }
+                Err(missing())
             }
             fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
                 let Ok(other) = other.cast::<Self>() else { return Ok(py.NotImplemented()); };
@@ -1131,7 +1192,12 @@ macro_rules! typed_list {
             fn __imul__(slf: &Bound<'_, Self>, n: &Bound<'_, PyAny>) -> PyResult<()> {
                 let n = strict_index(n)?;
                 let mut this = slf.try_borrow_mut()?;
-                if n <= 0 { this.exports.check($pyname)?; this.list.clear(); return Ok(()); }
+                if n <= 0 {
+                    this.exports.check($pyname)?;
+                    this.list.clear();
+                    this.changed();
+                    return Ok(());
+                }
                 if n == 1 { return Ok(()); }
                 let vals = this.snapshot();
                 let total = repeat_len(vals.len(), n)?;
@@ -1139,6 +1205,7 @@ macro_rules! typed_list {
                 for _ in 1..if vals.is_empty() { 1 } else { n } {
                     for &v in &vals { this.list.push(ValueCell::new(v)); }
                 }
+                this.changed();
                 Ok(())
             }
             fn append(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -1158,6 +1225,7 @@ macro_rules! typed_list {
                 this.list.try_reserve(1).map_err(crate::reserve_error)?;
                 if i == this.list.len() { this.list.push(ValueCell::new(value)); }
                 else { this.list.insert(i, ValueCell::new(value)); }
+                this.changed();
                 Ok(())
             }
             #[pyo3(signature = (index=-1))]
@@ -1167,16 +1235,29 @@ macro_rules! typed_list {
                 this.exports.check($pyname)?;
                 if this.list.is_empty() { return Err(PyIndexError::new_err(concat!("pop from empty ", $pyname))); }
                 let i = position(i, this.list.len(), $pyname).map_err(|_| PyIndexError::new_err("pop index out of range"))?;
-                Ok(this.list.remove(i).get())
+                let value = this.list.remove(i).get();
+                this.changed();
+                Ok(value)
             }
-            fn clear(&mut self) -> PyResult<()> { self.exports.check($pyname)?; self.list.clear(); Ok(()) }
-            fn reverse(&mut self) -> PyResult<()> { self.exports.check($pyname)?; self.list.reverse(); Ok(()) }
+            fn clear(&mut self) -> PyResult<()> {
+                self.exports.check($pyname)?;
+                self.list.clear();
+                self.changed();
+                Ok(())
+            }
+            fn reverse(&mut self) -> PyResult<()> {
+                self.exports.check($pyname)?;
+                self.list.reverse();
+                self.changed();
+                Ok(())
+            }
             fn copy(&self) -> PyResult<Self> { Self::from_values(self.snapshot(), self.list.page_size()) }
             #[pyo3(signature = (*, reverse=false))]
             fn sort(slf: &Bound<'_, Self>, #[pyo3(from_py_with = sort_reverse)] reverse: bool) -> PyResult<()> {
                 let mut this = slf.try_borrow_mut()?;
                 this.exports.check($pyname)?;
                 this.list.sort_by(|a,b| if reverse { numeric_order(b.get(), a.get()) } else { numeric_order(a.get(), b.get()) });
+                this.changed();
                 Ok(())
             }
             fn reserve(slf: &Bound<'_, Self>, additional: &Bound<'_, PyAny>) -> PyResult<()> {

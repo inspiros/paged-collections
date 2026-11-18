@@ -241,24 +241,22 @@ impl Hive {
                 .collect::<PyResult<_>>()?,
             None => Vec::new(),
         };
-        let hive = match hive {
-            Some(hive) => Some(hive),
-            None => {
-                let this = slf.try_borrow()?;
-                (this.hive.page_size() != page_size)
-                    .then(|| this.repage(slf.py(), page_size))
-                    .transpose()?
-            }
-        };
-        if let Some(hive) = hive {
-            let old = {
-                let mut this = slf.try_borrow_mut()?;
+        let old = {
+            let mut this = slf.try_borrow_mut()?;
+            let replacement = match hive {
+                Some(hive) => Some(hive),
+                None if this.hive.page_size() != page_size => {
+                    Some(this.repage(slf.py(), page_size)?)
+                }
+                None => None,
+            };
+            replacement.map(|hive| {
                 let old = std::mem::replace(&mut this.hive, hive);
                 this.changed();
                 old
-            };
-            drop(old);
-        }
+            })
+        };
+        drop(old);
         // Without _state, insert into the existing history, like map __init__.
         Self::insert_values(slf, values).map(drop)
     }
@@ -733,8 +731,8 @@ impl Hive {
         let mut ids = Vec::new();
         ids.try_reserve(values.len())
             .map_err(crate::reserve_error)?;
-        slf.try_borrow_mut()?.reserve_insert(values.len())?;
         let mut this = slf.try_borrow_mut()?;
+        this.reserve_insert(values.len())?;
         for value in values {
             ids.push(
                 this.hive

@@ -54,6 +54,10 @@ fn mutated(removing: bool) -> PyErr {
     }
 }
 
+fn remove_changed() -> PyErr {
+    PyRuntimeError::new_err("PagedDeque mutated during remove")
+}
+
 /// `operator.index(obj)`, saturated to `isize`. Convert before borrowing:
 /// `__index__` can run arbitrary Python code.
 fn signed_index(obj: &Bound<'_, PyAny>) -> PyResult<isize> {
@@ -101,6 +105,8 @@ pub(crate) struct PagedDeque {
     /// CPython's state: endpoint movement invalidates iterators, replacement
     /// and reverse do not. Empty clear and rotations of length <= 1 are inert.
     mods: u64,
+    // Also catches replacements and reverse for operations that save a match.
+    revision: u64,
 }
 
 impl PagedDeque {
@@ -109,10 +115,12 @@ impl PagedDeque {
             deque: DequeInner::default(),
             maxlen,
             mods: 0,
+            revision: 0,
         }
     }
     fn changed(&mut self) {
         self.mods = self.mods.wrapping_add(1);
+        self.revision = self.revision.wrapping_add(1);
     }
     fn snapshot(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
         self.deque.iter().map(|v| v.clone_ref(py)).collect()
@@ -176,17 +184,20 @@ impl PagedDeque {
             .get(i)
             .map(|v| v.clone_ref(slf.py())))
     }
-    /// The first position in `start..stop` holding a value equal to `value`.
+    /// The first matching position and the revision it was found at.
     /// contains/index return a successful match before checking state;
-    /// remove checks state first and raises IndexError on mutation.
+    /// remove checks endpoint state first, then the full search revision.
     fn find(
         slf: &Bound<'_, Self>,
         value: &Bound<'_, PyAny>,
         start: usize,
         stop: usize,
         removing: bool,
-    ) -> PyResult<Option<usize>> {
-        let mods = slf.try_borrow()?.mods;
+    ) -> PyResult<Option<(usize, u64)>> {
+        let (stop, mods, revision) = {
+            let this = slf.try_borrow()?;
+            (stop.min(this.deque.len()), this.mods, this.revision)
+        };
         for i in start..stop {
             let Some(item) = Self::at(slf, i)? else {
                 break;
@@ -195,44 +206,51 @@ impl PagedDeque {
             drop(item);
             let equal = equal?;
             if equal && !removing {
-                return Ok(Some(i));
+                return Ok(Some((i, revision)));
             }
-            let changed = slf.try_borrow()?.mods != mods;
-            if changed {
+            let this = slf.try_borrow()?;
+            if this.mods != mods {
                 return Err(mutated(removing));
             }
+            if removing && this.revision != revision {
+                return Err(remove_changed());
+            }
             if equal {
-                return Ok(Some(i));
+                return Ok(Some((i, this.revision)));
             }
         }
         Ok(None)
     }
 
     fn repeat(slf: &Bound<'_, Self>, n: isize) -> PyResult<()> {
-        let (size, maxlen) = {
-            let this = slf.try_borrow()?;
-            (this.deque.len(), this.maxlen)
-        };
-        if size == 0 || n == 1 {
+        if n == 1 {
             return Ok(());
         }
         if n <= 0 {
             return Self::clear(slf);
         }
         let py = slf.py();
-        let vals = slf.try_borrow()?.snapshot(py);
-        if size == 1 {
-            let total = maxlen.map_or(n as usize, |limit| limit.min(n as usize));
+        let (size, maxlen, vals) = {
             let mut this = slf.try_borrow_mut()?;
-            this.deque
-                .try_reserve(total.saturating_sub(1))
-                .map_err(crate::reserve_error)?;
-            this.changed();
-            for _ in 1..total {
-                this.deque.push_back(vals[0].clone_ref(py));
+            let size = this.deque.len();
+            let maxlen = this.maxlen;
+            match size {
+                0 => return Ok(()),
+                1 => {
+                    let total = maxlen.map_or(n as usize, |limit| limit.min(n as usize));
+                    this.deque
+                        .try_reserve(total.saturating_sub(1))
+                        .map_err(crate::reserve_error)?;
+                    this.changed();
+                    for _ in 1..total {
+                        let value = this.deque[0].clone_ref(py);
+                        this.deque.push_back(value);
+                    }
+                    return Ok(());
+                }
+                _ => (size, maxlen, this.snapshot(py)),
             }
-            return Ok(());
-        }
+        };
         let total = size
             .checked_mul(n as usize)
             .filter(|&len| len <= isize::MAX as usize)
@@ -312,19 +330,31 @@ impl PagedDeque {
                 }
             }
         }
-        let replacement = DequeInner::new(page_size)?;
+        let mut replacement = DequeInner::new(page_size)?;
         let maxlen = Self::parse_maxlen(maxlen.as_ref())?;
         // Install before releasing old elements: their destructors may append.
-        slf.try_borrow_mut()?.maxlen = maxlen;
-        Self::clear(slf)?;
-        if slf.try_borrow()?.deque.page_size() != page_size {
-            let vals = slf.try_borrow()?.snapshot(slf.py());
+        let removed: Vec<_> = {
             let mut this = slf.try_borrow_mut()?;
-            this.deque = replacement;
-            for value in vals {
-                this.deque.push_back(value);
+            this.maxlen = maxlen;
+            let removed: Vec<_> = std::iter::from_fn(|| this.deque.pop_front()).collect();
+            if !removed.is_empty() {
+                this.changed();
             }
-            this.changed();
+            removed
+        };
+        drop(removed);
+        {
+            let mut this = slf.try_borrow_mut()?;
+            if this.deque.page_size() != page_size {
+                replacement
+                    .try_reserve(this.deque.len())
+                    .map_err(crate::reserve_error)?;
+                while let Some(value) = this.deque.pop_front() {
+                    replacement.push_back(value);
+                }
+                this.deque = replacement;
+                this.changed();
+            }
         }
         match iterable {
             Some(values) => Self::extend(slf, &values),
@@ -352,7 +382,9 @@ impl PagedDeque {
         let old = {
             let mut this = slf.try_borrow_mut()?;
             let i = position(i, this.deque.len())?;
-            std::mem::replace(&mut this.deque[i], value)
+            let old = std::mem::replace(&mut this.deque[i], value);
+            this.revision = this.revision.wrapping_add(1);
+            old
         };
         drop(old);
         Ok(())
@@ -600,6 +632,7 @@ impl PagedDeque {
         let len = slf.try_borrow()?.deque.len();
         let (start, stop) = (bound(start, len), bound(stop, len));
         Self::find(slf, value, start, stop, false)?
+            .map(|(i, _)| i)
             .ok_or_else(|| PyValueError::new_err("value is not in PagedDeque"))
     }
 
@@ -623,12 +656,13 @@ impl PagedDeque {
     }
 
     fn remove(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let len = slf.try_borrow()?.deque.len();
-        let i = Self::find(slf, value, 0, len, true)?
+        let (i, revision) = Self::find(slf, value, 0, usize::MAX, true)?
             .ok_or_else(|| PyValueError::new_err("PagedDeque.remove(x): x not in deque"))?;
-        // `find` raised if a comparison mutated the deque, so `i` is current.
         let old = {
             let mut this = slf.try_borrow_mut()?;
+            if this.revision != revision {
+                return Err(remove_changed());
+            }
             let old = this.deque.remove(i);
             this.changed();
             old
@@ -678,6 +712,9 @@ impl PagedDeque {
         let len = this.deque.len();
         for i in 0..len / 2 {
             this.deque.swap(i, len - 1 - i);
+        }
+        if len > 1 {
+            this.revision = this.revision.wrapping_add(1);
         }
         Ok(())
     }

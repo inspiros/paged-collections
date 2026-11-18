@@ -198,29 +198,64 @@ impl<P, const CHUNKS: usize> Spine<P, CHUNKS> {
         Some(unsafe { Box::from_raw(raw) })
     }
 
-    /// Frees every page and chunk. If a page's destructor panics, the
-    /// remaining pages of that chunk are leaked (safe, not unsound).
+    /// Frees every page and chunk, including after one page destructor panics.
     pub(crate) fn clear(&mut self) {
-        for (k, cell) in self.chunks.iter_mut().enumerate() {
+        Reclaim {
+            chunks: &mut self.chunks,
+            next_chunk: 0,
+            cells: None,
+            next_page: 0,
+        }
+        .drain();
+    }
+}
+
+/// Owns the detached chunk and tracks progress before each page drop.
+struct Reclaim<'a, P> {
+    chunks: &'a mut [AtomicPtr<AtomicPtr<P>>],
+    next_chunk: usize,
+    cells: Option<Box<[AtomicPtr<P>]>>,
+    next_page: usize,
+}
+
+impl<P> Reclaim<'_, P> {
+    fn drain(&mut self) {
+        loop {
+            if let Some(cells) = &self.cells {
+                while let Some(cell) = cells.get(self.next_page) {
+                    self.next_page += 1;
+                    // Relaxed suffices under exclusive access.
+                    let page = cell.load(Ordering::Relaxed);
+                    if !page.is_null() {
+                        // SAFETY: this cell owns a distinct Box<P> in the
+                        // detached chunk. Advancing first prevents a second
+                        // drop of this page if its destructor panics.
+                        drop(unsafe { Box::from_raw(page) });
+                    }
+                }
+                self.cells = None;
+            }
+            let k = self.next_chunk;
+            let Some(cell) = self.chunks.get_mut(k) else {
+                break;
+            };
+            self.next_chunk += 1;
             // Relaxed suffices: exclusive access rules out readers/installers.
             let raw = cell.swap(ptr::null_mut(), Ordering::Relaxed);
-            if raw.is_null() {
-                continue;
-            }
-            let slice = ptr::slice_from_raw_parts_mut(raw, BASE << k);
-            // SAFETY: this cell uniquely owned the installed chunk with exactly
-            // BASE << k entries; exclusive access permits taking it back.
-            let cells = unsafe { Box::from_raw(slice) };
-            for cell in cells.iter() {
-                // Relaxed suffices: no concurrent access exists during clear.
-                let page = cell.load(Ordering::Relaxed);
-                if !page.is_null() {
-                    // SAFETY: every non-null cell uniquely owns one Box<P>,
-                    // no page is aliased, and exclusive access ends all borrows.
-                    drop(unsafe { Box::from_raw(page) });
-                }
+            if !raw.is_null() {
+                let slice = ptr::slice_from_raw_parts_mut(raw, BASE << k);
+                // SAFETY: the swap transferred the sole ownership of this
+                // allocation, which contains exactly BASE << k cells.
+                self.cells = Some(unsafe { Box::from_raw(slice) });
+                self.next_page = 0;
             }
         }
+    }
+}
+
+impl<P> Drop for Reclaim<'_, P> {
+    fn drop(&mut self) {
+        self.drain();
     }
 }
 
