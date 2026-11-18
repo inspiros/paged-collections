@@ -1,0 +1,90 @@
+name: Wheels
+
+# Per platform, three wheels cover every supported CPython:
+#   cp310-abi3          GIL builds, 3.10 and later
+#   cp314-cp314t        free-threaded 3.14 (no stable ABI before 3.15)
+#   cp315-abi3.abi3t    free-threaded (and GIL) builds, 3.15 and later
+# Free-threaded 3.13 is not built: PyO3 0.30 does not support it.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - pyproject.toml
+      - Cargo.toml
+      - crates/paged-collections-python/Cargo.toml
+      - .github/workflows/wheels.yml
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Interpreters wheels are built for; each also tests its wheel.
+  PYTHONS: "3.10 3.14t 3.15t"
+
+jobs:
+  linux:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, target: x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: "2_28"
+          # Interpreter names inside the manylinux container.
+          args: --release --out dist -i python3.10 python3.14t python3.15t
+      - uses: astral-sh/setup-uv@v6
+      - name: Test wheels
+        shell: bash
+        run: .github/workflows/test-wheels.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  native:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-latest, name: macos-arm64 }
+          - { runner: macos-15-intel, name: macos-x86_64 }
+          - { runner: windows-latest, name: windows-x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+      - name: Build wheels
+        shell: bash
+        run: |
+          uv python install $PYTHONS
+          interpreters=()
+          for py in $PYTHONS; do interpreters+=("$(uv python find "$py")"); done
+          uvx --from 'maturin>=1.16,<2' maturin build --release --out dist -i "${interpreters[@]}"
+      - name: Test wheels
+        shell: bash
+        run: .github/workflows/test-wheels.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist

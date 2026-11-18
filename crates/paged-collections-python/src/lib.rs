@@ -294,7 +294,12 @@ fn repr_items<'py, K: std::fmt::Display, V: IntoPyObject<'py>>(
 }
 
 /// Native core of the `paged_collections` Python package.
-#[pymodule]
+///
+/// The module runs without the GIL on free-threaded builds: every class is
+/// `Sync`, PyO3's borrow flags serialize `&mut self` methods against other
+/// calls on the same object, and no state is shared between objects except
+/// through atomics and locks.
+#[pymodule(gil_used = false)]
 mod _core {
     use super::*;
 

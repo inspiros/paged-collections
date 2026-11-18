@@ -344,11 +344,21 @@ be one of them. A pickle made with a size the reading build lacks raises
 `ConcurrentDirectMap*` classes support shared access from Python threads.
 They use the default page size and flat directory; sparse variants only insert
 while shared, and existing sparse map values are preserved. Batch methods
-release the GIL; single-key calls do not. Free-threaded builds are not yet
-published. Results are copies; there are no guards or views. Sparse removal
+release the GIL; single-key calls do not. Results are copies; there are no
+guards or views. Sparse removal
 and `clear` are exclusive: a conflicting exclusive call raises `RuntimeError`
 (`Already borrowed`). Direct map snapshots are ordered by key. `len()` is exact
 only when no write is in flight.
+
+### Free threading
+
+Wheels cover GIL CPython 3.10+ (`abi3`), free-threaded 3.14t, and
+free-threaded 3.15t+ (`abi3t`). Importing the package keeps the GIL
+disabled. The concurrent types above then run truly in parallel. The other
+classes are safe to share but not designed for it: a call that conflicts
+with another thread's call on the same object raises `RuntimeError`
+(`Already borrowed`), or `BufferError` while views exist. Guard such shared
+use with a lock. Free-threaded 3.13t is not supported.
 
 ## Layout
 
