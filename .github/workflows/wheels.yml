@@ -15,6 +15,7 @@ on:
       - Cargo.toml
       - crates/paged-collections-python/Cargo.toml
       - .github/workflows/wheels.yml
+  workflow_call:
   workflow_dispatch:
 
 env:
@@ -86,5 +87,5 @@ jobs:
           args: --out dist
       - uses: actions/upload-artifact@v4
         with:
-          name: sdist
+          name: wheels-sdist
           path: dist

@@ -36,3 +36,9 @@ The Python examples need the package installed (`uv sync`).
 
 See [crates/bench/README.md](crates/bench/README.md) and
 [benchmarks/python](benchmarks/python).
+
+## Releases
+
+1. Bump `version` in the root `Cargo.toml` (the crate and the Python package share it) and commit.
+2. Push a `vX.Y.Z` tag. This runs CI, builds and tests the wheels, and deploys the book.
+3. Run the **Publish** workflow by hand with the tag as the ref. It checks the tag against the version, reruns CI and the wheel builds, then publishes the crate to crates.io and the wheels and sdist to PyPI, in that order.
