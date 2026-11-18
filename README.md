@@ -13,7 +13,9 @@ Paged sparse sets, maps, a priority queue and stable-address containers for
 Rust (`no_std` + `alloc`), with Python bindings built on PyO3 and NumPy.
 
 - **Paged index**: a key-indexed table split into pages allocated on first
-  use, so memory follows the occupied key ranges, not the largest key.
+  use, so index pages follow the occupied key ranges. The default `Flat`
+  directory still holds one pointer per page up to the largest key; for keys
+  spread over a wide range, the `Radix` and `Tree` directories avoid that.
 - **Paged storage**: elements in pages that never move, so references stay
   valid while the container grows.
 
@@ -47,16 +49,18 @@ score.insert(a, 10);
 score.insert(b, 20);
 
 // Removing frees the slot; its next occupant gets a new generation, so the
-// stale id finds nothing, in the hive or in the side table.
+// stale id misses in the hive, and the new id misses the side-table entry
+// left by the old one. Side tables are not cleaned up automatically.
 hive.remove(a);
 let c = hive.insert("c");
 assert_eq!(c.index(), a.index());
 assert_eq!(hive.get(a), None);
 assert_eq!(score.get(c), None);
+assert_eq!(score.remove(a), Some(10));
 
 // A direct map iterates in slot order and answers range queries.
 let in_range: Vec<u32> = score.range(a..=b).map(|(_, &s)| s).collect();
-assert_eq!(in_range, [10, 20]);
+assert_eq!(in_range, [20]);
 ```
 
 Python:

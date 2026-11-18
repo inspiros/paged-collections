@@ -13,8 +13,12 @@ on:
     paths:
       - pyproject.toml
       - Cargo.toml
-      - crates/paged-collections-python/Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - python/**
+      - tests/**
       - .github/workflows/wheels.yml
+      - .github/workflows/test-wheels.sh
   workflow_call:
   workflow_dispatch:
 

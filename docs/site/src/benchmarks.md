@@ -270,7 +270,9 @@ of a key range.
 | 10⁵ range_1000 | 7,930 | 5,799 | **2,989** |
 | 10⁷ range_1000 | 8,012 | 5,863 | **3,252** |
 
-`next_occupant` is 6 to 12 times faster than `BTreeMap::range(k..).next()`.
+With `Flat`, `next_occupant` is 2.8 times faster than
+`BTreeMap::range(k..).next()` at 10³ keys and 6 to 12 times faster at 10⁵ and
+10⁷; with `Radix`, 1.3 to 6 times faster.
 Scanning a range is 2 to 2.7 times slower than a B-tree range, because the
 direct map checks every slot for occupancy.
 
@@ -452,9 +454,10 @@ ns per element
 | 10⁵ remove_half_reinsert | **12.1** | 34 | 13.1 | 29.5 | 13.2 | 14.5 |
 | 10⁷ remove_half_reinsert | **41.9** | 293 | 67.1 | 179 | 67.7 | 72.2 |
 
-`Hive` and `IdAllocator` + `PagedSparseMap` keep elements at stable
-addresses and pay for it on raw lookup speed against `slotmap`, `slab` and
-`thunderdome`, which store values in one growable vector.
+`Hive` keeps elements at stable addresses and pays for it on raw lookup speed
+against `slotmap`, `slab` and `thunderdome`, which store values in one growable
+vector. `IdAllocator` + `PagedSparseMap` also keeps values in a dense vector,
+so removal can move the last value; its cost is the extra index lookup.
 
 ## Concurrent Scaling
 

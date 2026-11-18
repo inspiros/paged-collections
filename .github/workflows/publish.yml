@@ -29,10 +29,33 @@ jobs:
     needs: check_ref
     uses: ./.github/workflows/wheels.yml
 
+  check_artifacts:
+    # Validates the Python files before anything is uploaded.
+    needs: wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+      - name: Check that the files match the tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ls dist
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              paged_collections-"$version"-*.whl|paged_collections-"$version".tar.gz) ;;
+              *) echo "::error::$f does not match tag $GITHUB_REF_NAME"; exit 1 ;;
+            esac
+          done
+
   publish_on_crates_io:
-    # Waits for the wheels too, so a broken Python build stops the release
-    # before anything is uploaded.
-    needs: [ci, wheels]
+    # Waits for CI and the Python files, so a broken build stops the release
+    # before anything is uploaded. If PyPI fails after this job succeeds, use
+    # "Re-run failed jobs": a fresh run would stop here, since the crate
+    # version is already on crates.io.
+    needs: [ci, check_artifacts]
     runs-on: ubuntu-latest
     environment: crates-io
     steps:
@@ -54,16 +77,8 @@ jobs:
           path: dist
           pattern: wheels-*
           merge-multiple: true
-      - name: Check that the files match the tag
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          ls dist
-          for f in dist/*; do
-            case "$(basename "$f")" in
-              paged_collections-"$version"-*.whl|paged_collections-"$version".tar.gz) ;;
-              *) echo "::error::$f does not match tag $GITHUB_REF_NAME"; exit 1 ;;
-            esac
-          done
-      # Trusted publishing (id-token above); configure the pypi environment
-      # as a trusted publisher on PyPI before the first release.
+      # Uses the pypi environment secret PYPI_TOKEN when set; if it is empty,
+      # falls back to trusted publishing (id-token above).
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}

@@ -6,7 +6,7 @@ existing elements.
 
 Python: `PagedList` (objects) and `PagedListF64`, `PagedListF32`,
 `PagedListI64`, `PagedListI32`, `PagedListU64`, `PagedListU32`,
-`PagedListBool`; `paged_list(dtype)` picks the class. They implement the
+`PagedListBool`; `paged_list(dtype)` creates an instance of the class for a dtype. They implement the
 `list` protocol.
 
 ## Example

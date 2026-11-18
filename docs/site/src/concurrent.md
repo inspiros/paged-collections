@@ -66,7 +66,8 @@ O(depth) lookup). `AtomicIdMap` is Flat-only; `Tree` has no concurrent form.
 
 ## Id Allocation Under Contention
 
-Freed slots go to one of 32 per-thread shards, each with its own free stack
+With `std`, freed slots go to one of 32 per-thread shards (`no_std` builds
+use one shared stack), each with its own free stack
 and block of fresh indices; a thread steals from other shards only when its
 own is empty. A single-threaded caller takes an inline fast path. Measured
 scaling is in [Benchmarks](benchmarks.md#concurrent-scaling).

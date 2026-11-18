@@ -40,9 +40,10 @@ The Rust example also prints `id_of index = 1`, the id recovered from the addres
   page is allocated, so memory follows the peak element count, not the number
   of inserts.
 - **Iteration** is in slot order (page by page), not insertion order.
-- **Memory return.** `shrink_to_fit` frees every empty page. The page keeps a
-  record of its highest generation, so earlier ids stay dead when the page is
-  reused.
+- **Memory return.** `shrink_to_fit` frees every empty page except pages
+  holding a retired slot, scanning the slots of each empty page to check. A
+  freed page keeps a record of its highest generation, so earlier ids stay
+  dead when the page is reused.
 
 ## Finding and Sorting
 

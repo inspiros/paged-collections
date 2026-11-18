@@ -8,12 +8,14 @@ classes support shared access from threads.
 
 | | Sparse set and maps | Direct maps |
 |---|---|---|
-| Shared inserts | `insert`, `insert_many`, `try_insert`, `get_or_insert` | `m[k] = v`, `insert`, `set_many` |
-| Shared removal | no | `del m[k]`, `remove` |
+| Shared inserts | set: `insert`, `insert_many`; maps: `try_insert`, `get_or_insert`, `insert_many` | `m[k] = v`, `insert`, `try_insert`, `set_many` |
+| Shared removal | no | `del m[k]`, `remove`, `remove_many` |
 | Exclusive (conflicts raise) | `remove`, `remove_many`, `clear` | `clear` |
 | Existing values on insert | kept (`try_insert` semantics) | replaced |
 
-- Default page size and `Flat` directory only.
+- Default page size and `Flat` directory only; the constructors take no
+  `page_size=`.
+- Equality and hashing are by identity, unlike the other classes.
 - Batch methods (`*_many`) release the GIL; single-key calls do not.
 - Results are copies (arrays, lists); there are no guards or views.
 - A conflicting exclusive call raises `RuntimeError("Already borrowed")`.
@@ -41,6 +43,13 @@ The other classes are safe to share but are not designed for it: a call that
 conflicts with another thread's call on the same object raises
 `RuntimeError("Already borrowed")`, or `BufferError` while views exist. Guard
 shared use of those classes with a lock.
+
+Zero-copy views (`view()`, `keys_view()`, `values_view()`) are not covered by
+those checks: NumPy reads and writes their memory directly and may release
+the GIL while doing so. Writing through a view while another thread reads or
+writes the collection, or reading a view while another thread writes the
+collection, is a data race, with or without the GIL. Hold the same lock for
+the views as for the collection, or work on copies (`keys()`, `values()`).
 
 Free-threaded 3.13t is not supported.
 

@@ -8,7 +8,7 @@ integers).
 
 Python: `DirectMap` (objects) and `DirectMapF64`, `DirectMapF32`,
 `DirectMapI64`, `DirectMapI32`, `DirectMapU64`, `DirectMapU32`,
-`DirectMapBool`; `direct_map(dtype)` picks the class.
+`DirectMapBool`; `direct_map(dtype)` creates an instance of the class for a dtype.
 
 ## Example
 
@@ -38,7 +38,7 @@ The Rust example prints the same lines, using the entry API in place of `setdefa
 |---|---|
 | get, insert, remove | O(1) with `Flat`; the first key in a page allocates the page |
 | iteration, clear, retain | O(allocated pages × `PAGE`), plus with `Flat` O(directory length) to skip unallocated pages |
-| `range`, `next_occupant`, `prev_occupant`, `first_key_value`, `last_key_value`, `pop_first`, `pop_last` | O(1) to reach the first page, then a scan of the allocated slots up to the entry |
+| `range`, `next_occupant`, `prev_occupant`, `first_key_value`, `last_key_value`, `pop_first`, `pop_last` | a seek to the first page (O(1) with `Flat`, O(depth) with `Radix` and `Tree`), then a scan of the allocated slots up to the entry; with `Flat`, unallocated directory entries in between are also skipped one by one |
 | len | O(1) |
 
 Iteration and `clear` scan every allocated slot, occupied or not, and every

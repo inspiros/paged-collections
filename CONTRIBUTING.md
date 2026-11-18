@@ -41,4 +41,4 @@ See [crates/bench/README.md](crates/bench/README.md) and
 
 1. Bump `version` in the root `Cargo.toml` (the crate and the Python package share it) and commit.
 2. Push a `vX.Y.Z` tag. This runs CI, builds and tests the wheels, and deploys the book.
-3. Run the **Publish** workflow by hand with the tag as the ref. It checks the tag against the version, reruns CI and the wheel builds, then publishes the crate to crates.io and the wheels and sdist to PyPI, in that order.
+3. Run the **Publish** workflow by hand with the tag as the ref. It checks the tag against the version, reruns CI and the wheel builds, checks the wheel and sdist names, then publishes the crate to crates.io and the wheels and sdist to PyPI, in that order. If the PyPI step fails after the crate is published, use **Re-run failed jobs** on that run; a new run would stop at crates.io.

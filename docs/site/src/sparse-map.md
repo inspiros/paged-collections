@@ -7,8 +7,8 @@ iterated or borrowed as slices without touching the index.
 
 Python: `SparseMap` holds arbitrary objects. `SparseMapF64`, `SparseMapF32`,
 `SparseMapI64`, `SparseMapI32`, `SparseMapU64`, `SparseMapU32` and
-`SparseMapBool` store values unboxed; `sparse_map(dtype)` returns the class
-for a NumPy dtype.
+`SparseMapBool` store values unboxed; `sparse_map(dtype)` returns an instance
+of the class for a NumPy dtype.
 
 ## Example
 
