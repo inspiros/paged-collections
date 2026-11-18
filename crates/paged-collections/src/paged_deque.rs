@@ -1535,6 +1535,35 @@ mod tests {
         sync::<IntoIter<u32>>();
     }
 
+    // Each check compiles only if the type lacks the trait: with it, both
+    // impls apply and the inferred parameter is ambiguous.
+    #[test]
+    fn send_sync_bounds_reject_like_standard_iterators() {
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+        trait AmbiguousIfSync<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+        <PagedDeque<Rc<u32>> as AmbiguousIfSend<_>>::check();
+        <PagedDeque<Cell<u32>> as AmbiguousIfSync<_>>::check();
+        <Pages<'_, Cell<u32>> as AmbiguousIfSend<_>>::check();
+        <Pages<'_, Cell<u32>> as AmbiguousIfSync<_>>::check();
+        <PagesMut<'_, Rc<u32>> as AmbiguousIfSend<_>>::check();
+        <PagesMut<'_, Cell<u32>> as AmbiguousIfSync<_>>::check();
+        <Iter<'_, Cell<u32>> as AmbiguousIfSend<_>>::check();
+        <Iter<'_, Cell<u32>> as AmbiguousIfSync<_>>::check();
+        <IterMut<'_, Rc<u32>> as AmbiguousIfSend<_>>::check();
+        <IterMut<'_, Cell<u32>> as AmbiguousIfSync<_>>::check();
+        <IntoIter<Rc<u32>> as AmbiguousIfSend<_>>::check();
+        <IntoIter<Cell<u32>> as AmbiguousIfSync<_>>::check();
+    }
+
     #[cfg(feature = "std")]
     mod unwind {
         use super::*;

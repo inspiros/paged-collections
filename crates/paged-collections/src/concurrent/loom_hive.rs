@@ -4,12 +4,14 @@
 extern crate std;
 
 use alloc::vec::Vec;
+use core::num::NonZeroU32;
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
 use loom::thread;
 use std::sync::atomic::{AtomicBool as StdAtomicBool, Ordering as StdOrdering};
 
 use super::ConcurrentHive;
+use crate::id_alloc::Id;
 
 fn model(f: impl Fn() + Send + Sync + 'static) {
     let mut builder = loom::model::Builder::new();
@@ -369,6 +371,80 @@ fn stale_get_during_forced_same_slot_reuse() {
         drop(hive);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
     });
+}
+
+#[test]
+fn guessed_id_lookup_races_publication_and_removal() {
+    static MARKED_WHILE_PINNED: StdAtomicBool = StdAtomicBool::new(false);
+    MARKED_WHILE_PINNED.store(false, StdOrdering::Relaxed);
+    model(|| {
+        let hive = Arc::new(ConcurrentHive::<ReleaseCheckedValue, 1>::new());
+        let guessed = Id::new(0, NonZeroU32::MIN);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Gate {
+            phase: Mutex::new(0),
+            changed: Condvar::new(),
+        });
+        let writer = hive.clone();
+        let factory_gate = gate.clone();
+        let counted = drops.clone();
+        let producer = thread::spawn(move || {
+            let id = writer.insert_with(|id| {
+                assert_eq!(id, guessed);
+                {
+                    let mut phase = factory_gate.phase.lock().unwrap();
+                    *phase = 1;
+                    factory_gate.changed.notify_one();
+                    while *phase != 2 {
+                        phase = factory_gate.changed.wait(phase).unwrap();
+                    }
+                }
+                // The gate releases before initialization. Successful get
+                // must acquire the value through the slot's live state.
+                payload.store(7, Ordering::Relaxed);
+                ReleaseCheckedValue {
+                    tag: 7,
+                    drops: counted,
+                    payload,
+                }
+            });
+            thread::yield_now();
+            assert!(writer.remove(id));
+        });
+
+        {
+            let mut phase = gate.phase.lock().unwrap();
+            while *phase != 1 {
+                phase = gate.changed.wait(phase).unwrap();
+            }
+            assert!(!hive.contains(guessed));
+            assert!(hive.get(guessed).is_none());
+            *phase = 2;
+            gate.changed.notify_one();
+        }
+        thread::yield_now();
+        if let Some(guard) = hive.get(guessed) {
+            assert_eq!(guard.id(), guessed);
+            assert_eq!(guard.tag, 7);
+            assert_eq!(guard.payload.load(Ordering::Relaxed), 7);
+            thread::yield_now();
+            if !hive.contains(guessed) {
+                // Removal invalidated new lookups while this guard is live.
+                assert!(hive.get(guessed).is_none());
+                MARKED_WHILE_PINNED.store(true, StdOrdering::Relaxed);
+            }
+            assert_eq!(guard.tag, 7);
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+        }
+
+        producer.join().unwrap();
+        assert!(!hive.contains(guessed));
+        assert!(hive.get(guessed).is_none());
+        assert!(hive.is_empty());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    });
+    assert!(MARKED_WHILE_PINNED.load(StdOrdering::Relaxed));
 }
 
 #[test]

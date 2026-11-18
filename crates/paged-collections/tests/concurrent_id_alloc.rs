@@ -29,9 +29,12 @@ fn eight_threads_keep_each_index_exclusively_owned() {
     let rounds = if cfg!(miri) { 20 } else { 20_000 };
     let max_held = if cfg!(miri) { 4 } else { 32 };
     let ids = Arc::new(ConcurrentIdAllocator::<2>::new());
-    // At most one fresh reservation per thread per round; no guessed capacity.
+    // At most one fresh reservation per thread per round. Contending threads
+    // reserve fresh indices in blocks of 64 (`index_bound`), so each fresh
+    // reservation advances the highest index by at most one block.
+    const BLOCK: usize = 64;
     let owned = Arc::new(
-        (0..THREADS * rounds)
+        (0..THREADS * rounds * BLOCK)
             .map(|_| AtomicBool::new(false))
             .collect::<Vec<_>>(),
     );

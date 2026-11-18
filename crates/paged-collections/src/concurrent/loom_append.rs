@@ -142,6 +142,67 @@ fn later_position_finishes_first_then_earlier_writer_helps_over_it() {
 }
 
 #[test]
+fn publishers_in_different_words_of_one_page_fill_the_prefix() {
+    const FIRST: usize = u64::BITS as usize - 1;
+    const SECOND: usize = FIRST + 1;
+    const PAGE: usize = SECOND + 1;
+
+    static READ_ACROSS_HOLE: CoverageFlag = CoverageFlag::new(false);
+    static READ_FULL_PREFIX: CoverageFlag = CoverageFlag::new(false);
+    READ_ACROSS_HOLE.store(false, CoverageOrdering::Relaxed);
+    READ_FULL_PREFIX.store(false, CoverageOrdering::Relaxed);
+    model(|| {
+        let log = Arc::new(AppendLog::<Value, PAGE>::new());
+        // Fill one partial word with a single batch. Both split reservations
+        // then land in the installed page, at bit 63 and bit 0 respectively.
+        let seed = (0..FIRST).map(|_| Value::new(0)).collect();
+        assert_eq!(log.push_many(seed, PAGE).ok(), Some(0));
+        assert_eq!(log.reserve_for_test(PAGE), FIRST);
+        assert_eq!(log.reserve_for_test(PAGE), SECOND);
+
+        let earlier = log.clone();
+        let a = thread::spawn(move || {
+            thread::yield_now();
+            earlier.finish_for_test(FIRST, Value::new(1));
+        });
+        let later = log.clone();
+        let b = thread::spawn(move || later.finish_for_test(SECOND, Value::new(2)));
+
+        thread::yield_now();
+        // Snapshot the watermark before point lookups can acquire ready bits.
+        let prefix = log.iter();
+        let len = prefix.len();
+        assert!((FIRST..=PAGE).contains(&len));
+        for (offset, value) in prefix.skip(FIRST).enumerate() {
+            value.check();
+            assert_eq!(value.tag, offset + 1);
+        }
+        if len == PAGE {
+            READ_FULL_PREFIX.store(true, CoverageOrdering::Relaxed);
+        } else if let Some(value) = log.get(SECOND) {
+            value.check();
+            assert_eq!(value.tag, 2);
+            // If the first position still reads as missing, the previous
+            // lookup had to acquire the second word above the watermark.
+            if len == FIRST && log.get(FIRST).is_none() {
+                READ_ACROSS_HOLE.store(true, CoverageOrdering::Relaxed);
+            }
+        }
+
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!((log.len(), log.reserved_len()), (PAGE, PAGE));
+        let expected = core::iter::repeat_n(0, FIRST).chain([1, 2]);
+        for (value, tag) in log.iter().zip(expected) {
+            assert_eq!(value.tag, tag);
+            assert_eq!(value.complement, !tag);
+        }
+    });
+    assert!(READ_ACROSS_HOLE.load(CoverageOrdering::Relaxed));
+    assert!(READ_FULL_PREFIX.load(CoverageOrdering::Relaxed));
+}
+
+#[test]
 fn helpers_cross_a_page_installation_boundary_without_losing_advance() {
     model(|| {
         let log = Arc::new(AppendLog::<usize, 2>::new());
