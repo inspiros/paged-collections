@@ -15,6 +15,11 @@ from one machine and are a reference, not a guarantee.
 
 ## Sparse Map or Direct Map
 
+<figure class="pc-figure">
+  <img src="assets/map-layouts.svg" alt="For key 9 the sparse map's page slot points to dense position 1. The direct map's page slot holds the value 90 itself." />
+  <figcaption>With the same keys and values, a sparse map iterates the dense arrays. A direct map visits slots in ascending key order for integer keys.</figcaption>
+</figure>
+
 | | `PagedSparseMap` | `PagedDirectMap` |
 |---|---|---|
 | Where values live | dense array, parallel to the keys | in the page slot |

@@ -8,6 +8,11 @@ pages are kept at the back and reused at either end.
 Python: `PagedDeque` follows `collections.deque` (CPython 3.12 semantics),
 including `maxlen`, `rotate` and the comparison operators.
 
+<figure class="pc-figure">
+  <img src="assets/deque-ends.svg" alt="A two-page deque with existing elements A, B, C and D. A front push puts L before A, and a back push puts R after D." />
+  <figcaption>Each push uses a free slot at its end of the deque. A push across a page boundary uses another page.</figcaption>
+</figure>
+
 ## Example
 
 <div class="lang-tabs">

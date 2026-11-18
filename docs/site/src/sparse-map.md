@@ -5,6 +5,8 @@ of keys plus a dense value array kept parallel to the dense keys: the value at
 position `i` belongs to the key at position `i`. Keys and values can be
 iterated or borrowed as slices without touching the index.
 
+See [where sparse and direct maps store their values](choosing.md#sparse-map-or-direct-map).
+
 Python: `SparseMap` holds arbitrary objects. `SparseMapF64`, `SparseMapF32`,
 `SparseMapI64`, `SparseMapI32`, `SparseMapU64`, `SparseMapU32` and
 `SparseMapBool` store values unboxed; `sparse_map(dtype)` returns an instance

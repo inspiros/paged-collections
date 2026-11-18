@@ -10,6 +10,11 @@ Python: `PriorityQueue` (int64 priorities) and `PriorityQueueF64` (float64);
 `min=True` makes either a min-queue. Pushing a present key changes its
 priority.
 
+<figure class="pc-figure">
+  <img src="assets/priority-queue-heap.svg" alt="In a four-way max-heap, key 7 has the highest priority, 80. The paged index locates key 9 at heap position 2." />
+  <figcaption><code>pop</code> takes the root of the heap. Updating key 9 starts at position 2, and the entry moves if its new priority requires it.</figcaption>
+</figure>
+
 ## Example
 
 <div class="lang-tabs">

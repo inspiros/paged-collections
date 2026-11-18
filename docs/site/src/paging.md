@@ -1,9 +1,5 @@
 # Paging Model
 
-<figure class="pc-hero">
-  <img src="assets/paged-index.svg" alt="A key splits into a page number and an offset; the directory points to pages allocated on first use" />
-</figure>
-
 ## Paged Index
 
 Keyed collections map each key to a *slot index* (the integer itself, or the
@@ -18,6 +14,11 @@ offset = index % PAGE
 A *directory* maps page numbers to pages. A page is a fixed array of `PAGE`
 slots, allocated on the first write into it. Lookups into an unallocated page
 return "absent" without allocating.
+
+<figure class="pc-figure">
+  <img src="assets/paged-index.svg" alt="The Flat directory has entries for pages 0, 1 and 2. Entries 0 and 2 point to allocated pages, while entry 1 is empty." />
+  <figcaption>With four slots per page, key 9 selects page 2 at offset 1. In this sparse index, that slot stores dense position 3.</figcaption>
+</figure>
 
 What a slot holds depends on the collection:
 
@@ -78,19 +79,20 @@ for each key pattern. In Python, pass `page_size=` (see
 
 ## Paged Storage
 
-<figure class="pc-hero">
-  <img src="assets/paged-storage.svg" alt="Vec push reallocates and copies, leaving a dangling reference; PagedVec push adds a page, only the pointer array grows, and the reference stays valid" />
+`PagedVec`, `PagedDeque` and `Hive` keep elements in pages of `PAGE` elements.
+A page is allocated once and never reallocated. When the container needs
+more slots, it adds a page and may grow the directory of page pointers.
+
+<figure class="pc-figure">
+  <img src="assets/paged-storage.svg" alt="A and B move when the Vec buffer moves to make room for C. In PagedVec, A and B stay on the first page and C goes on a second page." />
+  <figcaption>A full <code>Vec</code> can move its buffer when it grows. A <code>PagedVec</code> preserves the addresses of existing elements as it adds pages.</figcaption>
 </figure>
 
-`PagedVec`, `PagedDeque` and `Hive` keep elements in pages of `PAGE` elements.
-A page is allocated once and never reallocated. Growth appends a page and, at
-most, grows the directory of page pointers, which is `PAGE` times shorter
-than the element array. Consequences:
-
-- An element keeps its address while it stays at its position (vector, deque)
-  or in its slot (hive).
-- Growth never copies elements; the worst-case push is one page allocation
-  plus a directory copy.
+- Pushing preserves the addresses of existing elements, including when a
+  front push changes their logical indices in a deque. Edits such as
+  inserting into the middle of a sequence can move elements.
+- At a page boundary, a push may allocate a page and copy the directory of
+  page pointers.
 - The elements are not one contiguous slice. Slices are available per page
   (`pages()` in Rust, `page_view()` for typed Python lists).
 

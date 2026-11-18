@@ -8,6 +8,11 @@ matches a live one. Comparable in purpose to C++26 `std::hive`.
 
 Python: `Hive`; ids are integers packed as `generation << 32 | index`.
 
+<figure class="pc-figure">
+  <img src="assets/hive-slot-reuse.svg" alt="Removing A vacates slot 5. Inserting B reuses slot 5 with generation 2." />
+  <figcaption>The original id for slot 5 and generation 1 is stale. Looking it up misses even after B occupies the same slot.</figcaption>
+</figure>
+
 ## Example
 
 <div class="lang-tabs">

@@ -2,8 +2,9 @@
 
 <!-- Uncomment after the first release.
 [![crates.io](https://img.shields.io/crates/v/paged-collections)](https://crates.io/crates/paged-collections)
-[![docs.rs](https://img.shields.io/docsrs/paged-collections)](https://docs.rs/paged-collections)
+[![crates.io downloads](https://img.shields.io/crates/d/paged-collections)](https://crates.io/crates/paged-collections)
 [![PyPI](https://img.shields.io/pypi/v/paged-collections)](https://pypi.org/project/paged-collections/)
+[![PyPI monthly downloads](https://img.shields.io/pypi/dm/paged-collections)](https://pypi.org/project/paged-collections/)
 -->
 [![CI](https://img.shields.io/github/actions/workflow/status/inspiros/paged-collections/ci.yml?label=CI)](https://github.com/inspiros/paged-collections/actions/workflows/ci.yml)
 [![Documentation](https://img.shields.io/badge/docs-website-475d7a?logo=mdbook&logoColor=white)](https://inspiros.github.io/paged-collections/)
@@ -12,20 +13,23 @@
 Paged sparse sets, maps, a priority queue and stable-address containers for
 Rust (`no_std` + `alloc`), with Python bindings built on PyO3 and NumPy.
 
+<p align="center">
+  <img src="docs/site/src/assets/paging-overview.svg" alt="A paged index allocates pages on demand. Paged storage grows by adding pages without moving existing elements.">
+</p>
+
 - **Paged index**: a key-indexed table split into pages allocated on first
   use, so index pages follow the occupied key ranges. The default `Flat`
   directory still holds one pointer per page up to the largest key; for keys
   spread over a wide range, the `Radix` and `Tree` directories avoid that.
-- **Paged storage**: elements in pages that never move, so references stay
-  valid while the container grows.
+- **Paged storage**: elements keep their addresses as the container grows.
 
 > Status: in development, not yet published.
 
 ## Install
 
 ```sh
-cargo add paged-collections                         # features: std (default), serde, concurrent
-pip install paged-collections                       # Python 3.10+, NumPy 1.24+
+cargo add paged-collections             # features: std (default), serde, concurrent
+pip install paged-collections           # Python 3.10+, NumPy 1.24+
 ```
 
 Wheels cover CPython 3.10+ (`abi3`) and free-threaded 3.14t and 3.15t+.
@@ -112,13 +116,18 @@ maps.
 ## Layout
 
 ```text
-crates/paged-collections/         Rust library (no_std + alloc)
-crates/paged-collections-python/  PyO3 bindings (the `_core` extension)
-crates/bench/                     Rust benchmarks (not a default member)
-python/paged_collections/         Python sources and type stubs
-tests/                            Python tests
-benchmarks/python/                Python benchmarks
-docs/site/                        mdBook documentation
+paged-collections/
+├── crates/
+│   ├── paged-collections/         # Rust library (no_std + alloc)
+│   ├── paged-collections-python/  # PyO3 bindings for the _core extension
+│   └── bench/                     # Rust benchmarks outside the default build
+├── python/
+│   └── paged_collections/         # Python sources and type stubs
+├── tests/                         # Python tests
+├── benchmarks/
+│   └── python/                    # Python benchmarks
+└── docs/
+    └── site/                      # mdBook documentation
 ```
 
 Development commands are in [CONTRIBUTING.md](CONTRIBUTING.md).

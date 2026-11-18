@@ -5,6 +5,10 @@ stable-address containers whose memory is split into fixed-size pages. The
 core is a `no_std` Rust crate (`alloc` only); the Python package wraps it with
 PyO3 and exchanges batches with NumPy.
 
+<figure class="pc-figure pc-figure-wide">
+  <img src="assets/paging-overview.svg" alt="A paged index can leave some pages unallocated. Paged storage can add a page while existing elements stay at their addresses." />
+</figure>
+
 <nav class="pc-quicklinks" aria-label="Documentation links">
   <a href="installation.md">Installation &rarr;</a>
   <a href="choosing.md">Choosing a Container</a>
@@ -23,12 +27,12 @@ PyO3 and exchanges batches with NumPy.
 ## Two Uses of Paging
 
 - **Paged index.** A table indexed by key is split into pages allocated on
-  first use. Memory follows the occupied key ranges, not the largest key: a
-  flat sparse array for key `4_000_000_000` needs 16 GB, a paged one needs one
-  page. Used by the sparse set and map, the direct map and the priority queue.
-- **Paged storage.** Elements live in pages that are never reallocated, so
-  references stay valid while the container grows, and growth never copies
-  existing elements. Used by the paged vector, the deque and the hive.
+  first use. A write to an isolated key allocates only the page it touches.
+  With the default `Flat` directory, the pointer table still grows up to the
+  highest page number used. Sparse sets, sparse maps, direct maps and priority
+  queues use a paged index.
+- **Paged storage.** Growth adds pages while existing elements stay at their
+  addresses. The paged vector, deque and hive use paged storage.
 
 See [Paging Model](paging.md) for page sizes, directories and memory behaviour.
 

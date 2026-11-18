@@ -6,6 +6,8 @@ lookup is one page lookup and one slot read, entries never move, and
 iteration visits entries in ascending slot-index order (key order for
 integers).
 
+See [where sparse and direct maps store their values](choosing.md#sparse-map-or-direct-map).
+
 Python: `DirectMap` (objects) and `DirectMapF64`, `DirectMapF32`,
 `DirectMapI64`, `DirectMapI32`, `DirectMapU64`, `DirectMapU32`,
 `DirectMapBool`; `direct_map(dtype)` creates an instance of the class for a dtype.

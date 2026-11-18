@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="165" viewBox="0 0 480 165" role="img" aria-labelledby="title desc">
+  <title id="title">A hive slot gets a new generation when reused</title>
+  <desc id="desc">Removing A vacates slot 5. Inserting B reuses slot 5 with generation 2. The old id for slot 5, generation 1, misses.</desc>
+  <style>
+    text { fill: #202b45; font: 600 17px system-ui, sans-serif; }
+    .heading { font-size: 20px; font-weight: 700; }
+    .small { fill: #53627c; font-size: 16px; font-weight: 500; }
+    .mono { font-family: ui-monospace, monospace; }
+    .frame { fill: #f7f8fc; stroke: #d2daea; }
+    .empty { fill: none; stroke: #8795b0; stroke-dasharray: 4 3; }
+    .index { fill: #e7e9ff; stroke: #3730a3; }
+    .storage { fill: #def6ed; stroke: #0c6656; }
+    .connector { fill: none; stroke: #8795b0; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+    .arrowhead { fill: #8795b0; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #edf2fc; }
+      .small { fill: #becbe3; }
+      .frame { fill: #141e32; stroke: #41516e; }
+      .empty { stroke: #8294b6; }
+      .index { fill: #2d3565; stroke: #c1c7ff; }
+      .storage { fill: #193f42; stroke: #9aead1; }
+      .connector { stroke: #8294b6; }
+      .arrowhead { fill: #8294b6; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path class="arrowhead" d="M0 0 L8 4 L0 8 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="frame" x="0.5" y="0.5" width="479" height="164" rx="16"/>
+  <text x="22" y="34" class="heading">Slot 5 in a hive page</text>
+  <text x="78" y="66" text-anchor="middle">Live</text>
+  <rect class="storage" x="22" y="78" width="112" height="40" rx="8"/>
+  <text x="78" y="104" class="mono" text-anchor="middle">A</text>
+  <text x="78" y="142" class="small" text-anchor="middle">Generation 1</text>
+  <text x="240" y="66" text-anchor="middle">Free</text>
+  <rect class="empty" x="184" y="78" width="112" height="40" rx="8"/>
+  <text x="240" y="104" class="mono" text-anchor="middle">–</text>
+  <text x="240" y="142" class="small" text-anchor="middle">Vacant</text>
+  <text x="402" y="66" text-anchor="middle">Reused</text>
+  <rect class="index" x="346" y="78" width="112" height="40" rx="8"/>
+  <text x="402" y="104" class="mono" text-anchor="middle">B</text>
+  <text x="402" y="142" class="small" text-anchor="middle">Generation 2</text>
+  <path class="connector" d="M145 98 H172" marker-end="url(#arrow)"/>
+  <path class="connector" d="M307 98 H334" marker-end="url(#arrow)"/>
+</svg>

@@ -4,6 +4,8 @@
 page is allocated once and never reallocated, so pushing never moves or copies
 existing elements.
 
+See [how paged storage grows](paging.md#paged-storage).
+
 Python: `PagedList` (objects) and `PagedListF64`, `PagedListF32`,
 `PagedListI64`, `PagedListI32`, `PagedListU64`, `PagedListU32`,
 `PagedListBool`; `paged_list(dtype)` creates an instance of the class for a dtype. They implement the

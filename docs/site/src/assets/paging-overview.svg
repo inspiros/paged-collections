@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="178" viewBox="0 0 480 178" role="img" aria-labelledby="title desc">
+  <title id="title">Two ways to page a collection</title>
+  <desc id="desc">A paged index can leave unused page numbers unallocated. Paged storage grows by adding a page while existing elements stay at their addresses.</desc>
+  <style>
+    text { fill: #202b45; font: 600 17px system-ui, sans-serif; }
+    .heading { font-size: 20px; font-weight: 700; }
+    .small { fill: #53627c; font-size: 16px; font-weight: 500; }
+    .index-text { fill: #3730a3; }
+    .storage-text { fill: #0c6656; }
+    .frame { fill: #f7f8fc; stroke: #d2daea; }
+    .panel { fill: #ffffff; stroke: #d2daea; }
+    .cell { fill: #ffffff; stroke: #8795b0; }
+    .empty { fill: none; stroke: #8795b0; stroke-dasharray: 4 3; }
+    .index { fill: #e7e9ff; stroke: #3730a3; }
+    .storage { fill: #def6ed; stroke: #0c6656; }
+    .connector { fill: none; stroke: #8795b0; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #edf2fc; }
+      .small { fill: #becbe3; }
+      .index-text { fill: #c1c7ff; }
+      .storage-text { fill: #9aead1; }
+      .frame { fill: #141e32; stroke: #41516e; }
+      .panel { fill: #1c2940; stroke: #41516e; }
+      .cell { fill: #1c2940; stroke: #8294b6; }
+      .empty { stroke: #8294b6; }
+      .index { fill: #2d3565; stroke: #c1c7ff; }
+      .storage { fill: #193f42; stroke: #9aead1; }
+      .connector { stroke: #8294b6; }
+    }
+  </style>
+  <rect class="frame" x="0.5" y="0.5" width="479" height="177" rx="16"/>
+  <rect class="panel" x="12" y="12" width="222" height="154" rx="12"/>
+  <rect class="panel" x="246" y="12" width="222" height="154" rx="12"/>
+  <text x="27" y="43" class="heading index-text">Paged index</text>
+  <text x="261" y="43" class="heading storage-text">Paged storage</text>
+
+  <!-- Allocated pages surround an unused page number. -->
+  <rect class="index" x="27" y="65" width="52" height="54" rx="8"/>
+  <rect class="index" x="36" y="83" width="9" height="18" rx="2"/>
+  <rect class="cell" x="48" y="83" width="9" height="18" rx="2"/>
+  <rect class="index" x="60" y="83" width="9" height="18" rx="2"/>
+  <rect class="empty" x="97" y="65" width="52" height="54" rx="8"/>
+  <rect class="index" x="167" y="65" width="52" height="54" rx="8"/>
+  <rect class="cell" x="176" y="83" width="9" height="18" rx="2"/>
+  <rect class="index" x="188" y="83" width="9" height="18" rx="2"/>
+  <rect class="cell" x="200" y="83" width="9" height="18" rx="2"/>
+
+  <!-- An existing page stays in place while a new page is added. -->
+  <rect class="storage" x="261" y="65" width="52" height="54" rx="8"/>
+  <rect class="storage" x="270" y="83" width="9" height="18" rx="2"/>
+  <rect class="storage" x="282" y="83" width="9" height="18" rx="2"/>
+  <rect class="storage" x="294" y="83" width="9" height="18" rx="2"/>
+  <rect class="storage" x="401" y="65" width="52" height="54" rx="8"/>
+  <rect class="storage" x="410" y="83" width="9" height="18" rx="2"/>
+  <rect class="empty" x="422" y="83" width="9" height="18" rx="2"/>
+  <rect class="empty" x="434" y="83" width="9" height="18" rx="2"/>
+  <path class="connector" d="M348 92 H366 M357 83 V101"/>
+  <text x="27" y="145" class="small">Allocate pages as needed</text>
+  <text x="261" y="145" class="small">Keep elements in place</text>
+</svg>

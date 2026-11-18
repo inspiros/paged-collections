@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="272" viewBox="0 0 480 272" role="img" aria-labelledby="title desc">
+  <title id="title">Where sparse and direct maps store values</title>
+  <desc id="desc">A sparse map uses the slot for key 9 to find position 1 in parallel arrays of keys and values. A direct map stores the value 90 in the key 9 slot itself.</desc>
+  <style>
+    text { fill: #202b45; font: 600 17px system-ui, sans-serif; }
+    .heading { font-size: 20px; font-weight: 700; }
+    .small { fill: #53627c; font-size: 16px; font-weight: 500; }
+    .mono { font-family: ui-monospace, monospace; }
+    .index-text { fill: #3730a3; }
+    .frame { fill: #f7f8fc; stroke: #d2daea; }
+    .cell { fill: #ffffff; stroke: #8795b0; }
+    .empty { fill: none; stroke: #8795b0; stroke-dasharray: 4 3; }
+    .index { fill: #e7e9ff; stroke: #3730a3; }
+    .rule { fill: none; stroke: #d2daea; }
+    .connector { fill: none; stroke: #8795b0; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+    .index-line { stroke: #3730a3; }
+    .index-arrowhead { fill: #3730a3; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #edf2fc; }
+      .small { fill: #becbe3; }
+      .index-text { fill: #c1c7ff; }
+      .frame { fill: #141e32; stroke: #41516e; }
+      .cell { fill: #1c2940; stroke: #8294b6; }
+      .empty { stroke: #8294b6; }
+      .index { fill: #2d3565; stroke: #c1c7ff; }
+      .rule { stroke: #41516e; }
+      .connector { stroke: #8294b6; }
+      .index-line { stroke: #c1c7ff; }
+      .index-arrowhead { fill: #c1c7ff; }
+    }
+  </style>
+  <defs>
+    <marker id="index" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path class="index-arrowhead" d="M0 0 L8 4 L0 8 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="frame" x="0.5" y="0.5" width="479" height="271" rx="16"/>
+  <text x="22" y="39" class="heading">Sparse map</text>
+  <text x="22" y="81" class="small">Page slot for key 9</text>
+  <rect class="index" x="22" y="92" width="152" height="36" rx="6"/>
+  <text x="98" y="116" class="index-text" text-anchor="middle">Position 1</text>
+
+  <!-- The sparse index points to the key and value at the same dense position. -->
+  <path class="connector index-line" d="M174 110 H204 V60 H424 V81" marker-end="url(#index)"/>
+  <text x="235" y="108" class="small">Keys</text>
+  <text x="235" y="151" class="small">Values</text>
+  <rect class="cell" x="319" y="85" width="64" height="35" rx="6"/>
+  <text x="351.0" y="108.5" class="mono" text-anchor="middle">11</text>
+  <rect class="index" x="392" y="85" width="64" height="35" rx="6"/>
+  <text x="424.0" y="108.5" class="mono index-text" text-anchor="middle">9</text>
+  <rect class="cell" x="319" y="128" width="64" height="35" rx="6"/>
+  <text x="351.0" y="151.5" class="mono" text-anchor="middle">110</text>
+  <rect class="index" x="392" y="128" width="64" height="35" rx="6"/>
+  <text x="424.0" y="151.5" class="mono index-text" text-anchor="middle">90</text>
+  <path class="rule" d="M22 181 H458"/>
+
+  <!-- A direct map stores the values in the page slots themselves. -->
+  <text x="22" y="218" class="heading">Direct map</text>
+  <text x="22" y="241" class="small">Page slots for keys 8–11</text>
+  <text x="255" y="211" class="small mono" text-anchor="middle">8</text>
+  <text x="314" y="211" class="small mono" text-anchor="middle">9</text>
+  <text x="373" y="211" class="small mono" text-anchor="middle">10</text>
+  <text x="432" y="211" class="small mono" text-anchor="middle">11</text>
+  <rect class="empty" x="228" y="219" width="54" height="35" rx="6"/>
+  <text x="255.0" y="242.5" class="mono small" text-anchor="middle">–</text>
+  <rect class="index" x="287" y="219" width="54" height="35" rx="6"/>
+  <text x="314.0" y="242.5" class="mono index-text" text-anchor="middle">90</text>
+  <rect class="empty" x="346" y="219" width="54" height="35" rx="6"/>
+  <text x="373.0" y="242.5" class="mono small" text-anchor="middle">–</text>
+  <rect class="cell" x="405" y="219" width="54" height="35" rx="6"/>
+  <text x="432.0" y="242.5" class="mono" text-anchor="middle">110</text>
+</svg>

@@ -46,6 +46,11 @@ swaps the last key into the removed position (O(1)), so removal changes the
 order. `sort` and its variants reorder the dense array; sorted order then
 lasts until the next removal or insertion out of order.
 
+<figure class="pc-figure">
+  <img src="assets/sparse-set-removal.svg" alt="Removing 9 from the dense keys 11, 9, 2 moves the last key, 2, into the middle slot." />
+  <figcaption>Swap removal updates the sparse index for the moved key. Iteration now yields 11, then 2.</figcaption>
+</figure>
+
 ## Generational Keys
 
 The set holds at most one key per slot index. With generational keys,

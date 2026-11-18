@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="266" viewBox="0 0 480 266" role="img" aria-labelledby="title desc">
+  <title id="title">A paged index into a four-way max-heap</title>
+  <desc id="desc">Key 7 with priority 80 is the root. The paged index gives position 2 for key 9, whose priority is 40.</desc>
+  <style>
+    text { fill: #202b45; font: 600 17px system-ui, sans-serif; }
+    .heading { font-size: 20px; font-weight: 700; }
+    .small { fill: #53627c; font-size: 16px; font-weight: 500; }
+    .mono { font-family: ui-monospace, monospace; }
+    .index-text { fill: #3730a3; }
+    .storage-text { fill: #0c6656; }
+    .frame { fill: #f7f8fc; stroke: #d2daea; }
+    .panel { fill: #ffffff; stroke: #d2daea; }
+    .cell { fill: #ffffff; stroke: #8795b0; }
+    .index { fill: #e7e9ff; stroke: #3730a3; }
+    .storage { fill: #def6ed; stroke: #0c6656; }
+    .connector { fill: none; stroke: #8795b0; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+    .index-line { stroke: #3730a3; }
+    .index-arrowhead { fill: #3730a3; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #edf2fc; }
+      .small { fill: #becbe3; }
+      .index-text { fill: #c1c7ff; }
+      .storage-text { fill: #9aead1; }
+      .frame { fill: #141e32; stroke: #41516e; }
+      .panel { fill: #1c2940; stroke: #41516e; }
+      .cell { fill: #1c2940; stroke: #8294b6; }
+      .index { fill: #2d3565; stroke: #c1c7ff; }
+      .storage { fill: #193f42; stroke: #9aead1; }
+      .connector { stroke: #8294b6; }
+      .index-line { stroke: #c1c7ff; }
+      .index-arrowhead { fill: #c1c7ff; }
+    }
+  </style>
+  <defs>
+    <marker id="index" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path class="index-arrowhead" d="M0 0 L8 4 L0 8 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="frame" x="0.5" y="0.5" width="479" height="265" rx="16"/>
+  <text x="22" y="36" class="heading">Max-heap</text>
+  <text x="22" y="61" class="small">Key / priority</text>
+  <rect class="storage" x="196" y="43" width="88" height="50" rx="8"/>
+  <text x="240" y="74" class="mono storage-text" text-anchor="middle">7 / 80</text>
+  <text x="296" y="65" class="small storage-text">Max at position 0</text>
+  <path class="connector" d="M240 93 V118 M68 118 H413 M68 118 V141 M183 118 V141 M298 118 V141 M413 118 V141"/>
+  <rect class="cell" x="24" y="141" width="88" height="46" rx="8"/>
+  <text x="68" y="170" class="mono" text-anchor="middle">3 / 55</text>
+  <rect class="index" x="139" y="141" width="88" height="46" rx="8"/>
+  <text x="183" y="170" class="mono index-text" text-anchor="middle">9 / 40</text>
+  <rect class="cell" x="254" y="141" width="88" height="46" rx="8"/>
+  <text x="298" y="170" class="mono" text-anchor="middle">2 / 35</text>
+  <rect class="cell" x="369" y="141" width="88" height="46" rx="8"/>
+  <text x="413" y="170" class="mono" text-anchor="middle">1 / 60</text>
+  <rect class="panel" x="22" y="217" width="436" height="30" rx="8"/>
+  <text x="35" y="237" class="small index-text">Paged index finds key 9 at position 2</text>
+  <path class="connector index-line" d="M183 217 V191" marker-end="url(#index)"/>
+</svg>

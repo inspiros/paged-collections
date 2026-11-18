@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="142" viewBox="0 0 480 142" role="img" aria-labelledby="title desc">
+  <title id="title">Swap removal from a sparse set</title>
+  <desc id="desc">Removing 9 from dense keys 11, 9, 2 moves the last key 2 into the vacated position, leaving 11, 2.</desc>
+  <style>
+    text { fill: #202b45; font: 600 17px system-ui, sans-serif; }
+    .heading { font-size: 20px; font-weight: 700; }
+    .mono { font-family: ui-monospace, monospace; }
+    .index-text { fill: #3730a3; }
+    .frame { fill: #f7f8fc; stroke: #d2daea; }
+    .cell { fill: #ffffff; stroke: #8795b0; }
+    .index { fill: #e7e9ff; stroke: #3730a3; }
+    .connector { fill: none; stroke: #8795b0; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+    .index-line { stroke: #3730a3; }
+    .arrowhead { fill: #8795b0; }
+    .index-arrowhead { fill: #3730a3; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #edf2fc; }
+      .index-text { fill: #c1c7ff; }
+      .frame { fill: #141e32; stroke: #41516e; }
+      .cell { fill: #1c2940; stroke: #8294b6; }
+      .index { fill: #2d3565; stroke: #c1c7ff; }
+      .connector { stroke: #8294b6; }
+      .index-line { stroke: #c1c7ff; }
+      .arrowhead { fill: #8294b6; }
+      .index-arrowhead { fill: #c1c7ff; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path class="arrowhead" d="M0 0 L8 4 L0 8 Z"/>
+    </marker>
+    <marker id="index" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path class="index-arrowhead" d="M0 0 L8 4 L0 8 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="frame" x="0.5" y="0.5" width="479" height="141" rx="16"/>
+  <text x="22" y="35" class="heading">Before</text>
+  <text x="270" y="35" class="heading">After removing 9</text>
+  <rect class="cell" x="22" y="56" width="48" height="42" rx="6"/>
+  <text x="46.0" y="83.0" class="mono" text-anchor="middle">11</text>
+  <rect class="cell" x="76" y="56" width="48" height="42" rx="6"/>
+  <text x="100.0" y="83.0" class="mono" text-anchor="middle">9</text>
+  <rect class="index" x="130" y="56" width="48" height="42" rx="6"/>
+  <text x="154.0" y="83.0" class="mono index-text" text-anchor="middle">2</text>
+  <rect class="cell" x="270" y="56" width="48" height="42" rx="6"/>
+  <text x="294.0" y="83.0" class="mono" text-anchor="middle">11</text>
+  <rect class="index" x="324" y="56" width="48" height="42" rx="6"/>
+  <text x="348.0" y="83.0" class="mono index-text" text-anchor="middle">2</text>
+  <path class="connector" d="M199 77 H249" marker-end="url(#arrow)"/>
+  <path class="connector index-line" d="M154 104 V117 H348 V104" marker-end="url(#index)"/>
+</svg>
