@@ -72,4 +72,4 @@ The Rust example prints `range = [30, 20]` in place of the last line: it queries
 
 Thread-safe variants are listed under [Concurrent Containers](concurrent.md).
 The full Rust API is on [docs.rs](https://docs.rs/paged-collections); the
-Python API is typed in [`_core.pyi`](https://github.com/inspiros/paged-collections/blob/main/python/paged_collections/_core.pyi).
+Python API is typed in [`_core.pyi`](https://github.com/inspiros/paged-collections/blob/master/python/paged_collections/_core.pyi).

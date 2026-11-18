@@ -62,8 +62,8 @@ python benchmarks/python/concurrent_scaling.py --threads 1 2 4 8 --repeat 7
 
 The largest cases need tens of GiB of memory; pass a Criterion filter
 (for example `-- /1000/`) on smaller machines. Source:
-[`crates/bench`](https://github.com/inspiros/paged-collections/tree/main/crates/bench),
-[`benchmarks/python`](https://github.com/inspiros/paged-collections/tree/main/benchmarks/python).
+[`crates/bench`](https://github.com/inspiros/paged-collections/tree/master/crates/bench),
+[`benchmarks/python`](https://github.com/inspiros/paged-collections/tree/master/benchmarks/python).
 
 ## Keyed Collections
 

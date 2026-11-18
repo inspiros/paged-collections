@@ -6,13 +6,18 @@ publish = false
 
 [dependencies]
 paged-collections = { path = "../paged-collections", features = ["concurrent"] }
-criterion = "0.5"
 hashbrown = "0.17"
 rustc-hash = "2"
 slotmap = "1"
 slab = "0.4"
 thunderdome = "0.6"
 priority-queue = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+# Benchmark harness: the workspace's documentation lints do not apply.
+[lints]
 
 [[bench]]
 name = "sparse"

@@ -24,5 +24,5 @@ Module constants: `KEY_LIMIT` (2**32), `MAX_GENERATION` (2**31),
 Reference documentation:
 
 - Rust: [docs.rs/paged-collections](https://docs.rs/paged-collections)
-- Python: [`_core.pyi`](https://github.com/inspiros/paged-collections/blob/main/python/paged_collections/_core.pyi)
+- Python: [`_core.pyi`](https://github.com/inspiros/paged-collections/blob/master/python/paged_collections/_core.pyi)
   (type stubs; also used by IDEs)

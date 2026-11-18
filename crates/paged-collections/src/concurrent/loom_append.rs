@@ -494,7 +494,7 @@ fn two_batches_cross_pages_and_help_the_entire_ready_run() {
         }
         let starts: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
         assert!(starts == [1, 3] || starts == [3, 1]);
-        assert!(starts.iter().all(|&s| s / 2 != (s + 1) / 2));
+        assert!(starts.iter().all(|&s| s / 2 != s.div_ceil(2)));
         BOTH_CROSSED.store(true, CoverageOrdering::Relaxed);
         assert_eq!((log.len(), log.reserved_len()), (5, 5));
         for (tag, start) in starts.into_iter().enumerate() {

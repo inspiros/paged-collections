@@ -105,7 +105,7 @@ pub(super) static SPLICE_RETRIED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Makes the calling loom thread use `shard` (default 0).
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 pub(super) fn set_loom_shard(shard: usize) {
     assert!(shard < SHARDS);
     LOOM_SHARD.with(|cell| cell.set(shard));
