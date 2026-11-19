@@ -2,7 +2,7 @@
 
 ## Pickle and Copy
 
-All non-concurrent classes support `pickle`, `copy.copy` and `copy.deepcopy`.
+All classes support `pickle`, `copy.copy` and `copy.deepcopy`.
 
 - The page size is part of the pickled state. Pickles made before
   `page_size=` existed load with page size 1024.
@@ -10,7 +10,8 @@ All non-concurrent classes support `pickle`, `copy.copy` and `copy.deepcopy`.
   stay valid across a round trip. A `Hive` rebuilds its free lists on load,
   so the slot the next insert takes can differ from the original. Restoring an older pickle revives ids
   removed since it was taken (see [Hive](hive.md#limits-and-stale-ids)).
-- Concurrent classes raise on pickling.
+- Concurrent classes pickle a snapshot of their contents (see
+  [Python threads](python-threads.md#concurrent-classes)).
 
 Loading a pickle whose page size the running build does not include raises
 `ValueError` (see [page sizes](installation.md#page-sizes)).

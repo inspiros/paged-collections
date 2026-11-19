@@ -21,7 +21,13 @@ classes support shared access from threads.
 - A conflicting exclusive call raises `RuntimeError("Already borrowed")`.
 - Direct-map snapshots (`keys`, `values`, `items`) are in key order.
 - `len()` is exact only when no write is in flight.
-- Not picklable.
+- Constructors take initial contents like the plain classes:
+  `ConcurrentSparseSet(keys)` and `ConcurrentSparseMapF64(keys, values)`,
+  from NumPy arrays or sequences, validated before any write. Later duplicate
+  keys win, even in the insert-only sparse maps.
+- `pickle`, `copy.copy`, `copy.deepcopy` and `copy()` take one snapshot,
+  with the same consistency as `items()`: entries inserted or removed during
+  the call may or may not be included, but keys and values always pair up.
 
 ## Example
 

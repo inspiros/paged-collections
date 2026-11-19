@@ -1,6 +1,7 @@
 """Copied concurrent APIs, conversion contracts and shared-call threading."""
 
 from concurrent.futures import ThreadPoolExecutor
+import copy
 import pickle
 import random
 import threading
@@ -254,20 +255,98 @@ def test_seeded_dict_oracle(map_cls):
 
 
 @pytest.mark.parametrize("cls", CLASSES, ids=lambda cls: cls.__name__)
-def test_exports_and_no_pickling_or_page_size(cls):
+def test_exports_and_no_page_size(cls):
     assert cls.__name__ in pc.__all__
     value = cls()
-    with pytest.raises(TypeError, match="does not support pickling"):
-        value.__reduce__()
-    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
-        with pytest.raises(TypeError, match="does not support pickling"):
-            pickle.dumps(value, protocol=protocol)
     with pytest.raises(TypeError):
         cls(page_size=1024)
     with pytest.raises(TypeError):
         memoryview(value)
     assert not hasattr(value, "keys_view")
     assert not hasattr(value, "values_view")
+
+
+def test_set_constructor_pickle_and_copy():
+    keys = np.array([7, 3, 7, 4096, 3, 0], dtype=np.uint32)
+    for source in (keys, keys.tolist(), keys.astype(np.int64), range(0)):
+        s = pc.ConcurrentSparseSet(source)
+        expected = list(dict.fromkeys(int(k) for k in source))
+        assert s.keys().tolist() == expected
+    s = pc.ConcurrentSparseSet(keys)
+    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+        restored = pickle.loads(pickle.dumps(s, protocol=protocol))
+        assert type(restored) is pc.ConcurrentSparseSet
+        assert restored.keys().tolist() == [7, 3, 4096, 0]
+    for clone in (s.copy(), copy.copy(s), copy.deepcopy(s)):
+        assert clone is not s
+        assert clone.keys().tolist() == [7, 3, 4096, 0]
+        clone.insert(5)
+        clone.remove(7)
+    assert s.keys().tolist() == [7, 3, 4096, 0]
+    for bad in ([1, -1], [2**32], [1.5], [[1, 2]]):
+        with pytest.raises((OverflowError, ValueError, TypeError)):
+            pc.ConcurrentSparseSet(bad)
+
+
+def test_map_constructor_pickle_and_copy(map_cls):
+    a, b, c = _values(map_cls, [1, 2, 3])
+    # Later duplicates win in the constructor, as for the plain maps.
+    keys = np.array([9, 2, 9, 5000], dtype=np.uint32)
+    values = np.array([a, b, c, a], dtype=map_cls.dtype)
+    oracle = {9: c, 2: b, 5000: a}
+    for k, v in ((keys, values), (keys.tolist(), values.tolist()), (keys.astype(np.int64), values)):
+        _assert_map(map_cls(k, v), oracle)
+    if _sparse(map_cls):
+        assert map_cls(keys, values).keys().tolist() == [9, 2, 5000]
+    _assert_map(map_cls([], []), {})
+    _assert_map(map_cls([1, 2], b), {1: b, 2: b})
+    for args, error in [
+        (([1],), TypeError),
+        ((None, [a]), TypeError),
+        (([1, 2], [a]), ValueError),
+        (([1, -1], [a, b]), OverflowError),
+        (([2**32], [a]), OverflowError),
+        (([1, 2], ["x", "y"]), TypeError),
+    ]:
+        with pytest.raises(error):
+            map_cls(*args)
+    m = map_cls(keys, values)
+    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+        restored = pickle.loads(pickle.dumps(m, protocol=protocol))
+        assert type(restored) is map_cls
+        _assert_map(restored, oracle)
+        assert restored.items() == m.items()
+    for clone in (m.copy(), copy.copy(m), copy.deepcopy(m)):
+        assert clone is not m
+        assert clone.items() == m.items()
+        clone.clear()
+    _assert_map(m, oracle)
+
+
+def test_pickle_during_shared_writes(map_cls):
+    m = map_cls()
+    (v,) = _values(map_cls, [1])
+    stop = threading.Event()
+
+    def writer():
+        key = 0
+        while not stop.is_set():
+            _write(m, np.arange(key, key + 64, dtype=np.uint32), v)
+            key = (key + 64) % 200_000
+
+    with ThreadPoolExecutor(2) as pool:
+        futures = [pool.submit(writer) for _ in range(2)]
+        try:
+            for _ in range(20):
+                restored = pickle.loads(pickle.dumps(m))
+                keys, values = restored.keys(), restored.values()
+                assert len(keys) == len(values) == len(restored)
+                assert len(set(keys.tolist())) == len(keys)
+                np.testing.assert_array_equal(values, np.full(len(values), v, dtype=map_cls.dtype))
+        finally:
+            stop.set()
+            for future in futures:
+                future.result()
 
 
 def test_threaded_maps(map_cls):

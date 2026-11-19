@@ -6,10 +6,11 @@ use paged_collections::concurrent::{
     ConcurrentDirectMap as RustDirectMap, ConcurrentSparseMap as RustSparseMap,
     ConcurrentSparseSet as RustSparseSet,
 };
+use paged_collections::sparse_map::PagedSparseMap;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyKeyError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyIterator, PyList};
+use pyo3::types::{PyIterator, PyList, PyTuple};
 
 use crate::convert::{Key, KeyBatch, TypedValue, insert_key, lookup_key, value_batch};
 
@@ -51,11 +52,40 @@ impl<V: Copy> CopyMap<V> for RustDirectMap<Key, V> {
     }
 }
 
+/// Construction from validated batches, matching the plain maps: later
+/// duplicate keys win.
+trait Build<V> {
+    fn build(keys: Vec<Key>, values: Vec<V>) -> Self;
+}
+
+impl<V> Build<V> for RustSparseMap<Key, V> {
+    fn build(keys: Vec<Key>, values: Vec<V>) -> Self {
+        // The concurrent sparse map is insert-only (first wins), so resolve
+        // duplicates in a plain map; `From` keeps its dense order.
+        let mut plain = PagedSparseMap::new();
+        for (key, value) in keys.into_iter().zip(values) {
+            plain.insert(key, value);
+        }
+        Self::from(plain)
+    }
+}
+
+impl<V> Build<V> for RustDirectMap<Key, V> {
+    fn build(keys: Vec<Key>, values: Vec<V>) -> Self {
+        let map = Self::new();
+        for (key, value) in keys.into_iter().zip(values) {
+            map.insert(key, value);
+        }
+        map
+    }
+}
+
 /// A shared-insertion set of uint32 keys with copied snapshots.
 /// Batch methods release the GIL; single-key calls do not. Removal and
 /// clear require exclusive access and raise RuntimeError ("Already borrowed")
 /// if another call holds a shared borrow. Uses the default Rust page size
-/// and Flat directory; there are no guards, views or pickle support.
+/// and Flat directory; there are no guards or views. Pickling and copies
+/// take a weakly consistent snapshot (see the Rust `snapshot` docs).
 #[pyclass(module = "paged_collections._core", weakref)]
 pub(crate) struct ConcurrentSparseSet {
     set: RustSparseSet<Key>,
@@ -63,11 +93,32 @@ pub(crate) struct ConcurrentSparseSet {
 
 #[pymethods]
 impl ConcurrentSparseSet {
+    /// Build from a batch of keys (array or sequence); duplicates are kept
+    /// once, in first-occurrence order. Releases the GIL while inserting.
     #[new]
-    fn new() -> Self {
-        Self {
-            set: RustSparseSet::new(),
+    #[pyo3(signature = (keys = None))]
+    fn new(py: Python<'_>, keys: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let set = RustSparseSet::new();
+        if let Some(keys) = keys {
+            let keys = KeyBatch::<Key>::new(keys)?.to_insert_keys()?;
+            py.detach(|| set.insert_many(keys));
         }
+        Ok(Self { set })
+    }
+
+    /// Return a snapshot copy. Releases the GIL while copying.
+    fn copy(&self, py: Python<'_>) -> Self {
+        Self {
+            set: py.detach(|| self.set.clone()),
+        }
+    }
+
+    fn __copy__(&self, py: Python<'_>) -> Self {
+        self.copy(py)
+    }
+
+    fn __deepcopy__(&self, py: Python<'_>, _memo: &Bound<'_, PyAny>) -> Self {
+        self.copy(py)
     }
 
     fn __len__(&self) -> usize {
@@ -142,10 +193,11 @@ impl ConcurrentSparseSet {
         format!("ConcurrentSparseSet([{keys}])")
     }
 
-    fn __reduce__(&self) -> PyResult<()> {
-        Err(PyTypeError::new_err(
-            "ConcurrentSparseSet does not support pickling",
-        ))
+    /// Pickle as `(ConcurrentSparseSet, (keys,))` from one snapshot pass.
+    fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
+        let py = slf.py();
+        let keys = slf.try_borrow()?.keys(py);
+        (py.get_type::<Self>(), (keys,)).into_pyobject(py)
     }
 }
 
@@ -158,7 +210,8 @@ macro_rules! concurrent_map {
             "Batch methods release the GIL; single-key calls do not. ",
             "clear and sparse remove/remove_many require exclusive access: conflicts ",
             "with shared calls raise RuntimeError (Already borrowed). ",
-            "Uses the default Rust page size and Flat directory; no pickling. ",
+            "Uses the default Rust page size and Flat directory. ",
+            "Pickling and copy() take one weakly consistent snapshot. ",
             "Snapshots can omit insertions in flight; direct snapshots are consistent ",
             "per page only. Batch calls are not transactions."
         )]
@@ -169,9 +222,39 @@ macro_rules! concurrent_map {
 
         #[pymethods]
         impl $name {
+            /// Build from key and value batches (both or neither); later
+            /// duplicate keys win, as for the plain maps. Validates both
+            /// batches before writing; releases the GIL while inserting.
             #[new]
-            fn new() -> Self {
-                Self { map: <$inner>::new() }
+            #[pyo3(signature = (keys = None, values = None))]
+            fn new(
+                py: Python<'_>,
+                keys: Option<&Bound<'_, PyAny>>,
+                values: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<Self> {
+                let (keys, values) = match (keys, values) {
+                    (None, None) => (Vec::new(), Vec::new()),
+                    (Some(keys), Some(values)) => {
+                        let keys = KeyBatch::<Key>::new(keys)?.to_insert_keys()?;
+                        let values = value_batch::<$t>(values, keys.len())?;
+                        (keys, values)
+                    }
+                    _ => return Err(PyTypeError::new_err("give both keys and values, or neither")),
+                };
+                Ok(Self { map: py.detach(|| <$inner as Build<$t>>::build(keys, values)) })
+            }
+
+            /// Return a snapshot copy. Releases the GIL while copying.
+            fn copy(&self, py: Python<'_>) -> Self {
+                Self { map: py.detach(|| self.map.clone()) }
+            }
+
+            fn __copy__(&self, py: Python<'_>) -> Self {
+                self.copy(py)
+            }
+
+            fn __deepcopy__(&self, py: Python<'_>, _memo: &Bound<'_, PyAny>) -> Self {
+                self.copy(py)
             }
 
             #[classattr]
@@ -248,8 +331,18 @@ macro_rules! concurrent_map {
                 Ok(format!("{}({{{items}}})", stringify!($name)))
             }
 
-            fn __reduce__(&self) -> PyResult<()> {
-                Err(PyTypeError::new_err(concat!(stringify!($name), " does not support pickling")))
+            /// Pickle as `(cls, (keys, values))`. Keys and values come from
+            /// one snapshot pass, so they always pair up.
+            fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
+                let py = slf.py();
+                let this = slf.try_borrow()?;
+                // Capture the map, not the PyRef, which is not Send.
+                let map = &this.map;
+                let (keys, values): (Vec<Key>, Vec<$t>) =
+                    py.detach(|| map.copied_items().into_iter().unzip());
+                let keys = PyArray1::from_vec(py, keys);
+                let values = PyArray1::from_vec(py, values);
+                (py.get_type::<Self>(), (keys, values)).into_pyobject(py)
             }
 
             $($methods)*
