@@ -539,6 +539,7 @@ version = "0.1.0"
 dependencies = [
  "loom",
  "proptest",
+ "rayon",
  "serde",
  "serde_json",
 ]

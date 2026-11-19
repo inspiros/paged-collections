@@ -29,6 +29,7 @@
 //! - `std` (default): `std`-only conveniences. Without it the crate is `no_std`
 //!   and needs only `alloc`.
 //! - `serde`: serialization support.
+//! - `rayon`: parallel iteration through `rayon::prelude`. Enables `std`.
 //! - `concurrent`: thread-safe variants in [`concurrent`], which use `unsafe`
 //!   code and atomics. Off by default.
 
@@ -49,6 +50,7 @@ extern crate std;
 #[cfg_attr(docsrs, doc(cfg(feature = "concurrent")))]
 pub mod concurrent;
 pub mod direct_map;
+mod hash;
 // Slot indices are `u32` and must convert to `usize` without loss.
 #[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
 pub mod hive;

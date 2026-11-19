@@ -29,12 +29,30 @@
 //! assert!(set.remove(7));
 //! assert_eq!(set.as_slice(), &[3_000_000]);
 //! ```
+//!
+//! With the `rayon` feature, the borrowed parallel iterator is indexed and
+//! follows dense order.
+//!
+//! ```rust
+//! # #[cfg(feature = "rayon")] {
+//! use paged_collections::sparse_set::PagedSparseSet;
+//! use rayon::prelude::*;
+//!
+//! let set: PagedSparseSet<u32> = [7, 2, 9].into_iter().collect();
+//! assert_eq!(set.par_iter().copied().collect::<Vec<_>>(), [7, 2, 9]);
+//! # }
+//! ```
 
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 use core::fmt;
+use core::hash::{Hash, Hasher};
+use core::iter::{Chain, FusedIterator};
 use core::num::NonZeroU32;
+use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Sub, SubAssign};
+use core::slice;
 
+use crate::hash::hash_unordered;
 use crate::key::Key;
 use crate::page::{DEFAULT_PAGE, Directory, Flat, PageStore, split};
 
@@ -61,6 +79,29 @@ pub type Slot = Option<NonZeroU32>;
 ///
 /// Keys are kept in insertion order until a removal, which moves the last key
 /// into the gap.
+///
+/// # Set operations
+///
+/// [`union`](Self::union), [`intersection`](Self::intersection),
+/// [`difference`](Self::difference), and
+/// [`symmetric_difference`](Self::symmetric_difference) iterate over borrowed
+/// keys. The corresponding operators `|`, `&`, `-`, and `^` on borrowed sets
+/// create a set with the left operand's page size and directory. The assignment
+/// operators `|=`, `&=`, `-=`, and `^=` update a set in place. Removals can
+/// reorder keys by moving the last key into each gap.
+/// [`is_disjoint`](Self::is_disjoint), [`is_subset`](Self::is_subset), and
+/// [`is_superset`](Self::is_superset) test relationships between sets.
+///
+/// ```
+/// use paged_collections::page::Radix;
+/// use paged_collections::sparse_set::PagedSparseSet;
+///
+/// let mut a: PagedSparseSet<u16, 4> = [1, 2].into_iter().collect();
+/// let b: PagedSparseSet<u16, 64, Radix> = [2, 3].into_iter().collect();
+/// assert_eq!((&a | &b).as_slice(), &[1, 2, 3]);
+/// a &= &b;
+/// assert!(a.is_subset(&b));
+/// ```
 ///
 /// [`insert`]: PagedSparseSet::insert
 /// [`replace`]: PagedSparseSet::replace
@@ -335,6 +376,143 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
         self.dense.iter()
     }
 
+    /// Iterates over keys in `self` absent from `other`, in `self`'s dense order.
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let a: PagedSparseSet<u16> = [3, 1, 2].into_iter().collect();
+    /// let b: PagedSparseSet<u16> = [1, 4].into_iter().collect();
+    /// assert!(a.difference(&b).copied().eq([3, 2]));
+    /// ```
+    pub fn difference<'a, const P2: usize, D2: Directory>(
+        &'a self,
+        other: &'a PagedSparseSet<K, P2, D2>,
+    ) -> Difference<'a, K, P2, D2> {
+        Difference {
+            iter: self.iter(),
+            other,
+        }
+    }
+
+    /// Iterates over keys present in both sets.
+    ///
+    /// Order follows the smaller set's dense order, or `self`'s dense order
+    /// if the sets contain the same number of keys.
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let a: PagedSparseSet<u16> = [1, 2, 3].into_iter().collect();
+    /// let b: PagedSparseSet<u16> = [2, 1].into_iter().collect();
+    /// assert!(a.intersection(&b).copied().eq([2, 1]));
+    /// ```
+    pub fn intersection<'a, const P2: usize, D2: Directory>(
+        &'a self,
+        other: &'a PagedSparseSet<K, P2, D2>,
+    ) -> Intersection<'a, K, PAGE, D, P2, D2> {
+        let (iter, probe) = if self.len() <= other.len() {
+            (self.iter(), IntersectionProbe::Right(other))
+        } else {
+            (other.iter(), IntersectionProbe::Left(self))
+        };
+        Intersection { iter, probe }
+    }
+
+    /// Iterates over keys present in exactly one set.
+    ///
+    /// Yields [`self.difference(other)`](Self::difference), then
+    /// `other.difference(self)`. Different generations of the same slot are
+    /// unequal, so both are yielded. Collecting into a `PagedSparseSet` keeps
+    /// `self`'s key because [`insert`](Self::insert) refuses an occupied slot.
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let a: PagedSparseSet<u16> = [3, 1, 2].into_iter().collect();
+    /// let b: PagedSparseSet<u16> = [2, 5, 4].into_iter().collect();
+    /// assert!(a.symmetric_difference(&b).copied().eq([3, 1, 5, 4]));
+    /// ```
+    pub fn symmetric_difference<'a, const P2: usize, D2: Directory>(
+        &'a self,
+        other: &'a PagedSparseSet<K, P2, D2>,
+    ) -> SymmetricDifference<'a, K, PAGE, D, P2, D2> {
+        SymmetricDifference {
+            iter: self.difference(other).chain(other.difference(self)),
+        }
+    }
+
+    /// Iterates over keys present in either set.
+    ///
+    /// Yields `self`'s keys in dense order, then `other.difference(self)`.
+    /// Different generations of the same slot are unequal, so both are
+    /// yielded. Collecting into a `PagedSparseSet` keeps `self`'s key because
+    /// [`insert`](Self::insert) refuses an occupied slot.
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let a: PagedSparseSet<u16> = [3, 1, 2].into_iter().collect();
+    /// let b: PagedSparseSet<u16> = [2, 5, 4].into_iter().collect();
+    /// assert!(a.union(&b).copied().eq([3, 1, 2, 5, 4]));
+    /// ```
+    pub fn union<'a, const P2: usize, D2: Directory>(
+        &'a self,
+        other: &'a PagedSparseSet<K, P2, D2>,
+    ) -> Union<'a, K, PAGE, D> {
+        Union {
+            iter: self.iter().chain(other.difference(self)),
+        }
+    }
+
+    /// Whether the sets have no keys in common. Iterates over the smaller set.
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let a: PagedSparseSet<u16> = [1, 2].into_iter().collect();
+    /// let b: PagedSparseSet<u16> = [3].into_iter().collect();
+    /// assert!(a.is_disjoint(&b));
+    /// ```
+    pub fn is_disjoint<const P2: usize, D2: Directory>(
+        &self,
+        other: &PagedSparseSet<K, P2, D2>,
+    ) -> bool {
+        self.intersection(other).next().is_none()
+    }
+
+    /// Whether every key in `self` is also in `other`.
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let a: PagedSparseSet<u16> = [2].into_iter().collect();
+    /// let b: PagedSparseSet<u16> = [1, 2].into_iter().collect();
+    /// assert!(a.is_subset(&b));
+    /// ```
+    pub fn is_subset<const P2: usize, D2: Directory>(
+        &self,
+        other: &PagedSparseSet<K, P2, D2>,
+    ) -> bool {
+        self.len() <= other.len() && self.iter().all(|&key| other.contains(key))
+    }
+
+    /// Whether every key in `other` is also in `self`.
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let a: PagedSparseSet<u16> = [1, 2].into_iter().collect();
+    /// let b: PagedSparseSet<u16> = [2].into_iter().collect();
+    /// assert!(a.is_superset(&b));
+    /// ```
+    pub fn is_superset<const P2: usize, D2: Directory>(
+        &self,
+        other: &PagedSparseSet<K, P2, D2>,
+    ) -> bool {
+        other.is_subset(self)
+    }
+
     /// Swaps the keys at dense positions `a` and `b` and fixes their index
     /// slots. Panics if either is out of bounds.
     pub(crate) fn swap_positions(&mut self, a: usize, b: usize) {
@@ -453,14 +631,25 @@ impl<K: Key + fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
     }
 }
 
-/// Sets are equal when they hold the same keys, in any order.
-impl<K: Key, const PAGE: usize, D: Directory> PartialEq for PagedSparseSet<K, PAGE, D> {
-    fn eq(&self, other: &Self) -> bool {
+/// Compares exact keys with [`contains`](PagedSparseSet::contains), in any
+/// order and across page sizes and directories.
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    PartialEq<PagedSparseSet<K, P2, D2>> for PagedSparseSet<K, PAGE, D>
+{
+    fn eq(&self, other: &PagedSparseSet<K, P2, D2>) -> bool {
         self.len() == other.len() && self.iter().all(|&key| other.contains(key))
     }
 }
 
+/// Exact key equality gives sets an equivalence relation under [`PartialEq`].
 impl<K: Key, const PAGE: usize, D: Directory> Eq for PagedSparseSet<K, PAGE, D> {}
+
+/// Hashes the keys in any order, consistent with [`PartialEq`].
+impl<K: Key + Hash, const PAGE: usize, D: Directory> Hash for PagedSparseSet<K, PAGE, D> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_unordered(self.iter(), state);
+    }
+}
 
 impl<K: Key, const PAGE: usize, D: Directory> Extend<K> for PagedSparseSet<K, PAGE, D> {
     fn extend<I: IntoIterator<Item = K>>(&mut self, iter: I) {
@@ -501,6 +690,306 @@ impl<K: Key, const PAGE: usize, D: Directory> IntoIterator for PagedSparseSet<K,
 
     fn into_iter(self) -> Self::IntoIter {
         self.dense.into_iter()
+    }
+}
+
+/// An iterator over the keys yielded by [`PagedSparseSet::difference`].
+pub struct Difference<'a, K, const P2: usize, D2: Directory> {
+    iter: slice::Iter<'a, K>,
+    other: &'a PagedSparseSet<K, P2, D2>,
+}
+
+impl<'a, K: Key, const P2: usize, D2: Directory> Iterator for Difference<'a, K, P2, D2> {
+    type Item = &'a K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.find(|&&key| !self.other.contains(key))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.iter.len()))
+    }
+}
+
+impl<K: Key, const P2: usize, D2: Directory> FusedIterator for Difference<'_, K, P2, D2> {}
+
+impl<K, const P2: usize, D2: Directory> Clone for Difference<'_, K, P2, D2> {
+    fn clone(&self) -> Self {
+        Self {
+            iter: self.iter.clone(),
+            other: self.other,
+        }
+    }
+}
+
+impl<K: Key + fmt::Debug, const P2: usize, D2: Directory> fmt::Debug for Difference<'_, K, P2, D2> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+enum IntersectionProbe<'a, K, const PAGE: usize, D: Directory, const P2: usize, D2: Directory> {
+    Left(&'a PagedSparseSet<K, PAGE, D>),
+    Right(&'a PagedSparseSet<K, P2, D2>),
+}
+
+// Manual impls: a derive would require `K: Clone`.
+impl<K, const PAGE: usize, D: Directory, const P2: usize, D2: Directory> Clone
+    for IntersectionProbe<'_, K, PAGE, D, P2, D2>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<K, const PAGE: usize, D: Directory, const P2: usize, D2: Directory> Copy
+    for IntersectionProbe<'_, K, PAGE, D, P2, D2>
+{
+}
+
+/// An iterator over the keys yielded by [`PagedSparseSet::intersection`].
+pub struct Intersection<'a, K, const PAGE: usize, D: Directory, const P2: usize, D2: Directory> {
+    iter: slice::Iter<'a, K>,
+    probe: IntersectionProbe<'a, K, PAGE, D, P2, D2>,
+}
+
+impl<'a, K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory> Iterator
+    for Intersection<'a, K, PAGE, D, P2, D2>
+{
+    type Item = &'a K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.probe {
+            IntersectionProbe::Left(set) => self.iter.find(|&&key| set.contains(key)),
+            IntersectionProbe::Right(set) => self.iter.find(|&&key| set.contains(key)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.iter.len()))
+    }
+}
+
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory> FusedIterator
+    for Intersection<'_, K, PAGE, D, P2, D2>
+{
+}
+
+impl<K, const PAGE: usize, D: Directory, const P2: usize, D2: Directory> Clone
+    for Intersection<'_, K, PAGE, D, P2, D2>
+{
+    fn clone(&self) -> Self {
+        Self {
+            iter: self.iter.clone(),
+            probe: self.probe,
+        }
+    }
+}
+
+impl<K: Key + fmt::Debug, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    fmt::Debug for Intersection<'_, K, PAGE, D, P2, D2>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+/// An iterator over the keys yielded by [`PagedSparseSet::symmetric_difference`].
+pub struct SymmetricDifference<
+    'a,
+    K,
+    const PAGE: usize,
+    D: Directory,
+    const P2: usize,
+    D2: Directory,
+> {
+    iter: Chain<Difference<'a, K, P2, D2>, Difference<'a, K, PAGE, D>>,
+}
+
+impl<'a, K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory> Iterator
+    for SymmetricDifference<'a, K, PAGE, D, P2, D2>
+{
+    type Item = &'a K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory> FusedIterator
+    for SymmetricDifference<'_, K, PAGE, D, P2, D2>
+{
+}
+
+impl<K, const PAGE: usize, D: Directory, const P2: usize, D2: Directory> Clone
+    for SymmetricDifference<'_, K, PAGE, D, P2, D2>
+{
+    fn clone(&self) -> Self {
+        Self {
+            iter: self.iter.clone(),
+        }
+    }
+}
+
+impl<K: Key + fmt::Debug, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    fmt::Debug for SymmetricDifference<'_, K, PAGE, D, P2, D2>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+/// An iterator over the keys yielded by [`PagedSparseSet::union`].
+pub struct Union<'a, K, const PAGE: usize, D: Directory> {
+    iter: Chain<slice::Iter<'a, K>, Difference<'a, K, PAGE, D>>,
+}
+
+impl<'a, K: Key, const PAGE: usize, D: Directory> Iterator for Union<'a, K, PAGE, D> {
+    type Item = &'a K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<K: Key, const PAGE: usize, D: Directory> FusedIterator for Union<'_, K, PAGE, D> {}
+
+impl<K, const PAGE: usize, D: Directory> Clone for Union<'_, K, PAGE, D> {
+    fn clone(&self) -> Self {
+        Self {
+            iter: self.iter.clone(),
+        }
+    }
+}
+
+impl<K: Key + fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug for Union<'_, K, PAGE, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+/// Collects the [`union`](PagedSparseSet::union) into a new set.
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    BitOr<&PagedSparseSet<K, P2, D2>> for &PagedSparseSet<K, PAGE, D>
+{
+    type Output = PagedSparseSet<K, PAGE, D>;
+
+    fn bitor(self, other: &PagedSparseSet<K, P2, D2>) -> Self::Output {
+        let mut set = PagedSparseSet::with_capacity(self.len());
+        set.extend(self.union(other));
+        set
+    }
+}
+
+/// Collects the [`intersection`](PagedSparseSet::intersection) into a new set.
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    BitAnd<&PagedSparseSet<K, P2, D2>> for &PagedSparseSet<K, PAGE, D>
+{
+    type Output = PagedSparseSet<K, PAGE, D>;
+
+    fn bitand(self, other: &PagedSparseSet<K, P2, D2>) -> Self::Output {
+        let mut set = PagedSparseSet::with_capacity(self.len().min(other.len()));
+        set.extend(self.intersection(other));
+        set
+    }
+}
+
+/// Collects the [`difference`](PagedSparseSet::difference) into a new set.
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    Sub<&PagedSparseSet<K, P2, D2>> for &PagedSparseSet<K, PAGE, D>
+{
+    type Output = PagedSparseSet<K, PAGE, D>;
+
+    fn sub(self, other: &PagedSparseSet<K, P2, D2>) -> Self::Output {
+        let mut set = PagedSparseSet::with_capacity(self.len().saturating_sub(other.len()));
+        set.extend(self.difference(other));
+        set
+    }
+}
+
+/// Collects the [`symmetric difference`](PagedSparseSet::symmetric_difference) into a new set.
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    BitXor<&PagedSparseSet<K, P2, D2>> for &PagedSparseSet<K, PAGE, D>
+{
+    type Output = PagedSparseSet<K, PAGE, D>;
+
+    fn bitxor(self, other: &PagedSparseSet<K, P2, D2>) -> Self::Output {
+        let mut set = PagedSparseSet::with_capacity(self.len().abs_diff(other.len()));
+        set.extend(self.symmetric_difference(other));
+        set
+    }
+}
+
+/// Inserts the right operand's keys in dense order, keeping occupied slots.
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    BitOrAssign<&PagedSparseSet<K, P2, D2>> for PagedSparseSet<K, PAGE, D>
+{
+    fn bitor_assign(&mut self, other: &PagedSparseSet<K, P2, D2>) {
+        self.extend(other);
+    }
+}
+
+/// Keeps the keys present in both sets. Swap removal can reorder keys.
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    BitAndAssign<&PagedSparseSet<K, P2, D2>> for PagedSparseSet<K, PAGE, D>
+{
+    fn bitand_assign(&mut self, other: &PagedSparseSet<K, P2, D2>) {
+        self.retain(|&key| other.contains(key));
+    }
+}
+
+/// Removes keys present in the right operand. Swap removal can reorder keys.
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    SubAssign<&PagedSparseSet<K, P2, D2>> for PagedSparseSet<K, PAGE, D>
+{
+    fn sub_assign(&mut self, other: &PagedSparseSet<K, P2, D2>) {
+        if other.len() < self.len() {
+            for &key in other {
+                self.remove(key);
+            }
+        } else {
+            self.retain(|&key| !other.contains(key));
+        }
+    }
+}
+
+/// Toggles each key in the right operand. Swap removal can reorder keys.
+/// When the operands hold different generations of the same slot, the left
+/// operand keeps its key and skips the right operand's key.
+impl<K: Key, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    BitXorAssign<&PagedSparseSet<K, P2, D2>> for PagedSparseSet<K, PAGE, D>
+{
+    fn bitxor_assign(&mut self, other: &PagedSparseSet<K, P2, D2>) {
+        for &key in other {
+            if !self.remove(key) {
+                self.insert(key);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "rayon")]
+mod rayon_impl {
+    use super::*;
+    use rayon::prelude::*;
+
+    impl<'a, K: Key + Sync, const PAGE: usize, D: Directory> IntoParallelIterator
+        for &'a PagedSparseSet<K, PAGE, D>
+    {
+        type Item = &'a K;
+        type Iter = rayon::slice::Iter<'a, K>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            self.as_slice().par_iter()
+        }
     }
 }
 
@@ -563,6 +1052,7 @@ mod serde_impl {
 #[cfg(all(test, any(target_pointer_width = "32", target_pointer_width = "64")))]
 mod tests {
     use super::*;
+    use crate::page::Radix;
     #[cfg(target_pointer_width = "64")]
     use crate::page::Tree;
 
@@ -682,5 +1172,157 @@ mod tests {
         let c: PagedSparseSet<u32> = [1, 2].into_iter().collect();
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn set_algebra_preserves_the_left_generation_when_stored() {
+        let old = Gen(7);
+        let new = Gen(7 | 1 << 16);
+        let common = Gen(42);
+        let left_only = Gen(13);
+        let right_only = Gen(21);
+        let left: PagedSparseSet<Gen, 4> = [old, common, left_only].into_iter().collect();
+        let right: PagedSparseSet<Gen, 64, Radix> = [new, common, right_only].into_iter().collect();
+
+        let union = left.union(&right).copied();
+        assert!(union.clone().eq([old, common, left_only, new, right_only]));
+        assert_eq!(
+            union.collect::<PagedSparseSet<Gen>>().occupant(7),
+            Some(&old)
+        );
+        assert_eq!(
+            (&left | &right).as_slice(),
+            &[old, common, left_only, right_only]
+        );
+        assert_eq!((&right | &left).occupant(7), Some(&new));
+
+        let symmetric = left.symmetric_difference(&right).copied();
+        assert!(symmetric.clone().eq([old, left_only, new, right_only]));
+        assert_eq!(
+            symmetric.collect::<PagedSparseSet<Gen>>().occupant(7),
+            Some(&old)
+        );
+        assert_eq!((&left ^ &right).as_slice(), &[old, left_only, right_only]);
+        assert_eq!((&right ^ &left).occupant(7), Some(&new));
+
+        let mut assigned = left;
+        assigned ^= &right;
+        assert_eq!(assigned.as_slice(), &[old, left_only, right_only]);
+        assert_eq!(assigned.occupant(7), Some(&old));
+        assert!(!assigned.contains(new));
+        assert!(!assigned.contains(common));
+    }
+
+    #[test]
+    fn set_algebra_across_page_sizes_and_directories() {
+        let left: PagedSparseSet<u32, 4> = [90, 7, 1, 4].into_iter().collect();
+        let right: PagedSparseSet<u32, 64, Radix> = [1, 7, 128].into_iter().collect();
+        assert!(left.difference(&right).copied().eq([90, 4]));
+        assert!(left.intersection(&right).copied().eq([1, 7]));
+        assert!(right.intersection(&left).copied().eq([1, 7]));
+        assert!(left.union(&right).copied().eq([90, 7, 1, 4, 128]));
+        assert!(left.symmetric_difference(&right).copied().eq([90, 4, 128]));
+
+        let tie: PagedSparseSet<u32, 64, Radix> = [1, 7, 128, 256].into_iter().collect();
+        assert!(left.intersection(&tie).copied().eq([7, 1]));
+
+        let union: PagedSparseSet<u32, 4> = &left | &right;
+        let intersection: PagedSparseSet<u32, 4> = &left & &right;
+        let difference: PagedSparseSet<u32, 4> = &left - &right;
+        let symmetric: PagedSparseSet<u32, 4> = &left ^ &right;
+        assert_eq!(union.as_slice(), &[90, 7, 1, 4, 128]);
+        assert_eq!(intersection.as_slice(), &[1, 7]);
+        assert_eq!(difference.as_slice(), &[90, 4]);
+        assert_eq!(symmetric.as_slice(), &[90, 4, 128]);
+
+        let mut assigned = left.clone();
+        assigned |= &right;
+        assert_eq!(assigned, union);
+        let mut assigned = left.clone();
+        assigned &= &right;
+        assert_eq!(assigned, intersection);
+        let mut assigned = left.clone();
+        assigned -= &right;
+        assert_eq!(assigned, difference);
+        let mut assigned = left;
+        assigned ^= &right;
+        assert_eq!(assigned, symmetric);
+    }
+
+    #[test]
+    fn empty_sets_and_set_relationships() {
+        let empty = PagedSparseSet::<u32, 4>::new();
+        let set: PagedSparseSet<u32, 64, Radix> = [2, 1].into_iter().collect();
+        let subset: PagedSparseSet<u32, 4> = [1].into_iter().collect();
+        let disjoint: PagedSparseSet<u32, 4> = [3, 4, 5].into_iter().collect();
+
+        assert_eq!(empty.difference(&set).next(), None);
+        assert!(set.difference(&empty).copied().eq([2, 1]));
+        assert_eq!(set.intersection(&empty).next(), None);
+        assert!(empty.union(&set).copied().eq([2, 1]));
+        assert!(set.symmetric_difference(&empty).copied().eq([2, 1]));
+        assert_eq!(empty.union(&empty).next(), None);
+        assert_eq!(empty.symmetric_difference(&empty).next(), None);
+
+        assert!(empty.is_subset(&empty) && empty.is_superset(&empty));
+        assert!(empty.is_disjoint(&empty));
+        assert!(empty.is_subset(&set) && set.is_superset(&empty));
+        assert!(!set.is_subset(&empty) && !empty.is_superset(&set));
+        assert!(empty.is_disjoint(&set) && set.is_disjoint(&empty));
+        assert!(subset.is_subset(&set) && set.is_superset(&subset));
+        assert!(!set.is_subset(&subset) && !subset.is_superset(&set));
+        assert!(!subset.is_disjoint(&set) && !set.is_disjoint(&subset));
+        assert!(set.is_subset(&set) && set.is_superset(&set));
+        assert!(!set.is_disjoint(&set));
+        assert!(set.is_disjoint(&disjoint) && disjoint.is_disjoint(&set));
+        assert!(!set.is_subset(&disjoint) && !disjoint.is_superset(&set));
+    }
+
+    #[test]
+    fn set_iterators_report_remaining_bounds_and_keys() {
+        fn assert_exhausted(mut iter: impl FusedIterator) {
+            assert!(iter.next().is_none());
+            assert_eq!(iter.size_hint(), (0, Some(0)));
+            assert!(iter.next().is_none());
+        }
+
+        let left: PagedSparseSet<u32, 4> = [4, 2, 7, 3].into_iter().collect();
+        let right: PagedSparseSet<u32, 64, Radix> = [7, 2, 5].into_iter().collect();
+
+        let mut difference = left.difference(&right);
+        assert_eq!(difference.size_hint(), (0, Some(4)));
+        assert_eq!(difference.next(), Some(&4));
+        assert_eq!(difference.size_hint(), (0, Some(3)));
+        assert_eq!(alloc::format!("{difference:?}"), "[3]");
+        assert_eq!(difference.next(), Some(&3));
+        assert_exhausted(difference);
+
+        let mut intersection = left.intersection(&right);
+        assert_eq!(intersection.size_hint(), (0, Some(3)));
+        assert_eq!(intersection.next(), Some(&7));
+        assert_eq!(intersection.size_hint(), (0, Some(2)));
+        assert_eq!(alloc::format!("{intersection:?}"), "[2]");
+        assert_eq!(intersection.next(), Some(&2));
+        assert_exhausted(intersection);
+
+        let mut union = left.union(&right);
+        assert_eq!(union.size_hint(), (4, Some(7)));
+        assert_eq!(union.next(), Some(&4));
+        assert_eq!(union.size_hint(), (3, Some(6)));
+        assert_eq!(alloc::format!("{union:?}"), "[2, 7, 3, 5]");
+        assert!(union.by_ref().take(3).copied().eq([2, 7, 3]));
+        assert_eq!(union.size_hint(), (0, Some(3)));
+        assert_eq!(union.next(), Some(&5));
+        assert_exhausted(union);
+
+        let mut symmetric = left.symmetric_difference(&right);
+        assert_eq!(symmetric.size_hint(), (0, Some(7)));
+        assert_eq!(symmetric.next(), Some(&4));
+        assert_eq!(symmetric.size_hint(), (0, Some(6)));
+        assert_eq!(alloc::format!("{symmetric:?}"), "[3, 5]");
+        assert_eq!(symmetric.next(), Some(&3));
+        assert_eq!(symmetric.size_hint(), (0, Some(3)));
+        assert_eq!(symmetric.next(), Some(&5));
+        assert_exhausted(symmetric);
     }
 }

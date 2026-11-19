@@ -24,7 +24,7 @@ Rust (`no_std` + `alloc`), with Python bindings built on PyO3 and NumPy.
 ## Install
 
 ```sh
-cargo add paged-collections             # features: std (default), serde, concurrent
+cargo add paged-collections             # features: std (default), serde, rayon, concurrent
 pip install paged-collections           # Python 3.10+, NumPy 1.24+
 ```
 
@@ -91,6 +91,8 @@ del values                 # resizing raises BufferError while a view is alive
 | `PagedDeque<T>` | `PagedDeque` | storage | Double-ended queue with stable addresses |
 | `Hive<T>` | `Hive` | storage | Unordered slots with generational ids |
 | `IdAllocator` | `IdAllocator`, `IdMap` | none | Generational ids for use as keys |
+
+The `rayon` feature enables parallel iteration through `rayon::prelude`.
 
 The `concurrent` feature adds thread-safe variants: `ConcurrentHive`,
 `ConcurrentAppendHive`, `ConcurrentPagedVec`, `ConcurrentSparseSet`/`Map`,

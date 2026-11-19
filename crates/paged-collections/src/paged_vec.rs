@@ -58,6 +58,22 @@
 //! assert_eq!(v.pages().next(), Some(&[10, 0, 1, 2][..]));
 //! ```
 //!
+//! With the `rayon` feature, borrowed iterators are indexed across page
+//! boundaries. A parallel iterator can also collect into or extend a
+//! `PagedVec` in iteration order.
+//!
+//! ```rust
+//! # #[cfg(feature = "rayon")] {
+//! use paged_collections::paged_vec::PagedVec;
+//! use rayon::prelude::*;
+//!
+//! let mut v: PagedVec<_, 3> = (0..5).into_par_iter().collect();
+//! v.par_extend(5..7);
+//! v.par_iter_mut().for_each(|value| *value *= 2);
+//! assert_eq!(v.par_iter().copied().rev().collect::<Vec<_>>(), [12, 10, 8, 6, 4, 2, 0]);
+//! # }
+//! ```
+//!
 //! [`insert`]: PagedVec::insert
 //! [`remove`]: PagedVec::remove
 //! [`swap`]: PagedVec::swap
@@ -1437,6 +1453,190 @@ impl<T> Clone for Iter<'_, T> {
 impl<T: fmt::Debug> fmt::Debug for Iter<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+#[cfg(feature = "rayon")]
+pub use rayon_impl::{ParIter, ParIterMut};
+
+#[cfg(feature = "rayon")]
+mod rayon_impl {
+    use super::*;
+    use rayon::iter::plumbing::{Consumer, Producer, ProducerCallback, UnindexedConsumer, bridge};
+    use rayon::prelude::*;
+
+    // Both producers describe the same layout. The mutable producer splits
+    // the page directory before taking any element slices from it.
+    macro_rules! parallel_iter {
+        (
+            $(#[$doc:meta])* $name:ident, $producer:ident, $sequential:ident,
+            $bound:ident, [$($mutability:tt)*], $iter:ident,
+            $split_at:ident, $split_first:ident, $split_last:ident
+        ) => {
+            $(#[$doc])*
+            #[derive(Debug)]
+            pub struct $name<'a, T, const PAGE: usize = DEFAULT_PAGE>($producer<'a, T, PAGE>);
+
+            #[derive(Debug)]
+            struct $producer<'a, T, const PAGE: usize> {
+                head: &'a $($mutability)* [T],
+                // Every page here is full. Only the two ends can be partial.
+                middle: &'a $($mutability)* [Vec<T>],
+                tail: &'a $($mutability)* [T],
+            }
+
+            impl<'a, T, const PAGE: usize> $producer<'a, T, PAGE> {
+                fn new(pages: &'a $($mutability)* [Vec<T>]) -> Self {
+                    match pages.$split_last() {
+                        Some((tail, middle)) => Self { head: &$($mutability)* [], middle, tail },
+                        None => Self::from_head(&$($mutability)* []),
+                    }
+                }
+
+                fn from_head(head: &'a $($mutability)* [T]) -> Self {
+                    Self {
+                        head,
+                        middle: &$($mutability)* [],
+                        tail: &$($mutability)* [],
+                    }
+                }
+
+                fn len(&self) -> usize {
+                    self.head.len() + self.middle.len() * PAGE + self.tail.len()
+                }
+            }
+
+            impl<'a, T: $bound, const PAGE: usize> IntoParallelIterator
+                for &'a $($mutability)* PagedVec<T, PAGE>
+            {
+                type Item = &'a $($mutability)* T;
+                type Iter = $name<'a, T, PAGE>;
+
+                fn into_par_iter(self) -> Self::Iter {
+                    let used = self.used_pages();
+                    $name($producer::new(&$($mutability)* self.pages[..used]))
+                }
+            }
+
+            impl<'a, T: $bound, const PAGE: usize> ParallelIterator for $name<'a, T, PAGE> {
+                type Item = &'a $($mutability)* T;
+
+                fn drive_unindexed<C: UnindexedConsumer<Self::Item>>(self, consumer: C) -> C::Result {
+                    bridge(self, consumer)
+                }
+
+                fn opt_len(&self) -> Option<usize> {
+                    Some(self.len())
+                }
+            }
+
+            impl<T: $bound, const PAGE: usize> IndexedParallelIterator for $name<'_, T, PAGE> {
+                fn len(&self) -> usize {
+                    self.0.len()
+                }
+
+                fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+                    bridge(self, consumer)
+                }
+
+                fn with_producer<CB: ProducerCallback<Self::Item>>(self, callback: CB) -> CB::Output {
+                    callback.callback(self.0)
+                }
+            }
+
+            impl<'a, T: $bound, const PAGE: usize> Producer for $producer<'a, T, PAGE> {
+                type Item = &'a $($mutability)* T;
+                type IntoIter = $sequential<'a, T>;
+
+                fn into_iter(self) -> Self::IntoIter {
+                    let remaining = self.len();
+                    $sequential {
+                        pages: self.middle.$iter(),
+                        front: self.head.$iter(),
+                        back: self.tail.$iter(),
+                        remaining,
+                    }
+                }
+
+                fn split_at(self, index: usize) -> (Self, Self) {
+                    let Self { head, middle, tail } = self;
+                    if index <= head.len() {
+                        let (left, right) = head.$split_at(index);
+                        return (
+                            Self::from_head(left),
+                            Self { head: right, middle, tail },
+                        );
+                    }
+
+                    let index = index - head.len();
+                    let middle_len = middle.len() * PAGE;
+                    if index >= middle_len {
+                        let (left, right) = tail.$split_at(index - middle_len);
+                        return (
+                            Self { head, middle, tail: left },
+                            Self::from_head(right),
+                        );
+                    }
+
+                    let (page, offset) = split::<PAGE>(index);
+                    let (left, right) = middle.$split_at(page);
+                    if offset == 0 {
+                        return (
+                            Self { head, middle: left, tail: &$($mutability)* [] },
+                            Self { head: &$($mutability)* [], middle: right, tail },
+                        );
+                    }
+
+                    let (page, right) = right.$split_first().expect("split inside a full page");
+                    let (left_tail, right_head) = page.$split_at(offset);
+                    (
+                        Self { head, middle: left, tail: left_tail },
+                        Self { head: right_head, middle: right, tail },
+                    )
+                }
+            }
+        };
+    }
+
+    parallel_iter!(
+        /// Indexed parallel iterator over references to the elements of a [`PagedVec`].
+        ParIter,
+        PageProducer,
+        Iter,
+        Sync,
+        [],
+        iter,
+        split_at,
+        split_first,
+        split_last
+    );
+    parallel_iter!(
+        /// Indexed parallel iterator over mutable references to the elements of a [`PagedVec`].
+        ParIterMut, PageProducerMut, IterMut, Send, [mut], iter_mut, split_at_mut, split_first_mut,
+        split_last_mut
+    );
+
+    impl<T, const PAGE: usize> Clone for ParIter<'_, T, PAGE> {
+        fn clone(&self) -> Self {
+            let PageProducer { head, middle, tail } = self.0;
+            Self(PageProducer { head, middle, tail })
+        }
+    }
+
+    impl<T: Send, const PAGE: usize> FromParallelIterator<T> for PagedVec<T, PAGE> {
+        fn from_par_iter<I: IntoParallelIterator<Item = T>>(iter: I) -> Self {
+            let mut out = Self::new();
+            out.par_extend(iter);
+            out
+        }
+    }
+
+    impl<T: Send, const PAGE: usize> ParallelExtend<T> for PagedVec<T, PAGE> {
+        fn par_extend<I: IntoParallelIterator<Item = T>>(&mut self, iter: I) {
+            let chunks = iter.into_par_iter().collect_vec_list();
+            self.reserve(chunks.iter().map(Vec::len).sum());
+            self.extend(chunks.into_iter().flatten());
+        }
     }
 }
 

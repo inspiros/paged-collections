@@ -92,6 +92,22 @@
 //! map.shrink_to_fit(); // frees the now-empty page
 //! assert_eq!(map.allocated_pages(), 1);
 //! ```
+//!
+//! With the `rayon` feature, borrowed parallel iterators are unindexed and
+//! visit entries page by page. Collecting into a `Vec` preserves slot-index
+//! order. The order of `for_each` is unspecified.
+//!
+//! ```rust
+//! # #[cfg(feature = "rayon")] {
+//! use paged_collections::direct_map::PagedDirectMap;
+//! use rayon::prelude::*;
+//!
+//! let mut map: PagedDirectMap<u32, i32, 4> =
+//!     [(9, 10), (2, 20)].into_iter().collect();
+//! map.par_iter_mut().for_each(|(_, value)| *value += 1);
+//! assert_eq!(map.par_iter().map(|(k, &v)| (k, v)).collect::<Vec<_>>(), [(2, 21), (9, 11)]);
+//! # }
+//! ```
 
 use alloc::boxed::Box;
 use alloc::vec::{self, Vec};
@@ -609,21 +625,34 @@ impl<K: DirectKey + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> 
     }
 }
 
-/// Maps are equal when they hold the same entries. Allocated pages do not
-/// matter.
-impl<K: DirectKey, V: PartialEq, const PAGE: usize, D: Directory> PartialEq
-    for PagedDirectMap<K, V, PAGE, D>
+/// Compares entries in [`iter`](PagedDirectMap::iter)'s slot-index order,
+/// across page sizes and directories.
+impl<
+    K: DirectKey,
+    V: PartialEq<W>,
+    W,
+    const PAGE: usize,
+    D: Directory,
+    const P2: usize,
+    D2: Directory,
+> PartialEq<PagedDirectMap<K, W, P2, D2>> for PagedDirectMap<K, V, PAGE, D>
 {
-    fn eq(&self, other: &Self) -> bool {
-        // Iteration order is canonical (slot-index order, one entry per
-        // slot), so equal maps iterate identically.
-        self.len == other.len && self.iter().eq(other.iter())
+    fn eq(&self, other: &PagedDirectMap<K, W, P2, D2>) -> bool {
+        self.len == other.len
+            && self
+                .iter()
+                .zip(other.iter())
+                .all(|((key, value), (other_key, other_value))| {
+                    key == other_key && value == other_value
+                })
     }
 }
 
+/// Map [`PartialEq`] is an equivalence relation when the values implement [`Eq`].
 impl<K: DirectKey, V: Eq, const PAGE: usize, D: Directory> Eq for PagedDirectMap<K, V, PAGE, D> {}
 
-/// Hashes the entries in slot-index order, consistent with `Eq`.
+/// Hashes the length, then the entries in slot-index order, consistent with
+/// [`PartialEq`].
 impl<K: DirectKey + Hash, V: Hash, const PAGE: usize, D: Directory> Hash
     for PagedDirectMap<K, V, PAGE, D>
 {
@@ -1299,6 +1328,89 @@ impl<K: DirectKey, V, const PAGE: usize, D: Directory> Clone for Keys<'_, K, V, 
 impl<K: DirectKey, V, const PAGE: usize, D: Directory> Clone for Values<'_, K, V, PAGE, D> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+#[cfg(feature = "rayon")]
+pub use rayon_impl::{ParIter, ParIterMut};
+
+#[cfg(feature = "rayon")]
+mod rayon_impl {
+    use super::*;
+    use rayon::iter::plumbing::UnindexedConsumer;
+    use rayon::prelude::*;
+
+    /// Unindexed parallel iterator over the entries of a [`PagedDirectMap`].
+    pub struct ParIter<'a, K: DirectKey, V, const PAGE: usize = DEFAULT_PAGE>(
+        Vec<(usize, &'a [Slot<K, V>; PAGE])>,
+    );
+
+    /// Unindexed parallel iterator over the entries of a [`PagedDirectMap`], with mutable values.
+    pub struct ParIterMut<'a, K: DirectKey, V, const PAGE: usize = DEFAULT_PAGE>(
+        Vec<(usize, &'a mut [Slot<K, V>; PAGE])>,
+    );
+
+    impl<'a, K: DirectKey + Send, V: Sync, const PAGE: usize, D: Directory> IntoParallelIterator
+        for &'a PagedDirectMap<K, V, PAGE, D>
+    where
+        K::Tag: Sync,
+        Store<K, V, PAGE, D>: Sync,
+    {
+        type Item = (K, &'a V);
+        type Iter = ParIter<'a, K, V, PAGE>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            ParIter(self.pages.pages().collect())
+        }
+    }
+
+    impl<'a, K: DirectKey + Send, V: Send, const PAGE: usize, D: Directory> IntoParallelIterator
+        for &'a mut PagedDirectMap<K, V, PAGE, D>
+    where
+        K::Tag: Send,
+    {
+        type Item = (K, &'a mut V);
+        type Iter = ParIterMut<'a, K, V, PAGE>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            ParIterMut(self.pages.pages_mut().collect())
+        }
+    }
+
+    impl<'a, K: DirectKey + Send, V: Sync, const PAGE: usize> ParallelIterator
+        for ParIter<'a, K, V, PAGE>
+    where
+        K::Tag: Sync,
+    {
+        type Item = (K, &'a V);
+
+        fn drive_unindexed<C: UnindexedConsumer<Self::Item>>(self, consumer: C) -> C::Result {
+            self.0
+                .into_par_iter()
+                .flat_map_iter(|page| {
+                    page.slots()
+                        .filter_map(|(index, slot)| SlotEntry::<K>::entry(slot, index))
+                })
+                .drive_unindexed(consumer)
+        }
+    }
+
+    impl<'a, K: DirectKey + Send, V: Send, const PAGE: usize> ParallelIterator
+        for ParIterMut<'a, K, V, PAGE>
+    where
+        K::Tag: Send,
+    {
+        type Item = (K, &'a mut V);
+
+        fn drive_unindexed<C: UnindexedConsumer<Self::Item>>(self, consumer: C) -> C::Result {
+            self.0
+                .into_par_iter()
+                .flat_map_iter(|page| {
+                    page.slots()
+                        .filter_map(|(index, slot)| SlotEntry::<K>::entry(slot, index))
+                })
+                .drive_unindexed(consumer)
+        }
     }
 }
 

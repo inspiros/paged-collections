@@ -17,10 +17,13 @@ default = ["std"]
 std = []
 ## `Serialize`/`Deserialize` for the collections.
 serde = ["dep:serde"]
+## Parallel iterators with rayon (needs std).
+rayon = ["dep:rayon", "std"]
 ## Concurrent containers using core atomics and alloc.
 concurrent = []
 
 [dependencies]
+rayon = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 
 [target.'cfg(loom)'.dependencies]

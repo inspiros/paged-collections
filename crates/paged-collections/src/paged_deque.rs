@@ -34,6 +34,22 @@
 //! assert_eq!(queue.pop_front(), Some(5));
 //! assert_eq!(queue.front(), Some(&10));
 //! ```
+//!
+//! With the `rayon` feature, borrowed parallel iterators are unindexed and
+//! allocate a vector with one slice reference per used page. Collecting into
+//! a `Vec` preserves deque order. The order of `for_each` is unspecified.
+//!
+//! ```rust
+//! # #[cfg(feature = "rayon")] {
+//! use paged_collections::paged_deque::PagedDeque;
+//! use rayon::prelude::*;
+//!
+//! let mut queue: PagedDeque<_, 2> = [1, 2, 3].into();
+//! queue.push_front(0);
+//! queue.par_iter_mut().for_each(|value| *value += 1);
+//! assert_eq!(queue.par_iter().copied().collect::<Vec<_>>(), [1, 2, 3, 4]);
+//! # }
+//! ```
 
 use alloc::boxed::Box;
 use alloc::collections::{TryReserveError, VecDeque, vec_deque};
@@ -1091,6 +1107,62 @@ impl<T, const PAGE: usize> IntoIterator for PagedDeque<T, PAGE> {
     type IntoIter = IntoIter<T, PAGE>;
     fn into_iter(self) -> Self::IntoIter {
         IntoIter { deque: self }
+    }
+}
+
+#[cfg(feature = "rayon")]
+pub use rayon_impl::{ParIter, ParIterMut};
+
+#[cfg(feature = "rayon")]
+mod rayon_impl {
+    use super::*;
+    use rayon::iter::plumbing::UnindexedConsumer;
+    use rayon::prelude::*;
+
+    /// Unindexed parallel iterator over references to the elements of a [`PagedDeque`].
+    pub struct ParIter<'a, T>(Vec<&'a [T]>);
+
+    /// Unindexed parallel iterator over mutable references to the elements of a [`PagedDeque`].
+    pub struct ParIterMut<'a, T>(Vec<&'a mut [T]>);
+
+    impl<'a, T: Sync, const PAGE: usize> IntoParallelIterator for &'a PagedDeque<T, PAGE> {
+        type Item = &'a T;
+        type Iter = ParIter<'a, T>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            ParIter(self.pages().collect())
+        }
+    }
+
+    impl<'a, T: Send, const PAGE: usize> IntoParallelIterator for &'a mut PagedDeque<T, PAGE> {
+        type Item = &'a mut T;
+        type Iter = ParIterMut<'a, T>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            ParIterMut(self.pages_mut().collect())
+        }
+    }
+
+    impl<'a, T: Sync> ParallelIterator for ParIter<'a, T> {
+        type Item = &'a T;
+
+        fn drive_unindexed<C: UnindexedConsumer<Self::Item>>(self, consumer: C) -> C::Result {
+            self.0
+                .into_par_iter()
+                .flat_map_iter(|page| page.iter())
+                .drive_unindexed(consumer)
+        }
+    }
+
+    impl<'a, T: Send> ParallelIterator for ParIterMut<'a, T> {
+        type Item = &'a mut T;
+
+        fn drive_unindexed<C: UnindexedConsumer<Self::Item>>(self, consumer: C) -> C::Result {
+            self.0
+                .into_par_iter()
+                .flat_map_iter(|page| page.iter_mut())
+                .drive_unindexed(consumer)
+        }
     }
 }
 

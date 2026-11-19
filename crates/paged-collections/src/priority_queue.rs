@@ -34,13 +34,30 @@
 //! assert_eq!(queue.pop(), Some((7, 30)));
 //! assert_eq!(queue.pop(), Some((3_000_000, 20)));
 //! ```
+//!
+//! With the `rayon` feature, the shared parallel iterator is indexed and
+//! follows heap order.
+//!
+//! ```rust
+//! # #[cfg(feature = "rayon")] {
+//! use paged_collections::priority_queue::PagedPriorityQueue;
+//! use rayon::prelude::*;
+//!
+//! let mut queue: PagedPriorityQueue<u32, i32> = PagedPriorityQueue::new();
+//! queue.push(7, 10);
+//! queue.push(2, 20);
+//! assert_eq!(queue.par_iter().map(|(&k, &p)| (k, p)).collect::<Vec<_>>(), [(2, 20), (7, 10)]);
+//! # }
+//! ```
 
 use alloc::vec::Vec;
 use core::fmt;
+use core::hash::{Hash, Hasher};
 use core::iter::{FusedIterator, Zip};
 use core::marker::PhantomData;
 use core::slice;
 
+use crate::hash::hash_unordered;
 use crate::key::Key;
 use crate::page::{DEFAULT_PAGE, Directory, Flat};
 use crate::sparse_set::{PagedSparseSet, Slot};
@@ -465,6 +482,33 @@ impl<K: Key + fmt::Debug, P: fmt::Debug, const PAGE: usize, D: Directory> fmt::D
     }
 }
 
+/// Compares priorities by exact key using [`priority`](PagedPriorityQueue::priority),
+/// across page sizes and directories. Equality ignores heap layout.
+impl<K: Key, P: PartialEq<Q>, Q, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    PartialEq<PagedPriorityQueue<K, Q, P2, D2>> for PagedPriorityQueue<K, P, PAGE, D>
+{
+    fn eq(&self, other: &PagedPriorityQueue<K, Q, P2, D2>) -> bool {
+        self.len() == other.len()
+            && self.iter().all(|(key, priority)| {
+                other
+                    .priority(key)
+                    .is_some_and(|other_priority| priority == other_priority)
+            })
+    }
+}
+
+/// Queue [`PartialEq`] is an equivalence relation when priorities implement [`Eq`].
+impl<K: Key, P: Eq, const PAGE: usize, D: Directory> Eq for PagedPriorityQueue<K, P, PAGE, D> {}
+
+/// Hashes the key-priority pairs in any order, consistent with [`PartialEq`].
+impl<K: Key + Hash, P: Hash, const PAGE: usize, D: Directory> Hash
+    for PagedPriorityQueue<K, P, PAGE, D>
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_unordered(self.iter(), state);
+    }
+}
+
 /// Repeatedly pushes entries, so later entries in a slot win.
 impl<K: Key, P: Ord, const PAGE: usize, D: Directory> Extend<(K, P)>
     for PagedPriorityQueue<K, P, PAGE, D>
@@ -570,6 +614,25 @@ impl<K, P, const PAGE: usize, D: Directory> DoubleEndedIterator for Drain<'_, K,
 
 impl<K, P, const PAGE: usize, D: Directory> ExactSizeIterator for Drain<'_, K, P, PAGE, D> {}
 impl<K, P, const PAGE: usize, D: Directory> FusedIterator for Drain<'_, K, P, PAGE, D> {}
+
+#[cfg(feature = "rayon")]
+mod rayon_impl {
+    use super::*;
+    use rayon::prelude::*;
+
+    impl<'a, K: Key + Sync, P: Sync, const PAGE: usize, D: Directory> IntoParallelIterator
+        for &'a PagedPriorityQueue<K, P, PAGE, D>
+    {
+        type Item = (&'a K, &'a P);
+        type Iter = rayon::iter::Zip<rayon::slice::Iter<'a, K>, rayon::slice::Iter<'a, P>>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            self.key_slice()
+                .par_iter()
+                .zip(self.priority_slice().par_iter())
+        }
+    }
+}
 
 #[cfg(feature = "serde")]
 mod serde_impl {

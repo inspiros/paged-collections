@@ -78,11 +78,29 @@
 //! assert!(core::ptr::eq(addr, &hive[b]));
 //! assert_eq!(hive.values().copied().collect::<Vec<_>>(), ["c", "b", "d", "e", "f", "g"]);
 //! ```
+//!
+//! With the `rayon` feature, borrowed parallel iterators are unindexed and
+//! visit occupied slots page by page. Collecting into a `Vec` preserves slot
+//! order. The order of `for_each` is unspecified.
+//!
+//! ```rust
+//! # #[cfg(feature = "rayon")] {
+//! use paged_collections::hive::Hive;
+//! use rayon::prelude::*;
+//!
+//! let mut hive: Hive<_, 2> = Hive::new();
+//! let a = hive.insert(10);
+//! let b = hive.insert(20);
+//! hive.par_iter_mut().for_each(|(_, value)| *value += 1);
+//! assert_eq!(hive.par_iter().map(|(id, &v)| (id, v)).collect::<Vec<_>>(), [(a, 11), (b, 21)]);
+//! # }
+//! ```
 
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt;
+use core::hash::{Hash, Hasher};
 use core::iter::{Enumerate, FusedIterator};
 use core::ops::{Index, IndexMut};
 
@@ -1156,7 +1174,19 @@ impl<T: PartialEq<U>, U, const PAGE: usize, const PAGE2: usize> PartialEq<Hive<U
     }
 }
 
+/// Hive [`PartialEq`] is an equivalence relation when elements implement [`Eq`].
 impl<T: Eq, const PAGE: usize> Eq for Hive<T, PAGE> {}
+
+/// Hashes the length, then the id-element pairs in slot order, consistent
+/// with [`PartialEq`].
+impl<T: Hash, const PAGE: usize> Hash for Hive<T, PAGE> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_usize(self.len);
+        for entry in self {
+            entry.hash(state);
+        }
+    }
+}
 
 impl<T, const PAGE: usize> Index<Id> for Hive<T, PAGE> {
     type Output = T;
@@ -1610,6 +1640,71 @@ impl<T> Clone for Ids<'_, T> {
 impl<T> Clone for Values<'_, T> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+#[cfg(feature = "rayon")]
+pub use rayon_impl::{ParIter, ParIterMut};
+
+#[cfg(feature = "rayon")]
+mod rayon_impl {
+    use super::*;
+    use core::iter::from_fn;
+    use rayon::iter::plumbing::UnindexedConsumer;
+    use rayon::prelude::*;
+
+    /// Unindexed parallel iterator over the ids and elements of a [`Hive`].
+    pub struct ParIter<'a, T, const PAGE: usize = DEFAULT_PAGE>(&'a [Page<T>]);
+
+    /// Unindexed parallel iterator over the ids and mutable elements of a [`Hive`].
+    pub struct ParIterMut<'a, T, const PAGE: usize = DEFAULT_PAGE>(&'a mut [Page<T>]);
+
+    impl<'a, T: Sync, const PAGE: usize> IntoParallelIterator for &'a Hive<T, PAGE> {
+        type Item = (Id, &'a T);
+        type Iter = ParIter<'a, T, PAGE>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            ParIter(&self.pages)
+        }
+    }
+
+    impl<'a, T: Send, const PAGE: usize> IntoParallelIterator for &'a mut Hive<T, PAGE> {
+        type Item = (Id, &'a mut T);
+        type Iter = ParIterMut<'a, T, PAGE>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            ParIterMut(&mut self.pages)
+        }
+    }
+
+    impl<'a, T: Sync, const PAGE: usize> ParallelIterator for ParIter<'a, T, PAGE> {
+        type Item = (Id, &'a T);
+
+        fn drive_unindexed<C: UnindexedConsumer<Self::Item>>(self, consumer: C) -> C::Result {
+            self.0
+                .par_iter()
+                .enumerate()
+                .flat_map_iter(|(number, page)| {
+                    let mut slots = PageSlots::new(number * PAGE, page.slots.iter(), page.len);
+                    from_fn(move || slots.next(take_ref))
+                })
+                .drive_unindexed(consumer)
+        }
+    }
+
+    impl<'a, T: Send, const PAGE: usize> ParallelIterator for ParIterMut<'a, T, PAGE> {
+        type Item = (Id, &'a mut T);
+
+        fn drive_unindexed<C: UnindexedConsumer<Self::Item>>(self, consumer: C) -> C::Result {
+            self.0
+                .par_iter_mut()
+                .enumerate()
+                .flat_map_iter(|(number, page)| {
+                    let mut slots = PageSlots::new(number * PAGE, page.slots.iter_mut(), page.len);
+                    from_fn(move || slots.next(take_mut))
+                })
+                .drive_unindexed(consumer)
+        }
     }
 }
 

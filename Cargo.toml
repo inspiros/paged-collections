@@ -20,6 +20,7 @@ paged-collections = { path = "crates/paged-collections", version = "0.1.0" }
 # version-specific builds.
 pyo3 = { version = "0.30", features = ["abi3-py310", "abi3t-py315"] }
 numpy = "0.30"
+rayon = "1.10"
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 
 [workspace.lints.rust]

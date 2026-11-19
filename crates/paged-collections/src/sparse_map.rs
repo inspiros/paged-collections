@@ -44,15 +44,34 @@
 //! assert_eq!(map.key_slice(), &[7]);
 //! assert_eq!(map.value_slice(), &["nearer"]);
 //! ```
+//!
+//! With the `rayon` feature, parallel iterators are indexed and follow
+//! dense order.
+//!
+//! ```rust
+//! # #[cfg(feature = "rayon")] {
+//! use paged_collections::sparse_map::PagedSparseMap;
+//! use rayon::prelude::*;
+//!
+//! let mut map: PagedSparseMap<u32, i32> = [(7, 10), (2, 20)].into_iter().collect();
+//! map.par_iter_mut().for_each(|(&key, value)| *value += key as i32);
+//! assert_eq!(map.par_iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(), [(7, 17), (2, 22)]);
+//! assert_eq!(map.par_keys().copied().collect::<Vec<_>>(), [7, 2]);
+//! map.par_values_mut().for_each(|value| *value *= 2);
+//! assert_eq!(map.par_values().copied().collect::<Vec<_>>(), [34, 44]);
+//! # }
+//! ```
 
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt;
+use core::hash::{Hash, Hasher};
 use core::iter::{FusedIterator, Zip};
 use core::ops::Index;
 use core::slice;
 
+use crate::hash::hash_unordered;
 use crate::key::Key;
 use crate::page::{DEFAULT_PAGE, Directory, Flat};
 use crate::sparse_set::{PagedSparseSet, Slot};
@@ -648,19 +667,32 @@ impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::D
     }
 }
 
-/// Maps are equal when they hold the same entries, in any order.
-impl<K: Key, V: PartialEq, const PAGE: usize, D: Directory> PartialEq
-    for PagedSparseMap<K, V, PAGE, D>
+/// Compares values by exact key using [`get`](PagedSparseMap::get), in any
+/// order and across page sizes and directories.
+impl<K: Key, V: PartialEq<W>, W, const PAGE: usize, D: Directory, const P2: usize, D2: Directory>
+    PartialEq<PagedSparseMap<K, W, P2, D2>> for PagedSparseMap<K, V, PAGE, D>
 {
-    fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, other: &PagedSparseMap<K, W, P2, D2>) -> bool {
         self.len() == other.len()
-            && self
-                .iter()
-                .all(|(&key, value)| other.get(key) == Some(value))
+            && self.iter().all(|(&key, value)| {
+                other
+                    .get(key)
+                    .is_some_and(|other_value| value == other_value)
+            })
     }
 }
 
+/// Map [`PartialEq`] is an equivalence relation when the values implement [`Eq`].
 impl<K: Key, V: Eq, const PAGE: usize, D: Directory> Eq for PagedSparseMap<K, V, PAGE, D> {}
+
+/// Hashes the key-value pairs in any order, consistent with [`PartialEq`].
+impl<K: Key + Hash, V: Hash, const PAGE: usize, D: Directory> Hash
+    for PagedSparseMap<K, V, PAGE, D>
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_unordered(self.iter(), state);
+    }
+}
 
 /// `map[key]` returns the value for `key`.
 ///
@@ -799,6 +831,65 @@ impl<K, V> Clone for Iter<'_, K, V> {
 impl<K: Clone, V: Clone> Clone for IntoIter<K, V> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+#[cfg(feature = "rayon")]
+mod rayon_impl {
+    use super::*;
+    use rayon::iter::Zip;
+    use rayon::prelude::*;
+    use rayon::slice::{Iter, IterMut};
+
+    impl<K: Key, V, const PAGE: usize, D: Directory> PagedSparseMap<K, V, PAGE, D> {
+        /// Iterates in parallel over the keys in dense order.
+        pub fn par_keys(&self) -> Iter<'_, K>
+        where
+            K: Sync,
+        {
+            self.key_slice().par_iter()
+        }
+
+        /// Iterates in parallel over the values in dense order.
+        pub fn par_values(&self) -> Iter<'_, V>
+        where
+            V: Sync,
+        {
+            self.value_slice().par_iter()
+        }
+
+        /// Iterates in parallel over mutable values in dense order.
+        pub fn par_values_mut(&mut self) -> IterMut<'_, V>
+        where
+            V: Send,
+        {
+            self.value_slice_mut().par_iter_mut()
+        }
+    }
+
+    impl<'a, K: Key + Sync, V: Sync, const PAGE: usize, D: Directory> IntoParallelIterator
+        for &'a PagedSparseMap<K, V, PAGE, D>
+    {
+        type Item = (&'a K, &'a V);
+        type Iter = Zip<Iter<'a, K>, Iter<'a, V>>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            self.par_keys().zip(self.par_values())
+        }
+    }
+
+    impl<'a, K: Key + Sync, V: Send, const PAGE: usize, D: Directory> IntoParallelIterator
+        for &'a mut PagedSparseMap<K, V, PAGE, D>
+    {
+        type Item = (&'a K, &'a mut V);
+        type Iter = Zip<Iter<'a, K>, IterMut<'a, V>>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            self.keys
+                .as_slice()
+                .par_iter()
+                .zip(self.values.par_iter_mut())
+        }
     }
 }
 

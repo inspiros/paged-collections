@@ -4,6 +4,7 @@
 //! It models swap removal exactly, but accepts any valid dense permutation after
 //! retain or sorting. Exhaustive small-domain probes and historical wide keys
 //! keep checking stale slots after clear, removal, and generation replacement.
+//! Set algebra uses a `BTreeSet` oracle for plain integer keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
@@ -497,6 +498,100 @@ mod integer_sequences {
         integer_keys(),
         (0..52).collect()
     );
+
+    fn algebra_keys() -> BoxedStrategy<u32> {
+        prop_oneof![
+            16 => 0_u32..200,
+            1 => any::<u32>(),
+            1 => Just(u32::MAX),
+            1 => Just(1_u32 << 31),
+        ]
+        .boxed()
+    }
+
+    fn check_algebra_keys(
+        actual: impl Iterator<Item = u32>,
+        expected: &BTreeSet<u32>,
+        context: &str,
+    ) -> TestCaseResult {
+        let mut actual: Vec<_> = actual.collect();
+        prop_assert_eq!(actual.len(), expected.len(), "{}", context);
+        actual.sort_unstable();
+        prop_assert_eq!(
+            actual,
+            expected.iter().copied().collect::<Vec<_>>(),
+            "{}",
+            context
+        );
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+        #[test]
+        fn set_algebra(
+            left_keys in prop::collection::vec(algebra_keys(), 0..max_len()),
+            right_keys in prop::collection::vec(algebra_keys(), 0..max_len()),
+        ) {
+            let left: PagedSparseSet<u32, 4, Tree> = left_keys.iter().copied().collect();
+            let right: PagedSparseSet<u32, 64, Radix> = right_keys.iter().copied().collect();
+            let model_left: BTreeSet<_> = left_keys.into_iter().collect();
+            let model_right: BTreeSet<_> = right_keys.into_iter().collect();
+
+            let union = &model_left | &model_right;
+            let intersection = &model_left & &model_right;
+            let difference = &model_left - &model_right;
+            let symmetric = &model_left ^ &model_right;
+
+            check_algebra_keys(left.union(&right).copied(), &union, "union")?;
+            check_algebra_keys(left.intersection(&right).copied(), &intersection, "intersection")?;
+            check_algebra_keys(left.difference(&right).copied(), &difference, "difference")?;
+            check_algebra_keys(
+                left.symmetric_difference(&right).copied(),
+                &symmetric,
+                "symmetric difference",
+            )?;
+
+            prop_assert_eq!(left.is_disjoint(&right), model_left.is_disjoint(&model_right));
+            prop_assert_eq!(left.is_subset(&right), model_left.is_subset(&model_right));
+            prop_assert_eq!(left.is_superset(&right), model_left.is_superset(&model_right));
+
+            let check_set = |set: &PagedSparseSet<u32, 4, Tree>, expected: &BTreeSet<u32>, context| {
+                check_algebra_keys(set.iter().copied(), expected, context)?;
+                for (pos, &key) in set.iter().enumerate() {
+                    prop_assert_eq!(set.position(key), Some(pos), "{}: key {}", context, key);
+                }
+                for &key in &union {
+                    prop_assert_eq!(
+                        set.contains(key),
+                        expected.contains(&key),
+                        "{}: key {}",
+                        context,
+                        key
+                    );
+                }
+                Ok(())
+            };
+
+            check_set(&(&left | &right), &union, "|")?;
+            check_set(&(&left & &right), &intersection, "&")?;
+            check_set(&(&left - &right), &difference, "-")?;
+            check_set(&(&left ^ &right), &symmetric, "^")?;
+
+            let mut assigned = left.clone();
+            assigned |= &right;
+            check_set(&assigned, &union, "|=")?;
+            let mut assigned = left.clone();
+            assigned &= &right;
+            check_set(&assigned, &intersection, "&=")?;
+            let mut assigned = left.clone();
+            assigned -= &right;
+            check_set(&assigned, &difference, "-=")?;
+            let mut assigned = left;
+            assigned ^= &right;
+            check_set(&assigned, &symmetric, "^=")?;
+        }
+    }
 }
 
 #[cfg(target_pointer_width = "64")]
