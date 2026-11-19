@@ -16,6 +16,7 @@
 //! | [`sparse_map`] | `PagedSparseMap<K, V>` | index; storage optional |
 //! | [`priority_queue`] | `PagedPriorityQueue<K, P>` | index (indexed max-heap) |
 //! | [`direct_map`] | `PagedDirectMap<K, V>` | index (values in place, slot order) |
+//! | [`bit_set`] | `PagedBitSet<K>` | index (1 bit per slot) |
 //! | [`paged_vec`] | `PagedVec<T>` | storage (stable addresses) |
 //! | [`paged_deque`] | `PagedDeque<T>` | storage (stable addresses, double-ended) |
 //! | [`hive`] | `Hive<T>` | storage (stable addresses, reusable slots, generational ids) |
@@ -40,6 +41,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod bit_set;
 // Needs pointer-sized and 64-bit atomics, and `u32` indices that fit `usize`.
 #[cfg(all(
     feature = "concurrent",

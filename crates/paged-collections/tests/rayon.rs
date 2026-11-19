@@ -4,6 +4,7 @@
 
 use std::sync::LazyLock;
 
+use paged_collections::bit_set::PagedBitSet;
 use paged_collections::direct_map::{PagedDirectMap, Slot};
 use paged_collections::hive::Hive;
 use paged_collections::key::{DirectKey, Key};
@@ -363,5 +364,33 @@ fn directory_backed_parallel_iteration() {
         check_directory::<3, Flat>();
         check_directory::<3, Radix>();
         check_directory::<3, Tree>();
+    });
+}
+
+fn check_bit_set<const PAGE: usize, D: Directory>() {
+    let mut set = PagedBitSet::<usize, PAGE, D>::new();
+    let page_bits = PAGE * 64;
+    for page in (0..8).rev() {
+        let start = page * page_bits;
+        set.insert_range(start..=start + 6);
+        set.insert(start + page_bits - 1);
+    }
+    set.remove_range(2 * page_bits..3 * page_bits);
+    assert_eq!(set.allocated_pages(), 8);
+    assert_eq!(
+        (&set).into_par_iter().collect::<Vec<_>>(),
+        set.iter().collect::<Vec<_>>(),
+    );
+    assert_eq!((&set).into_par_iter().count(), set.len());
+    set.clear();
+    assert!((&set).into_par_iter().collect::<Vec<_>>().is_empty());
+}
+
+#[test]
+fn bit_set_parallel_iteration() {
+    POOL.install(|| {
+        check_bit_set::<1, Flat>();
+        check_bit_set::<3, Radix>();
+        check_bit_set::<8, Tree>();
     });
 }

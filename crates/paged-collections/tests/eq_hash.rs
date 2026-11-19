@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 
+use paged_collections::bit_set::PagedBitSet;
 use paged_collections::direct_map::PagedDirectMap;
 use paged_collections::page::{Directory, Radix, Tree};
 use paged_collections::priority_queue::PagedPriorityQueue;
@@ -25,6 +26,25 @@ where
     assert_eq!(left, right);
     assert_eq!(right, left);
     assert_eq!(hash(left), hash(right));
+}
+
+#[test]
+fn bit_set_ignores_directory_and_empty_pages() {
+    let flat: PagedBitSet<usize, 2> = [127, 0, 128, 65].into_iter().collect();
+    let tree: PagedBitSet<usize, 2, Tree> = [128, 65, 127, 0].into_iter().collect();
+    let mut radix: PagedBitSet<usize, 2, Radix> =
+        [0, usize::MAX, 127, 65, 128].into_iter().collect();
+    assert!(radix.remove(usize::MAX));
+    assert_eq!(flat.allocated_pages(), 2);
+    assert_eq!(radix.allocated_pages(), 3);
+    assert_eq_and_hash(&flat, &tree);
+    assert_eq_and_hash(&tree, &radix);
+    assert_eq_and_hash(&flat, &radix);
+
+    assert!(radix.remove(65));
+    assert!(radix.insert(64));
+    assert_eq!(flat.len(), radix.len());
+    assert_ne!(flat, radix);
 }
 
 #[test]
