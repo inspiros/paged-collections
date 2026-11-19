@@ -22,6 +22,34 @@ use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU8, AtomicU32, AtomicU64};
 
 /// The key type of the integer-keyed collections.
 pub(crate) type Key = u32;
+pub(crate) const KEY_LIMIT: u64 = 1_u64 << 32;
+
+/// An index-protocol object as a slot index, saturated at the key limit;
+/// `None` denotes a negative int. Non-integers raise `TypeError`.
+pub(crate) fn query_index(index: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+    // `operator.index` returns an exact `int` copy of an `int` subclass, so
+    // an overridden `__lt__` cannot change the sign test below.
+    let index = index
+        .py()
+        .import("operator")?
+        .call_method1("index", (index,))?;
+    if index.lt(0)? {
+        Ok(None)
+    } else {
+        Ok(Some(
+            index.extract::<u64>().unwrap_or(KEY_LIMIT).min(KEY_LIMIT),
+        ))
+    }
+}
+
+pub(crate) fn next_slot_index(index: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+    let index = query_index(index)?.unwrap_or(0);
+    Ok((index < KEY_LIMIT).then_some(index as usize))
+}
+
+pub(crate) fn prev_slot_index(index: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+    Ok(query_index(index)?.map(|index| index.min(KEY_LIMIT - 1) as usize))
+}
 
 /// A key type a Python collection can use: `u32` (integer keys) or
 /// [`Id`] (generational ids from `IdAllocator`, as `to_bits` integers).

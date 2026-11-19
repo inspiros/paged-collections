@@ -69,11 +69,27 @@ keys the methods differ when the slot is held by a *different* key:
 | `get(k)`, `get_mut(k)` | `m[k]`, `get(k, default)`, `get_many(keys, default)` |
 | `get_or_insert_with` | `setdefault(k, default)` |
 | `remove(k)` | `del m[k]`, `pop(k[, default])`, `popitem()`, `discard_many(keys)` |
+| `first_key_value()`, `last_key_value()` | `first_item()`, `last_item()` |
+| `pop_first()`, `pop_last()` | `pop_first()`, `pop_last()` |
+| `next_occupant`, `prev_occupant` | `next_occupant(index)`, `prev_occupant(index)` |
 | `contains_key(k)` | `k in m`, `contains_many(keys)` |
 | `key_slice()` | `keys()` (copy), `keys_view()` (zero-copy, read-only) |
 | `value_slice()`, `value_slice_mut()` | typed maps: `values()` (copy), `values_view()` (zero-copy; writeable except for `SparseMapBool`); `SparseMap.values()` returns a list |
 | `sort_keys`, `sort_by*` | `sort_keys()` |
 | `allocated_pages()` | `allocated_pages` |
+
+Ordered queries follow the sparse index. `first_item()` and `last_item()`
+return the `(key, value)` pairs with the smallest and largest slot indices.
+`pop_first()` and `pop_last()` remove and return those pairs by swap removal.
+All four raise `KeyError` on an empty map, and ordered pops raise `BufferError`
+while a NumPy view is alive.
+
+`next_occupant(index)` and `prev_occupant(index)` return the nearest pair at or
+after, or at or before, the given slot index. They return `None` when no entry
+matches. Both accept integers outside the slot domain. A negative index is
+before the first slot, and an index of `2**32` or higher is past the last slot.
+For `IdMap` and its typed variants, pass a slot index and receive a packed ID
+as the key in the returned pair.
 
 Batch methods are described in [NumPy Interop](numpy.md).
 

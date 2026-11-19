@@ -10,30 +10,13 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 use std::ops::Bound as SlotBound;
 
-use crate::convert::{Key, KeyBatch, TypedValue, insert_key, lookup_key, value_batch};
+use crate::convert::{
+    KEY_LIMIT, Key, KeyBatch, TypedValue, insert_key, lookup_key, next_slot_index, prev_slot_index,
+    query_index, value_batch,
+};
 use crate::iter::ordered_key_iterator;
 use crate::repr_items;
 use crate::typed_map::optional_default;
-
-const KEY_LIMIT: u64 = 1_u64 << 32;
-
-/// An index-protocol object as a slot index, saturated at the key limit;
-/// `None` denotes a negative int. Non-integers raise `TypeError`.
-fn query_index(index: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
-    // `operator.index` returns an exact `int` copy of an `int` subclass, so
-    // an overridden `__lt__` cannot change the sign test below.
-    let index = index
-        .py()
-        .import("operator")?
-        .call_method1("index", (index,))?;
-    if index.lt(0)? {
-        Ok(None)
-    } else {
-        Ok(Some(
-            index.extract::<u64>().unwrap_or(KEY_LIMIT).min(KEY_LIMIT),
-        ))
-    }
-}
 
 /// Half-open Python bounds as inclusive Rust slot bounds. The inclusive
 /// upper bound also represents the full u32 domain on a 32-bit target.
@@ -408,14 +391,9 @@ impl DirectMap {
         py: Python<'_>,
         index: &Bound<'_, PyAny>,
     ) -> PyResult<Option<(Key, Py<PyAny>)>> {
-        let index = query_index(index)?.unwrap_or(0);
-        Ok(if index < KEY_LIMIT {
-            self.map
-                .next_occupant(index as usize)
-                .map(|(key, value)| (key, value.clone_ref(py)))
-        } else {
-            None
-        })
+        Ok(next_slot_index(index)?
+            .and_then(|index| self.map.next_occupant(index))
+            .map(|(key, value)| (key, value.clone_ref(py))))
     }
 
     /// Return the last entry at or before ``index``, or ``None``.
@@ -424,12 +402,8 @@ impl DirectMap {
         py: Python<'_>,
         index: &Bound<'_, PyAny>,
     ) -> PyResult<Option<(Key, Py<PyAny>)>> {
-        let Some(index) = query_index(index)? else {
-            return Ok(None);
-        };
-        Ok(self
-            .map
-            .prev_occupant(index.min(KEY_LIMIT - 1) as usize)
+        Ok(prev_slot_index(index)?
+            .and_then(|index| self.map.prev_occupant(index))
             .map(|(key, value)| (key, value.clone_ref(py))))
     }
 
@@ -913,19 +887,15 @@ macro_rules! typed_direct_map {
 
             /// Return the first entry at or after ``index``, or ``None``.
             fn next_occupant(&self, index: &Bound<'_, PyAny>) -> PyResult<Option<(Key, $t)>> {
-                let index = query_index(index)?.unwrap_or(0);
-                Ok(if index < KEY_LIMIT {
-                    self.map.next_occupant(index as usize)
-                        .map(|(key, value)| (key, *value))
-                } else {
-                    None
-                })
+                Ok(next_slot_index(index)?
+                    .and_then(|index| self.map.next_occupant(index))
+                    .map(|(key, value)| (key, *value)))
             }
 
             /// Return the last entry at or before ``index``, or ``None``.
             fn prev_occupant(&self, index: &Bound<'_, PyAny>) -> PyResult<Option<(Key, $t)>> {
-                let Some(index) = query_index(index)? else { return Ok(None) };
-                Ok(self.map.prev_occupant(index.min(KEY_LIMIT - 1) as usize)
+                Ok(prev_slot_index(index)?
+                    .and_then(|index| self.map.prev_occupant(index))
                     .map(|(key, value)| (key, *value)))
             }
 

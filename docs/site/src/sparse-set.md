@@ -67,6 +67,9 @@ key holding a slot. See [Ids and Side Tables](ids.md).
 | `contains(k)` | `k in s`, `contains_many(keys) -> ndarray[bool]` | |
 | `as_slice()` | `to_array()` (copy), `view()` (zero-copy, read-only) | |
 | `iter()` | `iter(s)` | dense order |
+| `first()`, `last()` | `first()`, `last()` | smallest and largest keys |
+| `pop_first()`, `pop_last()` | `pop_first()`, `pop_last()` | remove and return the smallest and largest keys, respectively |
+| `next_occupant`, `prev_occupant` | `next_occupant(index)`, `prev_occupant(index)` | nearest key at or after, or at or before, `index` |
 | `sort*` | `sort()` | |
 | `position(k)` | | dense position |
 | `clear()` / `reset()` | `clear()` | `reset` frees pages |
@@ -75,7 +78,14 @@ key holding a slot. See [Ids and Side Tables](ids.md).
 
 Python keys are integers in `0 <= key < 2**32`. Batch lookups
 (`contains_many`, `discard_many`) treat out-of-range integers as absent;
-`add` and `add_many` raise for them. Set algebra:
+`add` and `add_many` raise for them.
+
+Ordered queries use the sparse index, and `next_occupant` and `prev_occupant`
+require a valid key and return `None` when no key matches. `first()`, `last()`,
+`pop_first()` and `pop_last()` raise `KeyError` on an empty set. Ordered pops
+use swap removal and raise `BufferError` while a `view()` is alive.
+
+### Set Algebra
 
 - Operators take `SparseSet` operands; methods accept any iterable of keys.
 - Results use the receiver's page size, keep the receiver's surviving keys in

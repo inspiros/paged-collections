@@ -84,6 +84,8 @@ Python ids are integers `generation << 32 | index`.
 
 `IdMap` and its typed variants (`IdMapF64`, ..., `id_map(dtype)`) are sparse
 maps keyed by these ids. They accept ids from `IdAllocator` and `Hive`.
+Their [ordered queries](sparse-map.md#rust-and-python) use slot indices and
+return packed ids as keys.
 
 | Rust | Python |
 |---|---|

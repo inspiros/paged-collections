@@ -8,7 +8,7 @@ import sys
 import numpy as np
 import pytest
 
-from paged_collections import KEY_LIMIT, SparseSet
+from paged_collections import KEY_LIMIT, BitSet, SparseSet
 
 
 def test_empty_and_scalar_operations():
@@ -62,10 +62,49 @@ def test_key_boundaries():
     # At most two pages plus the sparse directory, even at the u32 limit.
     s = SparseSet([0, 2**32 - 1])
     assert list(s) == [0, 2**32 - 1]
+    assert s.next_occupant(KEY_LIMIT - 1) == s.prev_occupant(KEY_LIMIT - 1) == KEY_LIMIT - 1
     np.testing.assert_array_equal(s.contains_many([0, 2**32 - 1, 2**32]),
                                   [True, True, False])
     assert s.discard_many([2**32 - 1, -1, 2**32]) == 1
     assert list(s) == [0]
+
+
+def test_empty_ordered_queries_after_clear():
+    s = SparseSet([2048, 2, 1023])
+    s.clear()
+    assert s.next_occupant(0) is None
+    assert s.prev_occupant(2048) is None
+    for method in ("first", "last", "pop_first", "pop_last"):
+        with pytest.raises(KeyError) as error:
+            getattr(s, method)()
+        assert error.value.args == (f"{method}(): SparseSet is empty",)
+    s.add(1)
+    assert s.first() == s.last() == 1
+    assert s.next_occupant(2) is None
+
+
+@pytest.mark.parametrize("index", [-2**200, -1, KEY_LIMIT, 2**200, 1.0, "1", [], None])
+def test_invalid_ordered_indices_match_bit_set(index):
+    s = SparseSet([1])
+    bits = BitSet([1])
+    for method in ("next_occupant", "prev_occupant"):
+        with pytest.raises((OverflowError, TypeError)) as expected:
+            getattr(bits, method)(index)
+        with pytest.raises(type(expected.value)) as error:
+            getattr(s, method)(index)
+        assert error.value.args == expected.value.args
+
+
+def test_ordered_queries_accept_index_protocol():
+    class Index:
+        def __index__(self):
+            return 1024
+
+    s = SparseSet([1025, 1023, 0])
+    assert s.next_occupant(index=Index()) == 1025
+    assert s.prev_occupant(index=np.uint64(1024)) == 1023
+    assert s.next_occupant(True) == 1023
+    assert s.prev_occupant(False) == 0
 
 
 def test_integer_batch_formats(key_batch):
@@ -281,7 +320,10 @@ def test_equality_hash_and_repr():
     )
 
 
-@pytest.mark.parametrize("change", ["insert", "remove", "clear", "sort", "batch_add", "batch_remove"])
+@pytest.mark.parametrize(
+    "change", ["insert", "remove", "clear", "sort", "batch_add", "batch_remove",
+               "pop", "pop_first", "pop_last"],
+)
 def test_iterator_detects_structural_change(change):
     s = SparseSet([9, 2, 7])
     it = iter(s)
@@ -297,8 +339,10 @@ def test_iterator_detects_structural_change(change):
         s.sort()
     elif change == "batch_add":
         s.add_many([2, 5])
-    else:
+    elif change == "batch_remove":
         s.discard_many([2])
+    else:
+        getattr(s, change)()
     with pytest.raises(RuntimeError):
         next(it)
 
@@ -361,7 +405,7 @@ def test_seeded_set_model():
             dense.pop()
 
     for step in range(3000):
-        op = rng.randrange(11)
+        op = rng.randrange(13)
         key = rng.randrange(96) + rng.choice([0, 1024, 4096])
         batch = [key, rng.randrange(96), key, rng.randrange(96) + 1024]
         if op == 0:
@@ -407,11 +451,27 @@ def test_seeded_set_model():
             dense.clear()
         elif op == 9:
             s.reserve(4)
+        elif op in (11, 12):
+            pop = s.pop_first if op == 11 else s.pop_last
+            if model:
+                expected = sorted(model)[0 if op == 11 else -1]
+                assert pop() == expected
+                remove(expected)
+            else:
+                with pytest.raises(KeyError):
+                    pop()
         else:
             assert (key in s) == (key in model)
         assert len(s) == len(model), step
         assert list(s) == dense, step
         assert set(s) == model, step
+        if step % 31 == 0 or not model:
+            ordered = sorted(model)
+            assert s.next_occupant(key) == next((k for k in ordered if k >= key), None)
+            assert s.prev_occupant(key) == next((k for k in reversed(ordered) if k <= key), None)
+            if ordered:
+                assert s.first() == ordered[0]
+                assert s.last() == ordered[-1]
 
 
 @pytest.mark.parametrize("method", ["union", "intersection", "difference"])

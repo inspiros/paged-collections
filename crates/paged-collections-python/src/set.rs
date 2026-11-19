@@ -521,6 +521,58 @@ impl SparseSet {
         Ok(key)
     }
 
+    /// Return the smallest key. Raise KeyError if empty.
+    fn first(&self) -> PyResult<Key> {
+        self.set
+            .first()
+            .ok_or_else(|| PyKeyError::new_err("first(): SparseSet is empty"))
+    }
+
+    /// Return the largest key. Raise KeyError if empty.
+    fn last(&self) -> PyResult<Key> {
+        self.set
+            .last()
+            .ok_or_else(|| PyKeyError::new_err("last(): SparseSet is empty"))
+    }
+
+    /// Remove and return the smallest key. Raise KeyError if empty.
+    fn pop_first(&mut self) -> PyResult<Key> {
+        if !self.set.is_empty() {
+            self.exports.check(NAME)?;
+        }
+        let key = self
+            .set
+            .pop_first()
+            .ok_or_else(|| PyKeyError::new_err("pop_first(): SparseSet is empty"))?;
+        self.changed();
+        Ok(key)
+    }
+
+    /// Remove and return the largest key. Raise KeyError if empty.
+    fn pop_last(&mut self) -> PyResult<Key> {
+        if !self.set.is_empty() {
+            self.exports.check(NAME)?;
+        }
+        let key = self
+            .set
+            .pop_last()
+            .ok_or_else(|| PyKeyError::new_err("pop_last(): SparseSet is empty"))?;
+        self.changed();
+        Ok(key)
+    }
+
+    /// Return the first key at or after index, or None.
+    fn next_occupant(slf: &Bound<'_, Self>, index: &Bound<'_, PyAny>) -> PyResult<Option<Key>> {
+        let index = insert_key(index)?;
+        Ok(slf.try_borrow()?.set.next_occupant(index as usize))
+    }
+
+    /// Return the last key at or before index, or None.
+    fn prev_occupant(slf: &Bound<'_, Self>, index: &Bound<'_, PyAny>) -> PyResult<Option<Key>> {
+        let index = insert_key(index)?;
+        Ok(slf.try_borrow()?.set.prev_occupant(index as usize))
+    }
+
     /// Remove every key. Pages stay allocated for reuse.
     fn clear(&mut self) -> PyResult<()> {
         if !self.set.is_empty() {

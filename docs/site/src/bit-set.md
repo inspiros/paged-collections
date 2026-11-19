@@ -87,10 +87,11 @@ assert_eq!(bits.pop_first(), Some(62));
 - `add_many` and `discard_many` return the number of keys changed.
   `contains_many` returns a boolean NumPy array. `to_numpy()` returns
   a new ascending `uint32` array.
-- `from_mask(mask, offset=0)` reads a one-dimensional boolean array or
-  sequence. A true value at position `i` sets `offset + i`. The whole
-  mask must fit in the key domain. `to_mask(start, stop)` returns a new
-  boolean array with one element per key in the interval, using
-  O(max(0, stop − start)) memory.
+- `from_mask(mask, offset=0, *, page_size=DEFAULT_BIT_PAGE_SIZE)` reads a
+  one-dimensional boolean array or sequence. A true value at position `i`
+  sets `offset + i`. The whole mask must fit in the key domain. The page
+  size counts 64-bit words, as in the constructor.
+- `to_mask(start, stop)` returns a new boolean array with one element per
+  key in the interval, using O(max(0, stop − start)) memory.
 
 API [`PagedBitSet`](https://docs.rs/paged-collections/latest/paged_collections/bit_set/struct.PagedBitSet.html).

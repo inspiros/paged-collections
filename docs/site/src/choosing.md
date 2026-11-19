@@ -28,11 +28,11 @@ They come from one machine and serve as a reference.
 | Iteration | dense array only, insertion order (changed by swap removal) | every allocated slot, key order |
 | `clear` | O(1) for the index | scans allocated pages |
 | Memory per allocated page | `PAGE` × 4 bytes | `PAGE` × slot size |
-| Range queries | no (sort the dense array, then binary search) | `range`, `next_occupant`, `prev_occupant` |
+| Range queries in Rust | `range`, `next_occupant`, `prev_occupant` | `range`, `next_occupant`, `prev_occupant` |
 
-Prefer the direct map when keys fill a few dense ranges, when you want key
-order, or when lookups dominate. Prefer the sparse map when keys are scattered
-thinly or when you need contiguous slices.
+Prefer the direct map when keys fill a few dense ranges, when you want
+iteration in key order, or when lookups dominate. Prefer the sparse map when
+keys are scattered thinly or when you need contiguous slices.
 
 ## Hive or `IdAllocator` with a Map
 

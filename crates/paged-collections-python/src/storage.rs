@@ -206,6 +206,24 @@ impl<K: PyKey> SetInner<K> {
     pub(crate) fn sort_unstable(&mut self) {
         paged!(Self, self, inner => inner.sort_unstable())
     }
+    pub(crate) fn first(&self) -> Option<K> {
+        paged!(Self, self, inner => inner.first().copied())
+    }
+    pub(crate) fn last(&self) -> Option<K> {
+        paged!(Self, self, inner => inner.last().copied())
+    }
+    pub(crate) fn next_occupant(&self, index: usize) -> Option<K> {
+        paged!(Self, self, inner => inner.next_occupant(index).copied())
+    }
+    pub(crate) fn prev_occupant(&self, index: usize) -> Option<K> {
+        paged!(Self, self, inner => inner.prev_occupant(index).copied())
+    }
+    pub(crate) fn pop_first(&mut self) -> Option<K> {
+        paged!(Self, self, inner => inner.pop_first())
+    }
+    pub(crate) fn pop_last(&mut self) -> Option<K> {
+        paged!(Self, self, inner => inner.pop_last())
+    }
 }
 
 impl<K: PyKey, V> MapInner<K, V> {
@@ -259,6 +277,24 @@ impl<K: PyKey, V> MapInner<K, V> {
     }
     pub(crate) fn sort_unstable_keys(&mut self) {
         paged!(Self, self, inner => inner.sort_unstable_keys())
+    }
+    pub(crate) fn first_key_value(&self) -> Option<(&K, &V)> {
+        paged!(Self, self, inner => inner.first_key_value())
+    }
+    pub(crate) fn last_key_value(&self) -> Option<(&K, &V)> {
+        paged!(Self, self, inner => inner.last_key_value())
+    }
+    pub(crate) fn next_occupant(&self, index: usize) -> Option<(&K, &V)> {
+        paged!(Self, self, inner => inner.next_occupant(index))
+    }
+    pub(crate) fn prev_occupant(&self, index: usize) -> Option<(&K, &V)> {
+        paged!(Self, self, inner => inner.prev_occupant(index))
+    }
+    pub(crate) fn pop_first(&mut self) -> Option<(K, V)> {
+        paged!(Self, self, inner => inner.pop_first())
+    }
+    pub(crate) fn pop_last(&mut self) -> Option<(K, V)> {
+        paged!(Self, self, inner => inner.pop_last())
     }
 }
 

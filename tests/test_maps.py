@@ -96,7 +96,63 @@ def test_key_boundaries(map_cls):
     m = map_cls([0, 2**32 - 1], values)
     assert m[0] == values[0]
     assert m[np.uint64(2**32 - 1)] == values[1]
+    last = (pc.KEY_LIMIT - 1, values[1])
+    assert m.next_occupant(pc.KEY_LIMIT - 1) == last
+    assert m.next_occupant(pc.KEY_LIMIT) is None
+    assert m.prev_occupant(pc.KEY_LIMIT) == last
     assert m.discard_many([0, 2**32 - 1, 2**32]) == 2
+    assert not m
+
+
+def test_empty_ordered_queries_after_clear(map_cls):
+    m = map_cls([2048, 2, 1023], _values(map_cls, [0, 1, 2]))
+    m.clear()
+    assert m.next_occupant(0) is None
+    assert m.prev_occupant(2048) is None
+    for method in ("first_item", "last_item", "pop_first", "pop_last"):
+        with pytest.raises(KeyError) as error:
+            getattr(m, method)()
+        assert error.value.args == (f"{method}(): {map_cls.__name__} is empty",)
+    value = _values(map_cls, [1])[0]
+    m[1] = value
+    assert m.first_item() == m.last_item() == (1, value)
+    assert m.next_occupant(2) is None
+
+
+def test_ordered_query_indices_match_direct_map(map_cls):
+    class Index:
+        def __index__(self):
+            return 1024
+
+    direct_cls = getattr(pc, map_cls.__name__.replace("Sparse", "Direct"))
+    keys = [1025, 1023, 0]
+    values = _values(map_cls, [0, 1, 2])
+    m = map_cls(keys, values)
+    direct = direct_cls(keys, values)
+    for method in ("next_occupant", "prev_occupant"):
+        query = getattr(m, method)
+        reference = getattr(direct, method)
+        for index in (-2**200, -1, 0, True, np.uint64(1023), Index(), pc.KEY_LIMIT, 2**200):
+            assert query(index=index) == reference(index)
+        for index in (1.0, "1", [], None):
+            with pytest.raises(TypeError) as expected:
+                reference(index)
+            with pytest.raises(TypeError) as error:
+                query(index)
+            assert error.value.args == expected.value.args
+
+
+@pytest.mark.parametrize("cls", [pc.IdMap, pc.IdMapF64])
+def test_ordered_id_map_queries_use_slot_index(cls):
+    low, high = pc.make_id(2, 3), pc.make_id(1024, 1)
+    m = cls([high, low], [10, 20])
+    assert m.first_item() == (low, 20)
+    assert m.last_item() == (high, 10)
+    assert m.next_occupant(3) == (high, 10)
+    assert m.prev_occupant(1023) == (low, 20)
+    assert m.next_occupant(low) is None
+    assert m.pop_first() == (low, 20)
+    assert m.pop_last() == (high, 10)
     assert not m
 
 
@@ -389,7 +445,10 @@ def test_equality_hash_and_repr(map_cls):
     assert "..." not in repr(m)
 
 
-@pytest.mark.parametrize("change", ["insert", "remove", "clear", "sort", "batch_set", "batch_remove"])
+@pytest.mark.parametrize(
+    "change", ["insert", "remove", "clear", "sort", "batch_set", "batch_remove",
+               "popitem", "pop_first", "pop_last"],
+)
 def test_iterator_detects_structural_change(map_cls, change):
     values = _values(map_cls, [1, 2, 3])
     m = map_cls([9, 2, 7], values)
@@ -406,8 +465,10 @@ def test_iterator_detects_structural_change(map_cls, change):
         m.sort_keys()
     elif change == "batch_set":
         m.set_many([2, 5], values[:2])
-    else:
+    elif change == "batch_remove":
         m.discard_many([2])
+    else:
+        getattr(m, change)()
     with pytest.raises(RuntimeError):
         next(it)
 
@@ -591,6 +652,9 @@ def test_object_values_identity_defaults_and_copy_depth():
     assert m[9] is nested and m[2] is None and m[7] is marker
     assert m.values()[0] is nested
     assert m.items()[0][1] is nested
+    assert m.last_item()[1] is nested
+    assert m.next_occupant(3)[1] is marker
+    assert m.copy().pop_last()[1] is nested
     assert m.get_many([9, 99], None) == [nested, None]
     assert m.get_many([99], marker)[0] is marker
     assert m.setdefault(8) is None
@@ -878,7 +942,7 @@ def test_seeded_map_model(map_cls):
             dense.pop()
 
     for step in range(3000):
-        op = rng.randrange(13)
+        op = rng.randrange(15)
         key = rng.randrange(96) + rng.choice([0, 1024, 4096])
         value = _values(map_cls, [rng.randrange(100)])[0]
         batch = [key, rng.randrange(96), key, rng.randrange(96) + 1024]
@@ -943,11 +1007,29 @@ def test_seeded_map_model(map_cls):
             else:
                 with pytest.raises(KeyError):
                     m[key]
+        elif op in (13, 14):
+            pop = m.pop_first if op == 13 else m.pop_last
+            if model:
+                expected = sorted(model)[0 if op == 13 else -1]
+                assert pop() == (expected, model[expected])
+                remove(expected)
+            else:
+                with pytest.raises(KeyError):
+                    pop()
         else:
             m.reserve(4)
         assert len(m) == len(model), step
         assert list(m) == dense, step
         assert m.items() == [(k, model[k]) for k in dense], step
+        if step % 31 == 0 or not model:
+            ordered = sorted(model.items())
+            next_item = next((item for item in ordered if item[0] >= key), None)
+            prev_item = next((item for item in reversed(ordered) if item[0] <= key), None)
+            assert m.next_occupant(key) == next_item
+            assert m.prev_occupant(key) == prev_item
+            if ordered:
+                assert m.first_item() == ordered[0]
+                assert m.last_item() == ordered[-1]
         if step % 101 == 0:
             np.testing.assert_array_equal(m.keys(), dense)
             _assert_values(m, m.values(), [model[k] for k in dense])

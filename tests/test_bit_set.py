@@ -181,19 +181,29 @@ def test_batch_errors_and_lookup_edges():
     assert list(s) == [MAX_KEY]
 
 
-def test_mask_roundtrip_and_errors():
+@pytest.mark.parametrize("size", PAGE_SIZES)
+def test_mask_roundtrip(size):
     mask = np.array([True, False, False, True, True], dtype=bool)[::-1]
-    offset = KEY_LIMIT - len(mask)
-    s = BitSet.from_mask(mask, np.uint64(offset))
-    assert list(s) == [offset, offset + 1, MAX_KEY]
-    result = s.to_mask(offset, KEY_LIMIT)
+    # Use the uint32 edge at the usual page size and cross a page boundary
+    # at other sizes, including builds with very small pages.
+    offset = KEY_LIMIT - len(mask) if size == 512 else size * 64 - 2
+    stop = offset + len(mask)
+    s = BitSet.from_mask(mask, np.uint64(offset), page_size=size)
+    assert s.page_size == size
+    assert list(s) == [offset, offset + 1, stop - 1]
+    result = s.to_mask(offset, stop)
     assert result.dtype == np.dtype(bool)
     np.testing.assert_array_equal(result, mask)
     result[:] = False
     assert len(s) == 3
-    assert s.to_mask(KEY_LIMIT, 0).shape == (0,)
+    assert s.to_mask(stop, 0).shape == (0,)
+    empty = BitSet.from_mask([], page_size=size)
+    assert not empty
+    assert empty.page_size == size
+
+
+def test_mask_errors_and_special_cases():
     assert list(BitSet.from_mask([False, True])) == [1]
-    assert not BitSet.from_mask([])
     # NumPy permits noncanonical bool bytes, which are still true.
     assert list(BitSet.from_mask(np.array([0, 255], dtype=np.uint8).view(bool))) == [1]
     for bad_offset in (-1, KEY_LIMIT, 2**100):
@@ -207,6 +217,13 @@ def test_mask_roundtrip_and_errors():
         BitSet.from_mask(np.array([1], dtype=np.uint8))
     with pytest.raises(ValueError, match="one-dimensional"):
         BitSet.from_mask([[True, False]])
+    with pytest.raises(TypeError):
+        BitSet.from_mask([True], 0, DEFAULT_BIT_PAGE_SIZE)
+    with pytest.raises(ValueError) as expected:
+        BitSet(page_size=0)
+    with pytest.raises(ValueError) as error:
+        BitSet.from_mask([True], page_size=0)
+    assert error.value.args == expected.value.args
 
 
 def test_pickle_copy_and_subclass():
@@ -232,7 +249,9 @@ def test_pickle_copy_and_subclass():
     assert base.page_size == size
     assert pickle.loads(pickle.dumps(base)) == base
     assert BitSet.from_mask([True]).page_size == DEFAULT_BIT_PAGE_SIZE
-    assert type(TaggedBitSet.from_mask([True])) is TaggedBitSet
+    from_mask = TaggedBitSet.from_mask([True], page_size=size)
+    assert type(from_mask) is TaggedBitSet
+    assert from_mask.page_size == size
     assert repr(s).startswith("TaggedBitSet([0, 17, 4294967295]")
 
 

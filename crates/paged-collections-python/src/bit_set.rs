@@ -1,7 +1,7 @@
 //! `BitSet`: Python wrapper of `PagedBitSet<u32>`.
 
 use crate::DEFAULT_BIT_PAGE_SIZE;
-use crate::convert::{Key, KeyBatch, TypedValue, as_ndarray, insert_key, lookup_key};
+use crate::convert::{KEY_LIMIT, Key, KeyBatch, TypedValue, as_ndarray, insert_key, lookup_key};
 use crate::storage::{BitSetInner, BitSetOp};
 use numpy::{PyArray1, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::IntoPyObjectExt;
@@ -11,8 +11,6 @@ use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyDict, PyInt, PySet, PyTuple, PyType};
 use std::collections::HashSet;
 use std::ops::{Range, RangeInclusive};
-
-const KEY_LIMIT: u64 = 1_u64 << 32;
 
 /// Validate both endpoints before checking whether the range is empty.
 fn bounds(start: &Bound<'_, PyAny>, stop: &Bound<'_, PyAny>) -> PyResult<Range<u64>> {
@@ -510,13 +508,14 @@ impl BitSet {
     }
 
     /// Build a set from a one-dimensional boolean mask. True at position i
-    /// includes key offset + i.
+    /// includes key offset + i. The page size counts 64-bit words.
     #[classmethod]
-    #[pyo3(signature = (mask, offset = 0))]
+    #[pyo3(signature = (mask, offset = 0, *, page_size = DEFAULT_BIT_PAGE_SIZE))]
     fn from_mask<'py>(
         cls: &Bound<'py, PyType>,
         mask: &Bound<'py, PyAny>,
         #[pyo3(from_py_with = insert_key)] offset: Key,
+        #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
         let array = as_ndarray(mask)?;
         if array.ndim() != 1 {
@@ -530,7 +529,7 @@ impl BitSet {
                 "mask extends outside the uint32 key domain",
             ));
         }
-        let mut set = BitSetInner::default();
+        let mut set = BitSetInner::new(page_size)?;
         if !array.is_empty() || mask.cast::<PyUntypedArray>().is_ok() {
             let mask = <bool as TypedValue>::convert(&array)?;
             set.extend(

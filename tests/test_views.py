@@ -64,7 +64,7 @@ def _structural_change(container, operation):
 
 @pytest.mark.parametrize(
     "operation",
-    ["insert", "remove", "clear", "pop", "sort", "reserve", "shrink_to_fit",
+    ["insert", "remove", "clear", "pop", "pop_first", "pop_last", "sort", "reserve", "shrink_to_fit",
      "batch_insert", "discard_many"],
 )
 def test_live_export_blocks_structural_changes_atomically(export_case, operation):

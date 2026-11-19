@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 
-use crate::convert::{Key, KeyBatch, PyKey};
+use crate::convert::{Key, KeyBatch, PyKey, next_slot_index, prev_slot_index};
 use crate::export::{Exports, read_only_view};
 use crate::iter::key_iterator;
 use crate::repr_items;
@@ -321,6 +321,70 @@ macro_rules! object_map {
                     PyKeyError::new_err(concat!("popitem(): ", $pyname, " is empty"))
                 })?;
                 Ok((key.to_bits(), this.remove_present(key)?))
+            }
+
+            /// Return the entry with the smallest slot index; raise ``KeyError`` if empty.
+            fn first_item(&self, py: Python<'_>) -> PyResult<(<$K as PyKey>::Bits, Py<PyAny>)> {
+                self.map.first_key_value()
+                    .map(|(key, value)| (key.to_bits(), value.clone_ref(py)))
+                    .ok_or_else(|| PyKeyError::new_err(concat!("first_item(): ", $pyname, " is empty")))
+            }
+
+            /// Return the entry with the largest slot index; raise ``KeyError`` if empty.
+            fn last_item(&self, py: Python<'_>) -> PyResult<(<$K as PyKey>::Bits, Py<PyAny>)> {
+                self.map.last_key_value()
+                    .map(|(key, value)| (key.to_bits(), value.clone_ref(py)))
+                    .ok_or_else(|| PyKeyError::new_err(concat!("last_item(): ", $pyname, " is empty")))
+            }
+
+            /// Remove and return the entry with the smallest slot index; raise
+            /// ``KeyError`` if the map is empty.
+            fn pop_first(slf: &Bound<'_, Self>) -> PyResult<(<$K as PyKey>::Bits, Py<PyAny>)> {
+                let mut this = slf.try_borrow_mut()?;
+                if !this.map.is_empty() {
+                    this.exports.check($pyname)?;
+                }
+                let (key, value) = this.map.pop_first().ok_or_else(|| {
+                    PyKeyError::new_err(concat!("pop_first(): ", $pyname, " is empty"))
+                })?;
+                this.changed();
+                Ok((key.to_bits(), value))
+            }
+
+            /// Remove and return the entry with the largest slot index; raise
+            /// ``KeyError`` if the map is empty.
+            fn pop_last(slf: &Bound<'_, Self>) -> PyResult<(<$K as PyKey>::Bits, Py<PyAny>)> {
+                let mut this = slf.try_borrow_mut()?;
+                if !this.map.is_empty() {
+                    this.exports.check($pyname)?;
+                }
+                let (key, value) = this.map.pop_last().ok_or_else(|| {
+                    PyKeyError::new_err(concat!("pop_last(): ", $pyname, " is empty"))
+                })?;
+                this.changed();
+                Ok((key.to_bits(), value))
+            }
+
+            /// Return the first entry at or after slot ``index``, or ``None``.
+            fn next_occupant(
+                &self,
+                py: Python<'_>,
+                index: &Bound<'_, PyAny>,
+            ) -> PyResult<Option<(<$K as PyKey>::Bits, Py<PyAny>)>> {
+                Ok(next_slot_index(index)?
+                    .and_then(|index| self.map.next_occupant(index))
+                    .map(|(key, value)| (key.to_bits(), value.clone_ref(py))))
+            }
+
+            /// Return the last entry at or before slot ``index``, or ``None``.
+            fn prev_occupant(
+                &self,
+                py: Python<'_>,
+                index: &Bound<'_, PyAny>,
+            ) -> PyResult<Option<(<$K as PyKey>::Bits, Py<PyAny>)>> {
+                Ok(prev_slot_index(index)?
+                    .and_then(|index| self.map.prev_occupant(index))
+                    .map(|(key, value)| (key.to_bits(), value.clone_ref(py))))
             }
 
             /// Return the value for ``key``, first inserting ``default`` if ``key``
