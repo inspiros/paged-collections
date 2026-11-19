@@ -1,7 +1,9 @@
 """Paged lists, hives, sets and maps, and generational id allocation, implemented in Rust.
 
-``SparseSet``, ``SparseMap`` and ``DirectMap`` use integer keys in
-``0 <= key < 2**32``. ``SparseSet`` holds keys only;
+``BitSet``, ``SparseSet``, ``SparseMap`` and ``DirectMap`` use integer keys in
+``0 <= key < 2**32``. ``BitSet`` stores one bit per slot in each allocated
+page and iterates in ascending order. Its page size counts 64-bit words.
+``SparseSet`` holds keys only;
 ``SparseMap`` maps keys to arbitrary objects; ``SparseMapF64`` and the other
 typed maps store numeric values unboxed and expose them as NumPy arrays.
 ``DirectMap`` and its typed variants keep entries in ascending key order and
@@ -44,11 +46,13 @@ import numpy as np
 import numpy.typing as npt
 
 from paged_collections._core import (
+    DEFAULT_BIT_PAGE_SIZE,
     DEFAULT_PAGE_SIZE,
     PAGE_SIZES,
     KEY_LIMIT,
     MAX_GENERATION,
     MAX_INDICES,
+    BitSet,
     ConcurrentDirectMapBool,
     ConcurrentDirectMapF32,
     ConcurrentDirectMapF64,
@@ -312,11 +316,13 @@ def priority_queue(
     return cls(items, min, page_size=page_size)
 
 __all__ = [
+    "DEFAULT_BIT_PAGE_SIZE",
     "DEFAULT_PAGE_SIZE",
     "PAGE_SIZES",
     "KEY_LIMIT",
     "MAX_GENERATION",
     "MAX_INDICES",
+    "BitSet",
     "ConcurrentDirectMapBool",
     "ConcurrentDirectMapF32",
     "ConcurrentDirectMapF64",

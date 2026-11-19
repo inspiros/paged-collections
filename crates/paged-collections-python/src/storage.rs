@@ -1,7 +1,8 @@
-//! Runtime page-size selection. Forwarders dispatch once and expose common
-//! slices/iterators, so comparisons never match two size enums together.
+//! Runtime page-size selection. Forwarders expose common slices and
+//! iterators, while matching bit-set variants also support word-wise algebra.
 
 use crate::convert::{Key, PyKey};
+use paged_collections::bit_set::PagedBitSet;
 use paged_collections::direct_map::PagedDirectMap;
 use paged_collections::hive::{Hive, RawPage, RawPagesError};
 use paged_collections::id_alloc::Id;
@@ -14,12 +15,156 @@ use std::collections::TryReserveError;
 use std::ops::{Index, IndexMut, RangeBounds};
 
 paged_enum!(pub(crate) enum SetInner [K: PyKey] [K] = PagedSparseSet [K] []);
+paged_enum!(pub(crate) enum BitSetInner [] [] = PagedBitSet [Key] []; crate::DEFAULT_BIT_PAGE_SIZE);
 paged_enum!(pub(crate) enum MapInner [K: PyKey, V] [K, V] = PagedSparseMap [K, V] []);
 paged_enum!(pub(crate) enum DirectInner [V] [V] = PagedDirectMap [Key, V] []);
 paged_enum!(pub(crate) enum ListInner [T] [T] = PagedVec [T] []);
 paged_enum!(pub(crate) enum DequeInner [T] [T] = PagedDeque [T] []);
 paged_enum!(pub(crate) enum QueueInner [P] [P] = PagedPriorityQueue [Key, P] []);
 paged_enum!(pub(crate) enum HiveInner [T] [T] = Hive [T] []);
+
+#[derive(Clone, Copy)]
+pub(crate) enum BitSetOp {
+    Union,
+    Intersection,
+    Difference,
+    SymmetricDifference,
+}
+
+impl BitSetInner {
+    pub(crate) fn len(&self) -> usize {
+        paged!(Self, self, inner => inner.len())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        paged!(Self, self, inner => inner.is_empty())
+    }
+
+    pub(crate) fn contains(&self, key: Key) -> bool {
+        paged!(Self, self, inner => inner.contains(key))
+    }
+
+    pub(crate) fn insert(&mut self, key: Key) -> bool {
+        paged!(Self, self, inner => inner.insert(key))
+    }
+
+    pub(crate) fn remove(&mut self, key: Key) -> bool {
+        paged!(Self, self, inner => inner.remove(key))
+    }
+
+    pub(crate) fn clear(&mut self) {
+        paged!(Self, self, inner => inner.clear())
+    }
+
+    pub(crate) fn first(&self) -> Option<Key> {
+        paged!(Self, self, inner => inner.first())
+    }
+
+    pub(crate) fn last(&self) -> Option<Key> {
+        paged!(Self, self, inner => inner.last())
+    }
+
+    pub(crate) fn pop_first(&mut self) -> Option<Key> {
+        paged!(Self, self, inner => inner.pop_first())
+    }
+
+    pub(crate) fn next_occupant(&self, key: Key) -> Option<Key> {
+        paged!(Self, self, inner => inner.next_occupant(key as usize))
+    }
+
+    pub(crate) fn prev_occupant(&self, key: Key) -> Option<Key> {
+        paged!(Self, self, inner => inner.prev_occupant(key as usize))
+    }
+
+    pub(crate) fn insert_range(&mut self, bounds: impl RangeBounds<Key>) -> usize {
+        paged!(Self, self, inner => inner.insert_range(bounds))
+    }
+
+    pub(crate) fn remove_range(&mut self, bounds: impl RangeBounds<Key>) -> usize {
+        paged!(Self, self, inner => inner.remove_range(bounds))
+    }
+
+    pub(crate) fn count_range(&self, bounds: impl RangeBounds<Key>) -> usize {
+        paged!(Self, self, inner => inner.count_range(bounds))
+    }
+
+    pub(crate) fn range(
+        &self,
+        bounds: impl RangeBounds<Key>,
+    ) -> impl DoubleEndedIterator<Item = Key> {
+        paged_iter!(Self, self, inner => inner.range(bounds))
+    }
+
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = Key> + DoubleEndedIterator {
+        paged_iter!(Self, self, inner => inner.iter())
+    }
+
+    pub(crate) fn extend(&mut self, keys: impl IntoIterator<Item = Key>) {
+        paged!(Self, self, inner => inner.extend(keys))
+    }
+
+    pub(crate) fn retain(&mut self, keep: impl FnMut(Key) -> bool) {
+        paged!(Self, self, inner => inner.retain(keep))
+    }
+
+    pub(crate) fn is_disjoint(&self, other: &Self) -> bool {
+        paged_pair!(Self, self, other, a, b => a.is_disjoint(b))
+            .unwrap_or_else(|| self.iter().all(|key| !other.contains(key)))
+    }
+
+    pub(crate) fn is_subset(&self, other: &Self) -> bool {
+        self.len() <= other.len()
+            && paged_pair!(Self, self, other, a, b => a.is_subset(b))
+                .unwrap_or_else(|| self.iter().all(|key| other.contains(key)))
+    }
+
+    pub(crate) fn combined(&self, other: &Self, op: BitSetOp) -> Self {
+        if let Some(out) = paged_pair!(Self, self, other, a, b, wrap => {
+            wrap(match op {
+                BitSetOp::Union => a | b,
+                BitSetOp::Intersection => a & b,
+                BitSetOp::Difference => a - b,
+                BitSetOp::SymmetricDifference => a ^ b,
+            })
+        }) {
+            return out;
+        }
+        let mut out = Self::new(self.page_size()).expect("existing page size");
+        out.extend(self.iter().filter(|&key| match op {
+            BitSetOp::Union => true,
+            BitSetOp::Intersection => other.contains(key),
+            BitSetOp::Difference | BitSetOp::SymmetricDifference => !other.contains(key),
+        }));
+        if matches!(op, BitSetOp::Union | BitSetOp::SymmetricDifference) {
+            out.extend(other.iter().filter(|&key| !self.contains(key)));
+        }
+        out
+    }
+
+    /// Apply the operation and report whether membership changed.
+    pub(crate) fn assign(&mut self, other: &Self, op: BitSetOp) -> bool {
+        let before = self.len();
+        let same_size = paged_pair!(Self, &mut *self, other, a, b => match op {
+            BitSetOp::Union => *a |= b,
+            BitSetOp::Intersection => *a &= b,
+            BitSetOp::Difference => *a -= b,
+            BitSetOp::SymmetricDifference => *a ^= b,
+        });
+        if same_size.is_none() {
+            match op {
+                BitSetOp::Union => self.extend(other.iter()),
+                BitSetOp::Intersection => self.retain(|key| other.contains(key)),
+                BitSetOp::Difference => self.retain(|key| !other.contains(key)),
+                BitSetOp::SymmetricDifference => {
+                    for key in other.iter() {
+                        paged!(Self, &mut *self, inner => inner.toggle(key));
+                    }
+                }
+            }
+        }
+        before != self.len() || matches!(op, BitSetOp::SymmetricDifference) && !other.is_empty()
+    }
+}
 
 impl<K: PyKey> SetInner<K> {
     pub(crate) fn len(&self) -> usize {

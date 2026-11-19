@@ -1,10 +1,11 @@
 # Choosing a Container
 
-Measured ratios for every row are in [Benchmarks](benchmarks.md). They come
-from one machine and are a reference, not a guarantee.
+Measured ratios for several containers are in [Benchmarks](benchmarks.md).
+They come from one machine and serve as a reference.
 
 | Need | Use | Instead of | Avoid when |
 |---|---|---|---|
+| Membership in dense integer ranges, ordered queries or range updates | [`PagedBitSet`](bit-set.md) | `PagedSparseSet` | keys are thinly scattered or you need a contiguous key array |
 | Integer keys in runs or ranges; fast iteration and misses | `PagedSparseSet`, `PagedSparseMap` | `HashSet`, `HashMap`, `BTreeMap` | keys are spread uniformly over a wide range |
 | Key-ordered iteration, range and nearest-key queries over dense ranges | `PagedDirectMap` | `BTreeMap` | keys are sparse inside their pages (iteration scans whole pages) |
 | Entries as contiguous slices or arrays | `PagedSparseMap` (`key_slice`, `value_slice`; Python views) | `HashMap` | |

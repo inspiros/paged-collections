@@ -12,6 +12,7 @@ use pyo3::types::{PyDict, PyIterator, PyTuple, PyType};
 
 include!(concat!(env!("OUT_DIR"), "/page_sizes.rs"));
 
+mod bit_set;
 mod concurrent;
 mod convert;
 mod deque;
@@ -189,15 +190,26 @@ fn reduce<'py>(
     contents: Vec<Bound<'py, PyAny>>,
     items: Option<Bound<'py, PyIterator>>,
 ) -> PyResult<Bound<'py, PyTuple>> {
-    let py = obj.py();
-    let module = py.import("paged_collections._core")?;
-    let cls = obj.get_type();
-    let is_subclass = !cls.is(base);
     // Read the base descriptor, bypassing subclass property overrides.
     let page_size = base
         .getattr_opt("page_size")?
         .map(|descriptor| descriptor.call_method1("__get__", (obj, base)))
         .transpose()?;
+    reduce_with_page_size(obj, base, contents, items, page_size)
+}
+
+/// Builds the reduce tuple from a page size already read by the caller.
+fn reduce_with_page_size<'py>(
+    obj: &Bound<'py, PyAny>,
+    base: &Bound<'py, PyType>,
+    contents: Vec<Bound<'py, PyAny>>,
+    items: Option<Bound<'py, PyIterator>>,
+    page_size: Option<Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let py = obj.py();
+    let module = py.import("paged_collections._core")?;
+    let cls = obj.get_type();
+    let is_subclass = !cls.is(base);
     let mut args = vec![cls.clone().into_any(), base.clone().into_any()];
     let allocation = if is_subclass { new_args(obj)? } else { None };
     let none = || py.None().into_bound(py);
@@ -389,6 +401,8 @@ mod _core {
     #[pymodule_export]
     use super::{_rebuild, _rebuild_paged, _rebuild_with_newargs};
     #[pymodule_export]
+    use crate::bit_set::{BitSet, BitSetIterator};
+    #[pymodule_export]
     use crate::concurrent::{
         ConcurrentDirectMapBool, ConcurrentDirectMapF32, ConcurrentDirectMapF64,
         ConcurrentDirectMapI32, ConcurrentDirectMapI64, ConcurrentDirectMapU32,
@@ -448,6 +462,7 @@ mod _core {
             PyTuple::new(m.py(), PAGE_SIZES.iter().copied())?,
         )?;
         m.add("DEFAULT_PAGE_SIZE", DEFAULT_PAGE_SIZE)?;
+        m.add("DEFAULT_BIT_PAGE_SIZE", DEFAULT_BIT_PAGE_SIZE)?;
         m.add(
             "MAX_GENERATION",
             paged_collections::id_alloc::MAX_GENERATION,

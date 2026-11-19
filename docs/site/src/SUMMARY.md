@@ -9,6 +9,7 @@
 
 # Keyed Collections
 
+- [Bit Set](bit-set.md)
 - [Sparse Set](sparse-set.md)
 - [Sparse Map](sparse-map.md)
 - [Direct Map](direct-map.md)

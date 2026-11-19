@@ -53,7 +53,9 @@ pc.DEFAULT_PAGE_SIZE  # 1024
 m = pc.SparseMap(page_size=4096)
 ```
 
-To build from source with other sizes, set the variables before building:
+`BitSet` uses the same compiled sizes, measured in 64-bit words, and
+defaults to `DEFAULT_BIT_PAGE_SIZE` (512, or `DEFAULT_PAGE_SIZE` when a
+custom build leaves 512 out). To build from source with other sizes, set the variables before building:
 
 ```sh
 PAGED_COLLECTIONS_PAGE_SIZES=64,1024,16384 \

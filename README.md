@@ -83,6 +83,7 @@ del values                 # resizing raises BufferError while a view is alive
 
 | Rust | Python | Paging | Purpose |
 |---|---|---|---|
+| `PagedBitSet<K>` | `BitSet` | index | One bit per slot in each allocated page, with key order and range operations |
 | `PagedSparseSet<K>` | `SparseSet` | index | Integer set: O(1) insert, remove, contains, clear; dense iteration |
 | `PagedSparseMap<K, V>` | `SparseMap`, `SparseMapF64`, ... | index | Sparse set with a dense value array |
 | `PagedDirectMap<K, V>` | `DirectMap`, `DirectMapF64`, ... | index | Values in place; key order and range queries |

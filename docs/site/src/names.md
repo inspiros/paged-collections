@@ -2,6 +2,7 @@
 
 | Rust | Python | Python variants |
 |---|---|---|
+| `bit_set::PagedBitSet<u32>` | `BitSet` | `DEFAULT_BIT_PAGE_SIZE` (64-bit words) |
 | `sparse_set::PagedSparseSet<u32>` | `SparseSet` | |
 | `sparse_map::PagedSparseMap<u32, V>` | `SparseMap` | `SparseMapF64`, `F32`, `I64`, `I32`, `U64`, `U32`, `Bool`; `sparse_map(dtype)` |
 | `sparse_map::PagedSparseMap<Id, V>` | `IdMap` | `IdMapF64`, ...; `id_map(dtype)` |

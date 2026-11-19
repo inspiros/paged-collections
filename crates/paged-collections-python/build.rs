@@ -40,6 +40,9 @@ fn main() {
         sizes.contains(&default),
         "PAGED_COLLECTIONS_DEFAULT_PAGE_SIZE: {default} must be in PAGED_COLLECTIONS_PAGE_SIZES"
     );
+    // BitSet pages count 64-bit words: 512 words is the core's 4 KiB default.
+    // Builds that leave 512 out fall back to the general default.
+    let bit_default = if sizes.contains(&512) { 512 } else { default };
 
     // Brackets separate declaration/use generics and type arguments before/after
     // PAGE. This also accepts nested types and an optional directory argument.
@@ -57,12 +60,19 @@ fn main() {
         .collect::<String>();
     let mut code = format!(
         "/// Compiled page sizes, sorted ascending.\npub(crate) const PAGE_SIZES: &[usize] = &{sizes:?};\n\
-         /// Default page size for new Python containers.\npub(crate) const DEFAULT_PAGE_SIZE: usize = {default};\n"
+         /// Default page size for new Python containers.\npub(crate) const DEFAULT_PAGE_SIZE: usize = {default};\n\
+         /// Default page size, in 64-bit words, for new `BitSet`s.\npub(crate) const DEFAULT_BIT_PAGE_SIZE: usize = {bit_default};\n"
     );
-    code.push_str(&format!(r#"
+    code.push_str(&format!(
+        r#"
 macro_rules! paged_enum {{
     ($vis:vis enum $name:ident [$($decl:tt)*] [$($arg:ty),*] =
         $inner:ident [$($before:ty),*] [$($after:ty),*]) => {{
+        paged_enum!($vis enum $name [$($decl)*] [$($arg),*] =
+            $inner [$($before),*] [$($after),*]; $crate::DEFAULT_PAGE_SIZE);
+    }};
+    ($vis:vis enum $name:ident [$($decl:tt)*] [$($arg:ty),*] =
+        $inner:ident [$($before:ty),*] [$($after:ty),*]; $default:expr) => {{
         /// Storage with a page size selected at construction.
         #[derive(Clone)]
         $vis enum $name<$($decl)*> {{ {variants} }}
@@ -73,11 +83,12 @@ macro_rules! paged_enum {{
             pub(crate) fn page_size(&self) -> usize {{ match self {{ {page_sizes} }} }}
         }}
         impl<$($decl)*> Default for $name<$($arg),*> {{
-            fn default() -> Self {{ Self::new($crate::DEFAULT_PAGE_SIZE).expect("compiled default page size") }}
+            fn default() -> Self {{ Self::new($default).expect("compiled default page size") }}
         }}
     }};
 }}
-"#));
+"#
+    ));
     for (name, iterator) in [("paged", false), ("paged_iter", true)] {
         code.push_str(&format!("macro_rules! {name} {{ ($enum:ident, $value:expr, $binding:ident => $body:expr) => {{ match $value {{"));
         for n in &sizes {
@@ -93,6 +104,17 @@ macro_rules! paged_enum {{
     code.push_str("macro_rules! paged_wrap { ($enum:ident, $value:expr, $binding:ident => $body:expr) => { match $value {");
     for n in &sizes {
         code.push_str(&format!("$enum::P{n}($binding) => $body.map($enum::P{n}),"));
+    }
+    code.push_str("} }; }\n");
+    // Same-size operands share the core's const-generic word-wise operations.
+    code.push_str("macro_rules! paged_pair { ($enum:ident, $left:expr, $right:expr, $a:ident, $b:ident $(, $wrap:ident)? => $body:expr) => { match ($left, $right) {");
+    for n in &sizes {
+        code.push_str(&format!(
+            "($enum::P{n}($a), $enum::P{n}($b)) => {{ $(let $wrap = $enum::P{n};)? Some($body) }},"
+        ));
+    }
+    if sizes.len() > 1 {
+        code.push_str("_ => None,");
     }
     code.push_str("} }; }\n");
     // A sum of iterator types preserves static dispatch and iterator guarantees
