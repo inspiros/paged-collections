@@ -11,6 +11,7 @@
 //! | [`insert`](PagedSparseMap::insert) | as `get`, amortized over dense-array growth; the first key in a page also allocates the page (and, with [`Flat`], grows the directory up to it) |
 //! | [`clear`](PagedSparseMap::clear) | O(1) for the index, plus dropping the values |
 //! | iteration, [`value_slice`](PagedSparseMap::value_slice) | over the dense arrays only |
+//! | [`range`](PagedSparseMap::range), [`first_key_value`](PagedSparseMap::first_key_value), [`next_occupant`](PagedSparseMap::next_occupant), ... | in slot-index order, over the sparse pages and slots in the range (stale slots included) |
 //! | sorting | O(n log n) comparisons, O(n) swaps, then one index write per entry; allocates `n` indices |
 //! | [`binary_search_key`](PagedSparseMap::binary_search_key), [`binary_search_by`](PagedSparseMap::binary_search_by), [`partition_point`](PagedSparseMap::partition_point) | O(log n), on entries the caller keeps sorted |
 //!
@@ -68,13 +69,13 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter::{FusedIterator, Zip};
-use core::ops::Index;
+use core::ops::{Index, RangeBounds};
 use core::slice;
 
 use crate::hash::hash_unordered;
 use crate::key::Key;
 use crate::page::{DEFAULT_PAGE, Directory, Flat};
-use crate::sparse_set::{PagedSparseSet, Slot};
+use crate::sparse_set::{self, PagedSparseSet, Positions, Slot, index_bounds};
 
 /// A map from [`Key`]s to values with O(1) insert, remove and lookup, and
 /// contiguous arrays of its keys and values.
@@ -455,6 +456,171 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedSparseMap<K, V, PAGE, D> {
         IterMut(self.keys.iter().zip(self.values.iter_mut()))
     }
 
+    /// Removes every entry and returns them in dense order.
+    ///
+    /// The map is empty as soon as this returns, even if the iterator is
+    /// leaked; dropping it drops the entries not yet yielded. Pages and the
+    /// dense arrays' capacity are kept, as with [`clear`](Self::clear).
+    ///
+    /// ```
+    /// use paged_collections::sparse_map::PagedSparseMap;
+    ///
+    /// let mut map: PagedSparseMap<u32, char> = [(5, 'a'), (1, 'b')].into_iter().collect();
+    /// assert_eq!(map.drain().collect::<Vec<_>>(), [(5, 'a'), (1, 'b')]);
+    /// assert!(map.is_empty() && map.get(5).is_none());
+    /// ```
+    pub fn drain(&mut self) -> Drain<'_, K, V> {
+        Drain(self.keys.drain().zip(self.values.drain(..)))
+    }
+
+    /// Removes the entries for which `pred` returns `true` and yields them.
+    ///
+    /// Each entry is tested exactly once. A removal moves the last entry into
+    /// the gap, so entries are tested in dense order except that a moved
+    /// entry is tested next. Entries not yet tested when the iterator is
+    /// dropped stay in the map; use [`retain`](Self::retain) if the removed
+    /// entries are not needed.
+    ///
+    /// ```
+    /// use paged_collections::sparse_map::PagedSparseMap;
+    ///
+    /// let mut map: PagedSparseMap<u32, u32> = (0..6).map(|k| (k, k * 10)).collect();
+    /// let mut big: Vec<(u32, u32)> = map.extract_if(|_, v| *v >= 30).collect();
+    /// big.sort();
+    /// assert_eq!(big, [(3, 30), (4, 40), (5, 50)]);
+    /// assert_eq!(map.len(), 3);
+    /// ```
+    pub fn extract_if<F: FnMut(&K, &mut V) -> bool>(
+        &mut self,
+        pred: F,
+    ) -> ExtractIf<'_, K, V, F, PAGE, D> {
+        ExtractIf {
+            map: self,
+            pos: 0,
+            pred,
+        }
+    }
+
+    /// The values of several keys at once, mutably: `None` for each key that
+    /// is not in the map. O(N log N) for N keys.
+    ///
+    /// ```
+    /// use paged_collections::sparse_map::PagedSparseMap;
+    ///
+    /// let mut map: PagedSparseMap<u32, u32> = [(1, 10), (2, 20)].into_iter().collect();
+    /// if let [Some(a), Some(b), None] = map.get_disjoint_mut([1, 2, 3]) {
+    ///     core::mem::swap(a, b);
+    /// }
+    /// assert_eq!((map[1], map[2]), (20, 10));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key in the map is given twice.
+    pub fn get_disjoint_mut<const N: usize>(&mut self, keys: [K; N]) -> [Option<&mut V>; N] {
+        // The present keys as (dense position, position in `keys`).
+        let mut order = [(0, 0); N];
+        let mut n = 0;
+        for (i, &key) in keys.iter().enumerate() {
+            if let Some(pos) = self.position(key) {
+                order[n] = (pos, i);
+                n += 1;
+            }
+        }
+        let order = &mut order[..n];
+        order.sort_unstable();
+        for pair in order.windows(2) {
+            assert!(
+                pair[0].0 != pair[1].0,
+                "PagedSparseMap::get_disjoint_mut: key at positions {} and {} given twice",
+                pair[0].1,
+                pair[1].1
+            );
+        }
+        // Split each value off the front of what is left: the borrows are
+        // disjoint by construction.
+        let mut out = [const { None }; N];
+        let mut rest: &mut [V] = &mut self.values;
+        let mut start = 0;
+        for &(pos, i) in order.iter() {
+            let (_, tail) = core::mem::take(&mut rest).split_at_mut(pos - start);
+            let (value, tail) = tail
+                .split_first_mut()
+                .expect("positions are inside the dense array");
+            out[i] = Some(value);
+            rest = tail;
+            start = pos + 1;
+        }
+        out
+    }
+
+    /// Iterates over the entries whose slot index lies between the slot
+    /// indices of the bounds, in slot-index order.
+    ///
+    /// The bounds are keys, compared by [`Key::index`]: for plain integer
+    /// keys this is the usual key range, independent of dense order. A
+    /// generational key bounds by its index only. An empty or inverted range
+    /// yields nothing.
+    ///
+    /// This walks the sparse index: it costs O(pages and slots in the
+    /// range), including slots left stale by [`clear`](Self::clear) (which
+    /// [`reset`](Self::reset) frees), not O(entries yielded).
+    ///
+    /// ```
+    /// use paged_collections::sparse_map::PagedSparseMap;
+    ///
+    /// let map: PagedSparseMap<u32, char, 4> =
+    ///     [(9, 'c'), (2, 'a'), (30, 'd'), (5, 'b')].into_iter().collect();
+    /// let keys: Vec<u32> = map.range(3..).map(|(&k, _)| k).collect();
+    /// assert_eq!(keys, [5, 9, 30]);
+    /// assert_eq!(map.first_key_value(), Some((&2, &'a')));
+    /// assert_eq!(map.prev_occupant(8), Some((&5, &'b')));
+    /// ```
+    pub fn range(&self, keys: impl RangeBounds<K>) -> Range<'_, K, V, PAGE, D> {
+        self.range_of(&index_bounds(&keys))
+    }
+
+    fn range_of(&self, indices: &impl RangeBounds<usize>) -> Range<'_, K, V, PAGE, D> {
+        Range {
+            positions: self.keys.positions(indices),
+            values: &self.values,
+        }
+    }
+
+    /// The entry with the smallest slot index. Costs as
+    /// [`range`](Self::range).
+    pub fn first_key_value(&self) -> Option<(&K, &V)> {
+        self.range_of(&..).next()
+    }
+
+    /// The entry with the largest slot index. Costs as
+    /// [`range`](Self::range).
+    pub fn last_key_value(&self) -> Option<(&K, &V)> {
+        self.range_of(&..).next_back()
+    }
+
+    /// The entry at slot `index` or the first one after it.
+    pub fn next_occupant(&self, index: usize) -> Option<(&K, &V)> {
+        self.range_of(&(index..)).next()
+    }
+
+    /// The entry at slot `index` or the last one before it.
+    pub fn prev_occupant(&self, index: usize) -> Option<(&K, &V)> {
+        self.range_of(&(..=index)).next_back()
+    }
+
+    /// Removes and returns the entry with the smallest slot index.
+    pub fn pop_first(&mut self) -> Option<(K, V)> {
+        let pos = self.keys.positions(&..).next()?;
+        Some(self.remove_at(pos))
+    }
+
+    /// Removes and returns the entry with the largest slot index.
+    pub fn pop_last(&mut self) -> Option<(K, V)> {
+        let pos = self.keys.positions(&..).next_back()?;
+        Some(self.remove_at(pos))
+    }
+
     /// Consumes the map and returns its keys in dense order.
     pub fn into_keys(self) -> alloc::vec::IntoIter<K> {
         self.keys.into_iter()
@@ -821,6 +987,115 @@ zip_iterator!(
     Zip<alloc::vec::IntoIter<K>, alloc::vec::IntoIter<V>>,
     (K, V)
 );
+
+zip_iterator!(
+    /// The entries removed by [`PagedSparseMap::drain`], in dense order.
+    Drain<'a, K, V>,
+    Zip<sparse_set::Drain<'a, K>, alloc::vec::Drain<'a, V>>,
+    (K, V)
+);
+
+/// The entries in a range of slot indices, from [`PagedSparseMap::range`].
+pub struct Range<'a, K, V, const PAGE: usize = DEFAULT_PAGE, D: Directory + 'a = Flat> {
+    positions: Positions<'a, K, PAGE, D>,
+    values: &'a [V],
+}
+
+impl<'a, K: Key, V, const PAGE: usize, D: Directory + 'a> Iterator for Range<'a, K, V, PAGE, D> {
+    type Item = (&'a K, &'a V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let pos = self.positions.next()?;
+        Some((&self.positions.dense()[pos], &self.values[pos]))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.positions.size_hint()
+    }
+}
+
+impl<'a, K: Key, V, const PAGE: usize, D: Directory + 'a> DoubleEndedIterator
+    for Range<'a, K, V, PAGE, D>
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let pos = self.positions.next_back()?;
+        Some((&self.positions.dense()[pos], &self.values[pos]))
+    }
+}
+
+impl<'a, K: Key, V, const PAGE: usize, D: Directory + 'a> FusedIterator
+    for Range<'a, K, V, PAGE, D>
+{
+}
+
+impl<'a, K, V, const PAGE: usize, D: Directory + 'a> Clone for Range<'a, K, V, PAGE, D> {
+    fn clone(&self) -> Self {
+        Self {
+            positions: self.positions.clone(),
+            values: self.values,
+        }
+    }
+}
+
+impl<'a, K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory + 'a> fmt::Debug
+    for Range<'a, K, V, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+/// The entries removed by [`PagedSparseMap::extract_if`].
+pub struct ExtractIf<'a, K, V, F, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+    map: &'a mut PagedSparseMap<K, V, PAGE, D>,
+    pos: usize,
+    pred: F,
+}
+
+impl<K: Key, V, F: FnMut(&K, &mut V) -> bool, const PAGE: usize, D: Directory> Iterator
+    for ExtractIf<'_, K, V, F, PAGE, D>
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<(K, V)> {
+        while self.pos < self.map.values.len() {
+            let pos = self.pos;
+            let key = self.map.keys.as_slice()[pos];
+            // Advance first: if `pred` panics, this entry is not tested again.
+            self.pos += 1;
+            if (self.pred)(&key, &mut self.map.values[pos]) {
+                // The last entry moves into `pos` and is tested next.
+                self.pos = pos;
+                return Some(self.map.remove_at(pos));
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.map.values.len() - self.pos))
+    }
+}
+
+impl<K: Key, V, F: FnMut(&K, &mut V) -> bool, const PAGE: usize, D: Directory> FusedIterator
+    for ExtractIf<'_, K, V, F, PAGE, D>
+{
+}
+
+impl<K: Key + fmt::Debug, V: fmt::Debug, F, const PAGE: usize, D: Directory> fmt::Debug
+    for ExtractIf<'_, K, V, F, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pos = self.pos;
+        f.debug_struct("ExtractIf")
+            .field("untested_keys", &&self.map.keys.as_slice()[pos..])
+            .field("untested_values", &&self.map.values[pos..])
+            .finish_non_exhaustive()
+    }
+}
 
 impl<K, V> Clone for Iter<'_, K, V> {
     fn clone(&self) -> Self {

@@ -553,6 +553,127 @@ impl<K: DirectKey, V, const PAGE: usize, D: Directory> PagedDirectMap<K, V, PAGE
         self.remove_occupant(index)
     }
 
+    /// Removes every entry and returns them in slot-index order. Pages stay
+    /// allocated, as with [`clear`](Self::clear).
+    ///
+    /// Entries are removed as the iterator yields them; dropping it removes
+    /// the rest. If it is leaked instead (`mem::forget`), or a value's `drop`
+    /// panics while the rest are removed, the entries not yet reached stay in
+    /// the map, which stays consistent.
+    ///
+    /// ```
+    /// use paged_collections::direct_map::PagedDirectMap;
+    ///
+    /// let mut map: PagedDirectMap<u32, char> = [(5, 'b'), (1, 'a')].into_iter().collect();
+    /// assert_eq!(map.drain().collect::<Vec<_>>(), [(1, 'a'), (5, 'b')]);
+    /// assert!(map.is_empty());
+    /// ```
+    pub fn drain(&mut self) -> Drain<'_, K, V, PAGE, D> {
+        Drain {
+            map: self,
+            next: Some(0),
+        }
+    }
+
+    /// Removes the entries for which `pred` returns `true` and yields them,
+    /// visiting the entries in slot-index order.
+    ///
+    /// Entries are tested and removed as the iterator advances: those it has
+    /// not reached when it is dropped stay in the map. Use
+    /// [`retain`](Self::retain) if the removed entries are not needed.
+    ///
+    /// ```
+    /// use paged_collections::direct_map::PagedDirectMap;
+    ///
+    /// let mut map: PagedDirectMap<u32, u32> = (0..6).map(|k| (k, k * 10)).collect();
+    /// let odd: Vec<(u32, u32)> = map.extract_if(|k, _| k % 2 == 1).collect();
+    /// assert_eq!(odd, [(1, 10), (3, 30), (5, 50)]);
+    /// assert_eq!(map.len(), 3);
+    /// ```
+    pub fn extract_if<F: FnMut(&K, &mut V) -> bool>(
+        &mut self,
+        pred: F,
+    ) -> ExtractIf<'_, K, V, F, PAGE, D> {
+        ExtractIf {
+            map: self,
+            next: Some(0),
+            pred,
+        }
+    }
+
+    /// The values of several keys at once, mutably: `None` for each key that
+    /// is not in the map. O(N log N) for N keys, plus stepping over the pages
+    /// between the smallest and largest key's.
+    ///
+    /// ```
+    /// use paged_collections::direct_map::PagedDirectMap;
+    ///
+    /// let mut map: PagedDirectMap<u32, u32> = [(1, 10), (9000, 20)].into_iter().collect();
+    /// if let [Some(a), None, Some(b)] = map.get_disjoint_mut([1, 2, 9000]) {
+    ///     core::mem::swap(a, b);
+    /// }
+    /// assert_eq!((map[1], map[9000]), (20, 10));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key in the map is given twice.
+    pub fn get_disjoint_mut<const N: usize>(&mut self, keys: [K; N]) -> [Option<&mut V>; N] {
+        // The present keys as (slot index, position in `keys`).
+        let mut order = [(0, 0); N];
+        let mut n = 0;
+        for (i, &key) in keys.iter().enumerate() {
+            if self.get(key).is_some() {
+                order[n] = (key.index(), i);
+                n += 1;
+            }
+        }
+        let order = &mut order[..n];
+        order.sort_unstable();
+        for pair in order.windows(2) {
+            assert!(
+                pair[0].0 != pair[1].0,
+                "PagedDirectMap::get_disjoint_mut: key at positions {} and {} given twice",
+                pair[0].1,
+                pair[1].1
+            );
+        }
+        let mut out = [const { None }; N];
+        let (Some(&(lo, _)), Some(&(hi, _))) = (order.first(), order.last()) else {
+            return out;
+        };
+        // Walk the pages in order (each is borrowed once), splitting each
+        // wanted slot off the front of what is left of its page.
+        let mut want = order.iter().peekable();
+        for (number, page) in self
+            .pages
+            .pages_in_mut(split::<PAGE>(lo).0..=split::<PAGE>(hi).0)
+        {
+            let mut rest: &mut [Slot<K, V>] = page;
+            let mut start = 0;
+            while let Some(&&(index, i)) = want.peek() {
+                let (wanted, offset) = split::<PAGE>(index);
+                if wanted > number {
+                    break;
+                }
+                want.next();
+                if wanted < number {
+                    // Only a store that breaks the page contract skips a
+                    // page holding an entry just found.
+                    continue;
+                }
+                let (_, tail) = mem::take(&mut rest).split_at_mut(offset - start);
+                let (slot, tail) = tail.split_first_mut().expect("offsets are inside the page");
+                if let Some((_, value)) = slot {
+                    out[i] = Some(value);
+                }
+                rest = tail;
+                start = offset + 1;
+            }
+        }
+        out
+    }
+
     /// The entry for `key`, for in-place access or insertion.
     ///
     /// The entry is [`Occupied`](Entry::Occupied) only if `key` itself is in
@@ -968,6 +1089,105 @@ where
         // `remaining > 0`; zero it so `len` stays truthful.
         self.remaining = 0;
         None
+    }
+}
+
+/// The entries removed by [`PagedDirectMap::drain`], in slot-index order.
+pub struct Drain<'a, K: DirectKey, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+    map: &'a mut PagedDirectMap<K, V, PAGE, D>,
+    // The slot index to resume from; `None` once the last slot is passed.
+    next: Option<usize>,
+}
+
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> Iterator for Drain<'_, K, V, PAGE, D> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<(K, V)> {
+        let start = self.next?;
+        let Some((key, _)) = self.map.slot_range(start..).next() else {
+            self.next = None;
+            return None;
+        };
+        let index = key.index();
+        self.next = index.checked_add(1);
+        self.map.remove_occupant(index)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // Every entry before the cursor has been removed.
+        (self.map.len, Some(self.map.len))
+    }
+}
+
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> ExactSizeIterator
+    for Drain<'_, K, V, PAGE, D>
+{
+}
+
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> FusedIterator for Drain<'_, K, V, PAGE, D> {}
+
+impl<K: DirectKey, V, const PAGE: usize, D: Directory> Drop for Drain<'_, K, V, PAGE, D> {
+    fn drop(&mut self) {
+        self.for_each(drop);
+    }
+}
+
+impl<K: DirectKey + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
+    for Drain<'_, K, V, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every entry still in the map is yet to be yielded.
+        f.debug_list().entries(self.map.iter()).finish()
+    }
+}
+
+/// The entries removed by [`PagedDirectMap::extract_if`], in slot-index
+/// order.
+pub struct ExtractIf<'a, K: DirectKey, V, F, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat>
+{
+    map: &'a mut PagedDirectMap<K, V, PAGE, D>,
+    next: Option<usize>,
+    pred: F,
+}
+
+impl<K: DirectKey, V, F: FnMut(&K, &mut V) -> bool, const PAGE: usize, D: Directory> Iterator
+    for ExtractIf<'_, K, V, F, PAGE, D>
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<(K, V)> {
+        loop {
+            let start = self.next?;
+            let Some((key, value)) = self.map.slot_range_mut(start..).next() else {
+                self.next = None;
+                return None;
+            };
+            let index = key.index();
+            // Advance first: if `pred` panics, this entry stays.
+            self.next = index.checked_add(1);
+            if (self.pred)(&key, value) {
+                return self.map.remove_occupant(index);
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(if self.next.is_some() { self.map.len } else { 0 }))
+    }
+}
+
+impl<K: DirectKey, V, F: FnMut(&K, &mut V) -> bool, const PAGE: usize, D: Directory> FusedIterator
+    for ExtractIf<'_, K, V, F, PAGE, D>
+{
+}
+
+impl<K: DirectKey + fmt::Debug, V: fmt::Debug, F, const PAGE: usize, D: Directory> fmt::Debug
+    for ExtractIf<'_, K, V, F, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtractIf")
+            .field("next", &self.next)
+            .finish_non_exhaustive()
     }
 }
 

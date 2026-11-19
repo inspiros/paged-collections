@@ -10,6 +10,7 @@
 //! | [`insert`](PagedSparseSet::insert), [`remove`](PagedSparseSet::remove), [`contains`](PagedSparseSet::contains) | O(1) (O(depth) with [`Radix`](crate::page::Radix), O(log pages) with [`Tree`](crate::page::Tree)) |
 //! | [`clear`](PagedSparseSet::clear) | O(1): pages are kept and old slots are ignored |
 //! | iteration, [`as_slice`](PagedSparseSet::as_slice) | over the dense array only |
+//! | [`range`](PagedSparseSet::range), [`first`](PagedSparseSet::first), [`next_occupant`](PagedSparseSet::next_occupant), ... | in slot-index order, over the sparse pages and slots in the range (stale slots included) |
 //!
 //! Lookups follow Briggs and Torczon: a slot is trusted only if it points
 //! inside the dense array at a key with the same slot index. Stale slots, left
@@ -49,7 +50,10 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter::{Chain, FusedIterator};
 use core::num::NonZeroU32;
-use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Sub, SubAssign};
+use core::ops::{
+    BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Bound, RangeBounds, Sub,
+    SubAssign,
+};
 use core::slice;
 
 use crate::hash::hash_unordered;
@@ -376,6 +380,129 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
         self.dense.iter()
     }
 
+    /// Removes every key and returns them in dense order.
+    ///
+    /// The set is empty as soon as this returns, even if the iterator is
+    /// leaked; dropping it drops the keys not yet yielded. Pages and the
+    /// dense array's capacity are kept, as with [`clear`](Self::clear).
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let mut set: PagedSparseSet<u32> = [5, 1, 9].into_iter().collect();
+    /// assert_eq!(set.drain().collect::<Vec<_>>(), [5, 1, 9]);
+    /// assert!(set.is_empty() && !set.contains(5));
+    /// ```
+    pub fn drain(&mut self) -> Drain<'_, K> {
+        // Clearing the dense array is enough: every slot left behind is
+        // stale and ignored by lookups.
+        Drain(self.dense.drain(..))
+    }
+
+    /// Removes the keys for which `pred` returns `true` and yields them.
+    ///
+    /// Each key is tested exactly once. A removal moves the last key into
+    /// the gap, so keys are tested in dense order except that a moved key
+    /// is tested next. Keys not yet tested when the iterator is dropped stay
+    /// in the set; use [`retain`](Self::retain) if the removed keys are not
+    /// needed.
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let mut set: PagedSparseSet<u32> = (0..6).collect();
+    /// let mut odd: Vec<u32> = set.extract_if(|&k| k % 2 == 1).collect();
+    /// odd.sort();
+    /// assert_eq!(odd, [1, 3, 5]);
+    /// assert_eq!(set.len(), 3);
+    /// ```
+    pub fn extract_if<F: FnMut(&K) -> bool>(&mut self, pred: F) -> ExtractIf<'_, K, F, PAGE, D> {
+        ExtractIf {
+            set: self,
+            pos: 0,
+            pred,
+        }
+    }
+
+    /// Dense positions of the keys whose slot index is in `indices`, in
+    /// slot-index order.
+    pub(crate) fn positions(&self, indices: &impl RangeBounds<usize>) -> Positions<'_, K, PAGE, D> {
+        let (first, last) = match resolve(indices) {
+            Some(span) if !self.dense.is_empty() => span,
+            _ => (1, 0),
+        };
+        #[allow(clippy::reversed_empty_ranges)]
+        let pages = if first <= last {
+            split::<PAGE>(first).0..=split::<PAGE>(last).0
+        } else {
+            1..=0
+        };
+        Positions {
+            pages: self.sparse.pages_in(pages),
+            dense: &self.dense,
+            first,
+            last,
+            front: None,
+            back: None,
+        }
+    }
+
+    /// Iterates over the keys whose slot index lies between the slot indices
+    /// of the bounds, in slot-index order.
+    ///
+    /// The bounds are keys, compared by [`Key::index`]: for plain integer
+    /// keys this is the usual key range, independent of dense order. A
+    /// generational key bounds by its index only. An empty or inverted range
+    /// yields nothing.
+    ///
+    /// This walks the sparse index: it costs O(pages and slots in the
+    /// range), including slots left stale by [`clear`](Self::clear) (which
+    /// [`reset`](Self::reset) frees), not O(keys yielded).
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let set: PagedSparseSet<u32, 4> = [9, 2, 30, 5].into_iter().collect();
+    /// assert_eq!(set.range(3..=30).copied().collect::<Vec<_>>(), [5, 9, 30]);
+    /// assert_eq!((set.first(), set.last()), (Some(&2), Some(&30)));
+    /// assert_eq!(set.next_occupant(6), Some(&9));
+    /// ```
+    pub fn range(&self, keys: impl RangeBounds<K>) -> Range<'_, K, PAGE, D> {
+        Range(self.positions(&index_bounds(&keys)))
+    }
+
+    /// The key with the smallest slot index. Costs as [`range`](Self::range).
+    pub fn first(&self) -> Option<&K> {
+        self.range(..).next()
+    }
+
+    /// The key with the largest slot index. Costs as [`range`](Self::range).
+    pub fn last(&self) -> Option<&K> {
+        self.range(..).next_back()
+    }
+
+    /// The key at slot `index` or the first one after it.
+    pub fn next_occupant(&self, index: usize) -> Option<&K> {
+        Range(self.positions(&(index..))).next()
+    }
+
+    /// The key at slot `index` or the last one before it.
+    pub fn prev_occupant(&self, index: usize) -> Option<&K> {
+        Range(self.positions(&(..=index))).next_back()
+    }
+
+    /// Removes and returns the key with the smallest slot index.
+    pub fn pop_first(&mut self) -> Option<K> {
+        let pos = self.positions(&..).next()?;
+        Some(self.remove_at(pos))
+    }
+
+    /// Removes and returns the key with the largest slot index.
+    pub fn pop_last(&mut self) -> Option<K> {
+        let pos = self.positions(&..).next_back()?;
+        Some(self.remove_at(pos))
+    }
+
     /// Iterates over keys in `self` absent from `other`, in `self`'s dense order.
     ///
     /// ```
@@ -690,6 +817,277 @@ impl<K: Key, const PAGE: usize, D: Directory> IntoIterator for PagedSparseSet<K,
 
     fn into_iter(self) -> Self::IntoIter {
         self.dense.into_iter()
+    }
+}
+
+/// The slot-index bounds of a key range.
+pub(crate) fn index_bounds<K: Key>(keys: &impl RangeBounds<K>) -> (Bound<usize>, Bound<usize>) {
+    (
+        keys.start_bound().map(|key| key.index()),
+        keys.end_bound().map(|key| key.index()),
+    )
+}
+
+/// The inclusive slot indices `first..=last` of `indices`, or `None` if it
+/// is empty.
+fn resolve(indices: &impl RangeBounds<usize>) -> Option<(usize, usize)> {
+    let first = match indices.start_bound() {
+        Bound::Included(&index) => Some(index),
+        Bound::Excluded(&index) => index.checked_add(1),
+        Bound::Unbounded => Some(0),
+    }?;
+    let last = match indices.end_bound() {
+        Bound::Included(&index) => Some(index),
+        Bound::Excluded(&index) => index.checked_sub(1),
+        Bound::Unbounded => Some(usize::MAX),
+    }?;
+    (first <= last).then_some((first, last))
+}
+
+/// One page of the sparse index being walked by [`Positions`]: its first
+/// slot index and the offsets still to visit.
+struct Part<'a, const PAGE: usize> {
+    base: usize,
+    page: &'a [Slot; PAGE],
+    offsets: core::ops::Range<usize>,
+}
+
+impl<const PAGE: usize> Clone for Part<'_, PAGE> {
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base,
+            page: self.page,
+            offsets: self.offsets.clone(),
+        }
+    }
+}
+
+/// Dense positions of the keys in a range of slot indices, in slot-index
+/// order, found by walking the sparse index and validating each slot the way
+/// lookups do.
+pub(crate) struct Positions<'a, K, const PAGE: usize, D: Directory + 'a> {
+    pages: <D::Store<Slot, PAGE> as PageStore<Slot, PAGE>>::Pages<'a>,
+    dense: &'a [K],
+    first: usize,
+    last: usize,
+    front: Option<Part<'a, PAGE>>,
+    back: Option<Part<'a, PAGE>>,
+}
+
+impl<'a, K, const PAGE: usize, D: Directory + 'a> Clone for Positions<'a, K, PAGE, D> {
+    fn clone(&self) -> Self {
+        Self {
+            pages: self.pages.clone(),
+            dense: self.dense,
+            first: self.first,
+            last: self.last,
+            front: self.front.clone(),
+            back: self.back.clone(),
+        }
+    }
+}
+
+impl<'a, K: Key, const PAGE: usize, D: Directory + 'a> Positions<'a, K, PAGE, D> {
+    /// The dense keys the positions index.
+    #[inline]
+    pub(crate) fn dense(&self) -> &'a [K] {
+        self.dense
+    }
+
+    /// The part of page `number` inside `first..=last`.
+    fn part(&self, number: usize, page: &'a [Slot; PAGE]) -> Part<'a, PAGE> {
+        let base = number.saturating_mul(PAGE);
+        let end = match self.last.checked_sub(base) {
+            Some(offset) => offset.saturating_add(1).min(PAGE),
+            // Only a store that breaks the page contract yields a page past
+            // `last`.
+            None => 0,
+        };
+        Part {
+            base,
+            page,
+            offsets: self.first.saturating_sub(base).min(end)..end,
+        }
+    }
+
+    /// The dense position slot `offset` of `part` points at, if valid.
+    #[inline]
+    fn valid(&self, part: &Part<'a, PAGE>, offset: usize) -> Option<usize> {
+        let pos = part.page[offset]?.get() as usize - 1;
+        let key = self.dense.get(pos)?;
+        (key.index() == part.base + offset).then_some(pos)
+    }
+}
+
+impl<'a, K: Key, const PAGE: usize, D: Directory + 'a> Iterator for Positions<'a, K, PAGE, D> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            if let Some(mut part) = self.front.take() {
+                while let Some(offset) = part.offsets.next() {
+                    if let Some(pos) = self.valid(&part, offset) {
+                        self.front = Some(part);
+                        return Some(pos);
+                    }
+                }
+            }
+            match self.pages.next() {
+                Some((number, page)) => self.front = Some(self.part(number, page)),
+                // The pages are exhausted: finish the page the back end
+                // started.
+                None => self.front = Some(self.back.take()?),
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // Each valid slot names a distinct dense position.
+        (0, Some(self.dense.len()))
+    }
+}
+
+impl<'a, K: Key, const PAGE: usize, D: Directory + 'a> DoubleEndedIterator
+    for Positions<'a, K, PAGE, D>
+{
+    fn next_back(&mut self) -> Option<usize> {
+        loop {
+            if let Some(mut part) = self.back.take() {
+                while let Some(offset) = part.offsets.next_back() {
+                    if let Some(pos) = self.valid(&part, offset) {
+                        self.back = Some(part);
+                        return Some(pos);
+                    }
+                }
+            }
+            match self.pages.next_back() {
+                Some((number, page)) => self.back = Some(self.part(number, page)),
+                None => self.back = Some(self.front.take()?),
+            }
+        }
+    }
+}
+
+impl<'a, K: Key, const PAGE: usize, D: Directory + 'a> FusedIterator for Positions<'a, K, PAGE, D> {}
+
+/// The keys in a range of slot indices, from [`PagedSparseSet::range`].
+pub struct Range<'a, K, const PAGE: usize = DEFAULT_PAGE, D: Directory + 'a = Flat>(
+    Positions<'a, K, PAGE, D>,
+);
+
+impl<'a, K: Key, const PAGE: usize, D: Directory + 'a> Iterator for Range<'a, K, PAGE, D> {
+    type Item = &'a K;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a K> {
+        let pos = self.0.next()?;
+        Some(&self.0.dense[pos])
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<'a, K: Key, const PAGE: usize, D: Directory + 'a> DoubleEndedIterator
+    for Range<'a, K, PAGE, D>
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let pos = self.0.next_back()?;
+        Some(&self.0.dense[pos])
+    }
+}
+
+impl<'a, K: Key, const PAGE: usize, D: Directory + 'a> FusedIterator for Range<'a, K, PAGE, D> {}
+
+impl<'a, K, const PAGE: usize, D: Directory + 'a> Clone for Range<'a, K, PAGE, D> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<'a, K: Key + fmt::Debug, const PAGE: usize, D: Directory + 'a> fmt::Debug
+    for Range<'a, K, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+/// The keys removed by [`PagedSparseSet::drain`], in dense order.
+#[derive(Debug)]
+pub struct Drain<'a, K>(alloc::vec::Drain<'a, K>);
+
+impl<K> Iterator for Drain<'_, K> {
+    type Item = K;
+
+    #[inline]
+    fn next(&mut self) -> Option<K> {
+        self.0.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<K> DoubleEndedIterator for Drain<'_, K> {
+    #[inline]
+    fn next_back(&mut self) -> Option<K> {
+        self.0.next_back()
+    }
+}
+
+impl<K> ExactSizeIterator for Drain<'_, K> {}
+
+impl<K> FusedIterator for Drain<'_, K> {}
+
+/// The keys removed by [`PagedSparseSet::extract_if`].
+pub struct ExtractIf<'a, K, F, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+    set: &'a mut PagedSparseSet<K, PAGE, D>,
+    pos: usize,
+    pred: F,
+}
+
+impl<K: Key, F: FnMut(&K) -> bool, const PAGE: usize, D: Directory> Iterator
+    for ExtractIf<'_, K, F, PAGE, D>
+{
+    type Item = K;
+
+    fn next(&mut self) -> Option<K> {
+        while self.pos < self.set.dense.len() {
+            let pos = self.pos;
+            // Advance first: if `pred` panics, this key is not tested again.
+            self.pos += 1;
+            if (self.pred)(&self.set.dense[pos]) {
+                // The last key moves into `pos` and is tested next.
+                self.pos = pos;
+                return Some(self.set.remove_at(pos));
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.set.dense.len() - self.pos))
+    }
+}
+
+impl<K: Key, F: FnMut(&K) -> bool, const PAGE: usize, D: Directory> FusedIterator
+    for ExtractIf<'_, K, F, PAGE, D>
+{
+}
+
+impl<K: Key + fmt::Debug, F, const PAGE: usize, D: Directory> fmt::Debug
+    for ExtractIf<'_, K, F, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtractIf")
+            .field("untested", &&self.set.dense[self.pos..])
+            .finish_non_exhaustive()
     }
 }
 

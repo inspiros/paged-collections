@@ -310,6 +310,42 @@ impl<K: DirectKey<Tag = ()>, const PAGE: usize, D: Directory> PagedBitSet<K, PAG
         }
     }
 
+    /// Removes every key and returns them in ascending slot-index order.
+    /// Pages stay allocated, as with [`clear`](Self::clear).
+    ///
+    /// Keys are removed as the iterator yields them; dropping it removes the
+    /// rest. If it is leaked instead (`mem::forget`), the keys not yet
+    /// yielded stay in the set.
+    pub fn drain(&mut self) -> Drain<'_, K, PAGE, D> {
+        Drain {
+            set: self,
+            next: Some(0),
+        }
+    }
+
+    /// Removes the keys for which `pred` returns `true` and yields them,
+    /// visiting the keys in ascending slot-index order.
+    ///
+    /// Keys are tested and removed as the iterator advances: those it has not
+    /// reached when it is dropped stay in the set. Use
+    /// [`retain`](Self::retain) if the removed keys are not needed.
+    ///
+    /// ```
+    /// use paged_collections::bit_set::PagedBitSet;
+    ///
+    /// let mut set: PagedBitSet<u32> = (0..6).collect();
+    /// assert_eq!(set.extract_if(|k| k % 2 == 1).collect::<Vec<_>>(), [1, 3, 5]);
+    /// assert_eq!(set.drain().collect::<Vec<_>>(), [0, 2, 4]);
+    /// assert!(set.is_empty());
+    /// ```
+    pub fn extract_if<F: FnMut(K) -> bool>(&mut self, pred: F) -> ExtractIf<'_, K, F, PAGE, D> {
+        ExtractIf {
+            set: self,
+            next: Some(0),
+            pred,
+        }
+    }
+
     /// Removes all keys, keeping the allocated pages for reuse.
     pub fn clear(&mut self) {
         for (_, page) in self.pages.pages_mut() {
@@ -589,6 +625,118 @@ impl<W: DoubleEndedIterator<Item = WordBits>> Cursor<W> {
             0
         };
         index
+    }
+}
+
+/// The keys removed by [`PagedBitSet::drain`], in slot-index order.
+pub struct Drain<
+    'a,
+    K: DirectKey<Tag = ()>,
+    const PAGE: usize = DEFAULT_BIT_PAGE,
+    D: Directory = Flat,
+> {
+    set: &'a mut PagedBitSet<K, PAGE, D>,
+    // The slot index to resume from; `None` once the last slot is passed.
+    next: Option<usize>,
+}
+
+impl<K: DirectKey<Tag = ()>, const PAGE: usize, D: Directory> Iterator for Drain<'_, K, PAGE, D> {
+    type Item = K;
+
+    fn next(&mut self) -> Option<K> {
+        let Some(key) = self.set.next_occupant(self.next?) else {
+            self.next = None;
+            return None;
+        };
+        let next = key.index().checked_add(1);
+        self.set.remove(key);
+        // Commit the cursor only after the removal, so that every key
+        // before it is gone even if a custom `Key::index` panics.
+        self.next = next;
+        Some(key)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // Every key before the cursor has been removed.
+        (self.set.len, Some(self.set.len))
+    }
+}
+
+impl<K: DirectKey<Tag = ()>, const PAGE: usize, D: Directory> ExactSizeIterator
+    for Drain<'_, K, PAGE, D>
+{
+}
+
+impl<K: DirectKey<Tag = ()>, const PAGE: usize, D: Directory> FusedIterator
+    for Drain<'_, K, PAGE, D>
+{
+}
+
+impl<K: DirectKey<Tag = ()>, const PAGE: usize, D: Directory> Drop for Drain<'_, K, PAGE, D> {
+    fn drop(&mut self) {
+        self.for_each(drop);
+    }
+}
+
+impl<K: DirectKey<Tag = ()> + fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
+    for Drain<'_, K, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every key still in the set is yet to be yielded.
+        f.debug_list().entries(self.set.iter()).finish()
+    }
+}
+
+/// The keys removed by [`PagedBitSet::extract_if`], in slot-index order.
+pub struct ExtractIf<
+    'a,
+    K: DirectKey<Tag = ()>,
+    F,
+    const PAGE: usize = DEFAULT_BIT_PAGE,
+    D: Directory = Flat,
+> {
+    set: &'a mut PagedBitSet<K, PAGE, D>,
+    next: Option<usize>,
+    pred: F,
+}
+
+impl<K: DirectKey<Tag = ()>, F: FnMut(K) -> bool, const PAGE: usize, D: Directory> Iterator
+    for ExtractIf<'_, K, F, PAGE, D>
+{
+    type Item = K;
+
+    fn next(&mut self) -> Option<K> {
+        loop {
+            let Some(key) = self.set.next_occupant(self.next?) else {
+                self.next = None;
+                return None;
+            };
+            // Advance first: if `pred` panics, this key stays.
+            self.next = key.index().checked_add(1);
+            if (self.pred)(key) {
+                self.set.remove(key);
+                return Some(key);
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(if self.next.is_some() { self.set.len } else { 0 }))
+    }
+}
+
+impl<K: DirectKey<Tag = ()>, F: FnMut(K) -> bool, const PAGE: usize, D: Directory> FusedIterator
+    for ExtractIf<'_, K, F, PAGE, D>
+{
+}
+
+impl<K: DirectKey<Tag = ()>, F, const PAGE: usize, D: Directory> fmt::Debug
+    for ExtractIf<'_, K, F, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtractIf")
+            .field("next", &self.next)
+            .finish_non_exhaustive()
     }
 }
 
