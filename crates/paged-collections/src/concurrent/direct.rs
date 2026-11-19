@@ -168,8 +168,30 @@ pub struct VacantEntry<'a, K: DirectKey, V> {
 }
 
 impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap<K, V, PAGE, D> {
+    /// Clones a weakly consistent snapshot into a valid plain map, scanning
+    /// the directory and allocated slots. Includes entries that remain unchanged
+    /// throughout the call if their writes happen-before it.
+    ///
+    /// Value cloning runs under a page read lock. The callback must avoid
+    /// all access to that page, including reads, which can deadlock behind
+    /// a queued writer.
+    pub fn snapshot(&self) -> PagedDirectMap<K, V, PAGE, D>
+    where
+        V: Clone,
+    {
+        let mut map = PagedDirectMap::new();
+        self.for_each(|key, value| {
+            map.insert(*key, value.clone());
+        });
+        map
+    }
+
     /// Number of slots protected by each page lock.
     pub const PAGE_SIZE: usize = PAGE;
+
+    fn valid_page_capacity() -> bool {
+        PAGE > 0 && PAGE <= isize::MAX as usize / mem::size_of::<Slot<K, V>>()
+    }
 
     /// Creates an empty map without allocating.
     ///
@@ -178,7 +200,7 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
     /// Panics if `PAGE` is zero or its slot storage exceeds `isize::MAX` bytes.
     pub fn new() -> Self {
         assert!(
-            PAGE > 0 && PAGE <= isize::MAX as usize / mem::size_of::<Slot<K, V>>(),
+            Self::valid_page_capacity(),
             "ConcurrentDirectMap: invalid page capacity"
         );
         Self {
@@ -422,11 +444,23 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
     /// Empty or inverted ranges visit nothing. Holds one page read lock at a
     /// time; consistent per page only, weakly consistent across pages.
     pub fn range_for_each(&self, keys: impl RangeBounds<K>, mut f: impl FnMut(&K, &V)) {
+        self.try_range_for_each(keys, |key, value| {
+            f(key, value);
+            Ok::<_, core::convert::Infallible>(())
+        })
+        .unwrap();
+    }
+
+    fn try_range_for_each<E>(
+        &self,
+        keys: impl RangeBounds<K>,
+        mut f: impl FnMut(&K, &V) -> Result<(), E>,
+    ) -> Result<(), E> {
         let start = match keys.start_bound() {
             Bound::Included(key) => key.index(),
             Bound::Excluded(key) => match key.index().checked_add(1) {
                 Some(index) => index,
-                None => return,
+                None => return Ok(()),
             },
             Bound::Unbounded => 0,
         };
@@ -434,12 +468,12 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
             Bound::Included(key) => key.index(),
             Bound::Excluded(key) => match key.index().checked_sub(1) {
                 Some(index) => index,
-                None => return,
+                None => return Ok(()),
             },
             Bound::Unbounded => usize::MAX,
         };
         if start > end {
-            return;
+            return Ok(());
         }
         for (number, page) in self.pages.iter() {
             if number < start / PAGE {
@@ -462,10 +496,11 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
             let base = number * PAGE;
             for (offset, slot) in guard.slots.iter().enumerate().take(last).skip(first) {
                 if let Some((tag, value)) = slot {
-                    f(&K::from_parts(base + offset, *tag), value);
+                    f(&K::from_parts(base + offset, *tag), value)?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Iterates exclusively in ascending slot order without acquiring page locks.
@@ -692,6 +727,16 @@ impl<'a, K: DirectKey, V> VacantEntry<'a, K, V> {
     }
 }
 
+/// Clones via [`ConcurrentDirectMap::snapshot`]. Value cloning runs under
+/// a page read lock and must avoid all access to that page.
+impl<K: DirectKey, V: Clone, const PAGE: usize, D: SharedDirectory> Clone
+    for ConcurrentDirectMap<K, V, PAGE, D>
+{
+    fn clone(&self) -> Self {
+        Self::from(self.snapshot())
+    }
+}
+
 impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> Default
     for ConcurrentDirectMap<K, V, PAGE, D>
 {
@@ -737,6 +782,61 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> From<PagedDirectMap
 {
     fn from(map: PagedDirectMap<K, V, PAGE, D>) -> Self {
         map.into_iter().collect()
+    }
+}
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::*;
+    use crate::concurrent::serde::deserialize_map;
+    use serde::de::{Deserialize, Deserializer, Error};
+    use serde::ser::{Serialize, SerializeMap, Serializer};
+
+    /// Serializes a weakly consistent snapshot as a valid plain map in
+    /// slot order, with the same consistency as
+    /// [`ConcurrentDirectMap::snapshot`]. Scans the directory and allocated
+    /// slots. JSON, CBOR and serializers that buffer unknown-length
+    /// MessagePack maps can accept the missing length. For serializers
+    /// that require the length upfront, such as bincode, serialize
+    /// [`snapshot()`](ConcurrentDirectMap::snapshot) instead.
+    ///
+    /// User `Serialize` runs under a page read lock. The callback must
+    /// avoid all access to that page, including reads, which can deadlock
+    /// behind a queued writer.
+    impl<K: DirectKey + Serialize, V: Serialize, const PAGE: usize, D: SharedDirectory> Serialize
+        for ConcurrentDirectMap<K, V, PAGE, D>
+    {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut map = serializer.serialize_map(None)?;
+            self.try_range_for_each(.., |key, value| map.serialize_entry(key, value))?;
+            map.end()
+        }
+    }
+
+    /// Reads the plain [`PagedDirectMap`] format, rejecting indices outside
+    /// the concurrent directory's range before allocating a page.
+    impl<
+        'de,
+        K: DirectKey + Deserialize<'de>,
+        V: Deserialize<'de>,
+        const PAGE: usize,
+        D: SharedDirectory,
+    > Deserialize<'de> for ConcurrentDirectMap<K, V, PAGE, D>
+    {
+        fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
+            if !Self::valid_page_capacity() {
+                return Err(De::Error::custom(
+                    "ConcurrentDirectMap: invalid page capacity",
+                ));
+            }
+            deserialize_map(deserializer, Self::new(), |map, key: K, value: V| {
+                if D::Pages::<Page<K, V>>::page_number::<PAGE>(key.index()).is_none() {
+                    return Err("ConcurrentDirectMap: key index exceeds direct spine range");
+                }
+                map.insert(key, value);
+                Ok(())
+            })
+        }
     }
 }
 

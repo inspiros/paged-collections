@@ -677,6 +677,26 @@ impl FreeStack {
         Unissued { ranges, at: 0 }
     }
 
+    /// A weakly consistent view of fresh block tails, in ascending order.
+    /// Reads one word per shard and skips refills in progress.
+    pub(crate) fn unissued_shared(&self) -> Unissued {
+        let mut ranges: Vec<_> = self
+            .shards
+            .iter()
+            .filter_map(|shard| {
+                // Acquire samples each block word once; block writers can
+                // race this load. If an observed index is then handed out,
+                // emitting version 2 spends its first generation in the fork.
+                let word = shard.block.load(Ordering::Acquire);
+                let (cursor, end) = (word as u32, (word >> 32) as u32);
+                // SINGLE and REFILLING both have cursor >= end.
+                (cursor < end).then_some(cursor..end)
+            })
+            .collect();
+        ranges.sort_unstable_by_key(|range| range.start);
+        Unissued { ranges, at: 0 }
+    }
+
     /// Empties every stack under exclusive access; fresh blocks and the
     /// fresh bound are kept. No pop can be in flight, so no stale link can
     /// be followed later.
@@ -738,6 +758,14 @@ pub(crate) struct Unissued {
 }
 
 impl Unissued {
+    /// Tests the captured ranges in O(log shards), in any query order.
+    pub(crate) fn contains_shared(&self, index: u32) -> bool {
+        let at = self.ranges.partition_point(|range| range.end <= index);
+        self.ranges
+            .get(at)
+            .is_some_and(|range| range.contains(&index))
+    }
+
     /// Whether `index` was reserved but never handed out. Successive calls
     /// must pass ascending indices.
     pub(crate) fn contains(&mut self, index: u32) -> bool {

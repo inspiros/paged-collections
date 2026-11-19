@@ -215,6 +215,42 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
         }
     }
 
+    /// Copies a weakly consistent snapshot into a plain [`IdAllocator`],
+    /// in O([`index_bound`](Self::index_bound)) time and space.
+    /// Allocations that happen-before the call are included if the id stays
+    /// live throughout it. Ids whose freeing happens-before the call stay
+    /// dead. The raw parts always validate; the lowest free index is reused first.
+    pub fn snapshot(&self) -> IdAllocator {
+        let (versions, free) = self.snapshot_parts();
+        IdAllocator::try_from_raw_parts(versions, free)
+            .expect("allocator snapshot has valid raw parts")
+    }
+
+    fn snapshot_parts(&self) -> (Vec<u32>, Vec<u32>) {
+        let bound = self.index_bound();
+        let unissued = self.free.unissued_shared();
+        let mut versions = Vec::with_capacity(bound as usize);
+        let mut free = Vec::new();
+        for index in 0..bound {
+            let version = self.slot(index).map_or(0, |slot| {
+                // Acquire observes the published version. Use this same
+                // observation for both the versions and the free list.
+                let version = slot.version.load(Ordering::Acquire);
+                if version == 0 && unissued.contains_shared(index) {
+                    2
+                } else {
+                    version
+                }
+            });
+            versions.push(version);
+            if version != 0 && version & 1 == 0 {
+                free.push(index);
+            }
+        }
+        free.reverse();
+        (versions, free)
+    }
+
     /// Converts to the plain allocator, preserving ids, and LIFO reuse order
     /// within each thread group's stack. Indices reserved in a block but
     /// never handed out become free, with generation 1 spent.
@@ -281,9 +317,42 @@ impl<const PAGE: usize> From<IdAllocator> for ConcurrentIdAllocator<PAGE> {
     }
 }
 
+/// Clones via [`ConcurrentIdAllocator::snapshot`], preserving generations.
+impl<const PAGE: usize> Clone for ConcurrentIdAllocator<PAGE> {
+    fn clone(&self) -> Self {
+        Self::from(self.snapshot())
+    }
+}
+
 impl<const PAGE: usize> Default for ConcurrentIdAllocator<PAGE> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::*;
+    use crate::id_alloc::serde_impl::serialize_raw_parts;
+    use serde::de::{Deserialize, Deserializer};
+    use serde::ser::{Serialize, Serializer};
+
+    /// Serializes weakly consistent versions and their matching free list
+    /// in the plain [`IdAllocator`] format, with the same consistency as
+    /// [`ConcurrentIdAllocator::snapshot`]. The result always validates.
+    /// Takes O(index bound) time and temporary space.
+    impl<const PAGE: usize> Serialize for ConcurrentIdAllocator<PAGE> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let (versions, free) = self.snapshot_parts();
+            serialize_raw_parts(&versions, &free, serializer)
+        }
+    }
+
+    /// Validates the plain [`IdAllocator`] format and converts in O(index bound).
+    impl<'de, const PAGE: usize> Deserialize<'de> for ConcurrentIdAllocator<PAGE> {
+        fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
+            IdAllocator::deserialize(deserializer).map(Self::from)
+        }
     }
 }
 
@@ -310,6 +379,17 @@ mod tests {
         assert_eq!((a.index(), b.index(), c.index()), (0, 1, 2));
         assert_eq!(ids.index_bound(), 64);
         assert!(ids.free(b));
+        let snapshot = ids.snapshot();
+        let (versions, free) = snapshot.raw_parts();
+        assert_eq!(&versions[..4], &[1, 2, 1, 2]);
+        assert!(versions[4..].iter().all(|&v| v == 0));
+        assert_eq!(free, &[3, 1]);
+        #[cfg(feature = "serde")]
+        {
+            let json = serde_json::to_string(&ids).unwrap();
+            let decoded: IdAllocator = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.raw_parts(), snapshot.raw_parts());
+        }
         let plain = ids.into_inner();
         let (versions, free) = plain.raw_parts();
         assert_eq!(&versions[..3], &[1, 2, 1]);

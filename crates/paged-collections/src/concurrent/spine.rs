@@ -51,6 +51,13 @@ impl<P, const CHUNKS: usize> Spine<P, CHUNKS> {
         Some((k, page - (size - BASE)))
     }
 
+    /// Whether a page number fits the directory and its chunk fits in an allocation.
+    pub(super) fn can_allocate_page(page: usize) -> bool {
+        Self::location(page).is_some_and(|(k, _)| {
+            (BASE << k) <= isize::MAX as usize / core::mem::size_of::<AtomicPtr<P>>()
+        })
+    }
+
     pub(crate) fn get(&self, page: usize) -> Option<&P> {
         let (k, offset) = Self::location(page)?;
         // Acquire pairs with chunk publication, including all initialized cells.

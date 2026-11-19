@@ -50,6 +50,16 @@
 //! uses directory memory proportional to installed pages, and has O(depth)
 //! page lookups. [`AtomicIdMap`] remains Flat-only; `Tree` has no concurrent form.
 //!
+//! Shared snapshots capture the committed prefix of the vector and sparse
+//! collections, which can omit completed writes beyond an earlier unpublished
+//! reservation. The other snapshots are weakly consistent. They include entries
+//! that remain unchanged throughout the call if their writes happen-before it.
+//! A thread join or a Release/Acquire handoff can establish this ordering;
+//! a Relaxed signal alone is insufficient. With `serde`, serialization reads
+//! the same views in the plain formats where available. The hives and id
+//! allocator preserve the history of ids that became dead in operations
+//! that happen-before the call.
+//!
 //! # Element invariance
 //!
 //! Shared insertion requires invariance in every element type: shortening a
@@ -225,6 +235,8 @@ mod index;
 mod lock;
 mod radix;
 mod recycle;
+#[cfg(feature = "serde")]
+mod serde;
 mod sparse;
 mod spine;
 mod vec;

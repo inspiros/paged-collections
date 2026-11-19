@@ -16,7 +16,7 @@ use core::ptr;
 
 use super::atomic::{AtomicU32, AtomicU64, Ordering, UnsafeCell, spin_loop};
 use super::count::StripedLen;
-use super::free_stack::{FreeStack, block_for};
+use super::free_stack::{FreeStack, Unissued, block_for};
 use super::recycle::PageStack;
 use super::spine::Spine;
 use crate::hive::{Hive, RawPage, RawSlot};
@@ -323,6 +323,17 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
 
     fn acquire(&self, index: u32, expected: Option<u32>) -> Option<Ref<'_, T, PAGE>> {
         let slot = self.slot(index)?;
+        self.acquire_slot(slot, index, expected).ok()
+    }
+
+    // Returns the word that ruled out a guard, so a scan can map that state
+    // without loading again after a concurrent transition.
+    fn acquire_slot<'a>(
+        &'a self,
+        slot: &'a Slot<T>,
+        index: u32,
+        expected: Option<u32>,
+    ) -> Result<Ref<'a, T, PAGE>, u64> {
         // Acquire observes publication before inspecting the version/flags.
         let mut word = slot.state.load(Ordering::Acquire);
         loop {
@@ -331,7 +342,7 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
                 || word & (BUSY | MARKED) != 0
                 || expected.is_some_and(|version| version != live)
             {
-                return None;
+                return Err(word);
             }
             assert!(word & REFS != REFS, "ConcurrentHive: guard count overflow");
             // Acquire sees the value published by the inserter; Release makes
@@ -343,7 +354,7 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    return Some(Ref {
+                    return Ok(Ref {
                         hive: self,
                         slot,
                         index,
@@ -355,6 +366,38 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
                 Err(actual) => word = actual,
             }
         }
+    }
+
+    fn snapshot_slot(&self, index: u32, unissued: &Unissued) -> RawSlot<Ref<'_, T, PAGE>> {
+        let Some(slot) = self.slot(index) else {
+            // A reservation or recycled page may still be uninstalled.
+            return RawSlot::Vacant { version: 0 };
+        };
+        let word = match self.acquire_slot(slot, index, None) {
+            Ok(value) => {
+                return RawSlot::Occupied {
+                    version: value.version,
+                    value,
+                };
+            }
+            Err(word) => word,
+        };
+        let mut version = word as u32;
+        if word & BUSY != 0 {
+            #[cfg(all(test, loom))]
+            super::loom_hive::record_snapshot_busy(index);
+            // A claimer keeps the old vacancy; a finalizer has already
+            // advanced to the next vacancy (or to zero on retirement).
+            debug_assert_eq!(version & 1, 0);
+        } else if word & MARKED != 0 {
+            #[cfg(all(test, loom))]
+            super::loom_hive::record_snapshot_marked();
+            // Logical removal precedes finalization, including for TAKE.
+            version = vacant(version) as u32;
+        } else if version == 0 && unissued.contains_shared(index) {
+            version = 2;
+        }
+        RawSlot::Vacant { version }
     }
 
     /// Pins the value of a matching live id until the returned guard drops.
@@ -716,6 +759,38 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
         self.recycled.set(freed);
     }
 
+    /// Clones a weakly consistent snapshot into a plain [`Hive`].
+    /// Insertions that happen-before the call are included if the entry
+    /// stays live throughout it. Ids whose removal happens-before the
+    /// call stay dead. The raw pages always validate. Scans up to
+    /// [`index_bound`](Self::index_bound) with a floor lookup per page.
+    ///
+    /// Each value stays guarded while its `Clone` runs. Taking that id in
+    /// the callback, or waiting there for another thread to take it, deadlocks.
+    pub fn snapshot(&self) -> Hive<T, PAGE>
+    where
+        T: Clone,
+    {
+        let bound = self.index_bound();
+        let unissued = self.free.unissued_shared();
+        let pages = self
+            .recycled
+            .snapshot_pages(bound, PAGE)
+            .map(|(floor, indices)| RawPage {
+                floor,
+                slots: indices
+                    .map(|index| match self.snapshot_slot(index, &unissued) {
+                        RawSlot::Occupied { version, value } => RawSlot::Occupied {
+                            version,
+                            value: (*value).clone(),
+                        },
+                        RawSlot::Vacant { version } => RawSlot::Vacant { version },
+                    })
+                    .collect(),
+            });
+        Hive::try_from_raw_pages(pages).expect("hive snapshot has valid raw pages")
+    }
+
     /// Moves into a plain [`Hive`], preserving live ids and stale-id history.
     /// Takes O([`index_bound`](Self::index_bound)) time; pages and reuse order
     /// may change.
@@ -803,9 +878,52 @@ impl<T, const PAGE: usize> ConcurrentHive<T, PAGE> {
     }
 }
 
+/// Clones via [`ConcurrentHive::snapshot`], preserving generations.
+/// Each value stays guarded while its `Clone` runs, so taking that id
+/// or waiting for its taker from the callback deadlocks.
+impl<T: Clone, const PAGE: usize> Clone for ConcurrentHive<T, PAGE> {
+    fn clone(&self) -> Self {
+        Self::from(self.snapshot())
+    }
+}
+
 impl<T, const PAGE: usize> Default for ConcurrentHive<T, PAGE> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::*;
+    use crate::hive::serde_impl::raw_pages;
+    use serde::de::{Deserialize, Deserializer};
+    use serde::ser::{Serialize, Serializer};
+
+    /// Serializes a weakly consistent snapshot in the plain [`Hive`] format.
+    /// Uses the same consistency as [`ConcurrentHive::snapshot`] and scans
+    /// to the initial index bound with one floor lookup per page.
+    /// The resulting pages always pass [`Hive`]'s validation.
+    ///
+    /// Each value stays guarded while its `Serialize` runs. Taking that id
+    /// in the callback, or waiting there for another thread to take it, deadlocks.
+    impl<T: Serialize, const PAGE: usize> Serialize for ConcurrentHive<T, PAGE> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let bound = self.index_bound();
+            let unissued = self.free.unissued_shared();
+            raw_pages::serialize(
+                self.recycled.snapshot_pages(bound, PAGE),
+                |index| self.snapshot_slot(index, &unissued),
+                serializer,
+            )
+        }
+    }
+
+    /// Validates the plain [`Hive`] format and converts in O(index bound).
+    impl<'de, T: Deserialize<'de>, const PAGE: usize> Deserialize<'de> for ConcurrentHive<T, PAGE> {
+        fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
+            Hive::deserialize(deserializer).map(Self::from)
+        }
     }
 }
 
@@ -1120,6 +1238,16 @@ mod tests {
         assert!(hive.remove(b));
         // State-0 tail slots keep their pages: shrinking frees nothing here.
         hive.shrink_to_fit();
+        let versions = raw_versions(&hive.snapshot());
+        assert_eq!(&versions[..4], &[1, 2, 1, 2]);
+        // Index 3 is on the installed page. The rest have no page yet.
+        assert!(versions[4..].iter().all(|&v| v == 0));
+        #[cfg(feature = "serde")]
+        {
+            let json = serde_json::to_string(&hive).unwrap();
+            let decoded: Hive<u32, 4> = serde_json::from_str(&json).unwrap();
+            assert_eq!(raw_versions(&decoded), versions);
+        }
         let plain = hive.into_hive();
         let versions = raw_versions(&plain);
         assert_eq!(versions.len(), 64);

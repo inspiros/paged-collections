@@ -95,13 +95,16 @@ unsafe impl<T: Send, const PAGE: usize> Send for AppendLog<T, PAGE> {}
 unsafe impl<T: Send + Sync, const PAGE: usize> Sync for AppendLog<T, PAGE> {}
 
 impl<T, const PAGE: usize> AppendLog<T, PAGE> {
+    pub(super) fn valid_page_capacity() -> bool {
+        PAGE > 0
+            && PAGE
+                <= isize::MAX as usize / core::mem::size_of::<UnsafeCell<MaybeUninit<T>>>().max(1)
+            && PAGE.div_ceil(64) <= isize::MAX as usize / core::mem::size_of::<AtomicU64>()
+    }
+
     pub(crate) fn new() -> Self {
         assert!(
-            PAGE > 0
-                && PAGE
-                    <= isize::MAX as usize
-                        / core::mem::size_of::<UnsafeCell<MaybeUninit<T>>>().max(1)
-                && PAGE.div_ceil(64) <= isize::MAX as usize / core::mem::size_of::<AtomicU64>(),
+            Self::valid_page_capacity(),
             "AppendLog: invalid page capacity"
         );
         Self {
@@ -110,6 +113,11 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
             committed: AtomicUsize::new(0),
             sync: AtomicUsize::new(0),
         }
+    }
+
+    #[cfg(feature = "serde")]
+    pub(super) fn can_append_at(pos: usize) -> bool {
+        Spine::<Page<T>, CHUNKS>::can_allocate_page(pos / PAGE)
     }
 
     fn claim(&self, limit: usize) -> Option<(usize, &Page<T>)> {

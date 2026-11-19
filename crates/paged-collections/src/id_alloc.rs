@@ -560,7 +560,7 @@ impl fmt::Debug for Iter<'_> {
 }
 
 #[cfg(feature = "serde")]
-mod serde_impl {
+pub(crate) mod serde_impl {
     use super::*;
     use serde::de::{Deserialize, Deserializer, Error};
     use serde::ser::{Serialize, Serializer};
@@ -586,6 +586,15 @@ mod serde_impl {
         free: &'a [u32],
     }
 
+    /// Writes already validated versions and their corresponding free list.
+    pub(crate) fn serialize_raw_parts<S: Serializer>(
+        versions: &[u32],
+        free: &[u32],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        ReprRef { versions, free }.serialize(serializer)
+    }
+
     #[derive(serde::Deserialize)]
     struct Repr {
         versions: Vec<u32>,
@@ -596,11 +605,7 @@ mod serde_impl {
     /// gives an equal allocator that issues the same ids.
     impl Serialize for IdAllocator {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            ReprRef {
-                versions: &self.versions,
-                free: &self.free,
-            }
-            .serialize(serializer)
+            serialize_raw_parts(&self.versions, &self.free, serializer)
         }
     }
 

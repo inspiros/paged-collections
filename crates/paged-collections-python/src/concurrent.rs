@@ -25,7 +25,7 @@ fn lookup_keys(keys: &Bound<'_, PyAny>) -> PyResult<Vec<Option<Key>>> {
 /// The common copied lookup/snapshot interface, hiding direct-map guards.
 trait CopyMap<V: Copy> {
     fn copied_get(&self, key: Key) -> Option<V>;
-    fn snapshot(&self) -> Vec<(Key, V)>;
+    fn copied_items(&self) -> Vec<(Key, V)>;
 }
 
 impl<V: Copy> CopyMap<V> for RustSparseMap<Key, V> {
@@ -33,7 +33,7 @@ impl<V: Copy> CopyMap<V> for RustSparseMap<Key, V> {
         self.get(&key).copied()
     }
 
-    fn snapshot(&self) -> Vec<(Key, V)> {
+    fn copied_items(&self) -> Vec<(Key, V)> {
         self.iter().map(|(&key, &value)| (key, value)).collect()
     }
 }
@@ -43,7 +43,7 @@ impl<V: Copy> CopyMap<V> for RustDirectMap<Key, V> {
         self.get(key).map(|value| *value)
     }
 
-    fn snapshot(&self) -> Vec<(Key, V)> {
+    fn copied_items(&self) -> Vec<(Key, V)> {
         let mut items = Vec::new();
         // Copy under one page lock at a time; no guard reaches Python.
         self.for_each(|&key, &value| items.push((key, value)));
@@ -223,18 +223,18 @@ macro_rules! concurrent_map {
             }
 
             fn keys<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<Key>> {
-                let keys = py.detach(|| self.map.snapshot().into_iter().map(|(key, _)| key).collect());
+                let keys = py.detach(|| self.map.copied_items().into_iter().map(|(key, _)| key).collect());
                 PyArray1::from_vec(py, keys)
             }
 
             fn values<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<$t>> {
-                let values = py.detach(|| self.map.snapshot().into_iter().map(|(_, value)| value).collect());
+                let values = py.detach(|| self.map.copied_items().into_iter().map(|(_, value)| value).collect());
                 PyArray1::from_vec(py, values)
             }
 
             /// Return a copied list of (key, value) pairs.
             fn items(&self, py: Python<'_>) -> Vec<(Key, $t)> {
-                py.detach(|| self.map.snapshot())
+                py.detach(|| self.map.copied_items())
             }
 
             /// Clear with exclusive access; conflicts raise RuntimeError.
@@ -244,7 +244,7 @@ macro_rules! concurrent_map {
 
             fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
                 // Release every direct-map guard before invoking Python repr.
-                let items = crate::repr_items(self.map.snapshot().into_iter(), py)?;
+                let items = crate::repr_items(self.map.copied_items().into_iter(), py)?;
                 Ok(format!("{}({{{items}}})", stringify!($name)))
             }
 

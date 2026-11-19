@@ -53,9 +53,13 @@ impl Drop for Reservation<'_> {
 }
 
 impl<const PAGE: usize, D: SharedDirectory> Index<PAGE, D> {
+    fn valid_page_capacity() -> bool {
+        PAGE > 0 && PAGE <= isize::MAX as usize / core::mem::size_of::<AtomicU32>()
+    }
+
     fn new() -> Self {
         assert!(
-            PAGE > 0 && PAGE <= isize::MAX as usize / core::mem::size_of::<AtomicU32>(),
+            Self::valid_page_capacity(),
             "ConcurrentSparse: invalid page capacity"
         );
         Self {
@@ -413,9 +417,25 @@ impl<K: Key, const PAGE: usize, D: SharedDirectory> ConcurrentSparseSet<K, PAGE,
         }
     }
 
+    /// Copies the committed prefix into a plain set in O(prefix length).
+    /// Like [`len`](Self::len) and [`iter`](Self::iter), this can omit
+    /// completed inserts beyond an earlier unpublished reservation. The keys
+    /// form a valid plain set.
+    pub fn snapshot(&self) -> PagedSparseSet<K, PAGE, D> {
+        self.iter().copied().collect()
+    }
+
     /// Moves keys into the plain set with the same directory in dense order, in O(len).
     pub fn into_inner(self) -> PagedSparseSet<K, PAGE, D> {
         self.dense.into_inner().into_iter().collect()
+    }
+}
+
+/// Copies the committed prefix via [`ConcurrentSparseSet::snapshot`],
+/// which can omit completed inserts beyond an unpublished reservation.
+impl<K: Key, const PAGE: usize, D: SharedDirectory> Clone for ConcurrentSparseSet<K, PAGE, D> {
+    fn clone(&self) -> Self {
+        Self::from(self.snapshot())
     }
 }
 
@@ -690,10 +710,33 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentSparseMap<K, V,
         }
     }
 
+    /// Clones the committed prefix into a plain map in O(prefix length).
+    /// Like [`len`](Self::len) and [`iter`](Self::iter), this can omit
+    /// completed inserts beyond an earlier unpublished reservation. The
+    /// entries form a valid plain map.
+    pub fn snapshot(&self) -> PagedSparseMap<K, V, PAGE, D>
+    where
+        V: Clone,
+    {
+        self.iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect()
+    }
+
     /// Moves entries into a plain map with the same directory in dense order, in O(len).
     /// Values move without cloning; their addresses can change.
     pub fn into_inner(self) -> PagedSparseMap<K, V, PAGE, D> {
         self.dense.into_inner().into_iter().collect()
+    }
+}
+
+/// Clones the committed prefix via [`ConcurrentSparseMap::snapshot`],
+/// which can omit completed inserts beyond an unpublished reservation.
+impl<K: Key, V: Clone, const PAGE: usize, D: SharedDirectory> Clone
+    for ConcurrentSparseMap<K, V, PAGE, D>
+{
+    fn clone(&self) -> Self {
+        Self::from(self.snapshot())
     }
 }
 
@@ -722,6 +765,133 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> From<PagedSparseMap<K, V,
             let _ = result.try_insert(key, value);
         }
         result
+    }
+}
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::*;
+    use crate::concurrent::serde::deserialize_map;
+    use core::marker::PhantomData;
+    use serde::de::{Deserialize, Deserializer, Error, SeqAccess, Visitor};
+    use serde::ser::{Serialize, Serializer};
+
+    fn check_index<const PAGE: usize, D: SharedDirectory>(
+        index: usize,
+    ) -> Result<(), &'static str> {
+        if D::Pages::<IndexPage>::page_number::<PAGE>(index).is_none() {
+            return Err("ConcurrentSparse: key index exceeds sparse spine range");
+        }
+        Ok(())
+    }
+
+    fn can_append_at<T, const PAGE: usize>(len: usize) -> bool {
+        len < DENSE_LIMIT && AppendLog::<T, PAGE>::can_append_at(len)
+    }
+
+    /// Serializes the committed keys in dense order as a valid plain set
+    /// sequence in O(prefix length). The prefix can omit completed inserts
+    /// beyond an earlier unpublished reservation, as in [`ConcurrentSparseSet::iter`].
+    impl<K: Key + Serialize, const PAGE: usize, D: SharedDirectory> Serialize
+        for ConcurrentSparseSet<K, PAGE, D>
+    {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.iter())
+        }
+    }
+
+    /// Reads the plain [`PagedSparseSet`] format, rejecting keys and lengths
+    /// outside the concurrent set's capacity.
+    impl<'de, K: Key + Deserialize<'de>, const PAGE: usize, D: SharedDirectory> Deserialize<'de>
+        for ConcurrentSparseSet<K, PAGE, D>
+    {
+        fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
+            struct SetVisitor<K, const PAGE: usize, D>(PhantomData<(K, D)>);
+
+            impl<'de, K: Key + Deserialize<'de>, const PAGE: usize, D: SharedDirectory> Visitor<'de>
+                for SetVisitor<K, PAGE, D>
+            {
+                type Value = ConcurrentSparseSet<K, PAGE, D>;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a sequence of keys")
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut access: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let set = ConcurrentSparseSet::new();
+                    while let Some(key) = access.next_element::<K>()? {
+                        let index = key.index();
+                        check_index::<PAGE, D>(index).map_err(A::Error::custom)?;
+                        if !can_append_at::<K, PAGE>(set.len())
+                            && set.index.position(index).is_none()
+                        {
+                            return Err(A::Error::custom(
+                                "ConcurrentSparseSet: dense capacity exceeded",
+                            ));
+                        }
+                        set.insert(key);
+                    }
+                    Ok(set)
+                }
+            }
+
+            if !Index::<PAGE, D>::valid_page_capacity()
+                || !AppendLog::<K, PAGE>::valid_page_capacity()
+            {
+                return Err(De::Error::custom(
+                    "ConcurrentSparseSet: invalid page capacity",
+                ));
+            }
+            deserializer.deserialize_seq(SetVisitor::<K, PAGE, D>(PhantomData))
+        }
+    }
+
+    /// Serializes the committed entries in dense order as a valid plain map
+    /// in O(prefix length). The prefix can omit completed inserts beyond an
+    /// earlier unpublished reservation, as in [`ConcurrentSparseMap::iter`].
+    impl<K: Key + Serialize, V: Serialize, const PAGE: usize, D: SharedDirectory> Serialize
+        for ConcurrentSparseMap<K, V, PAGE, D>
+    {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_map(self.iter())
+        }
+    }
+
+    /// Reads the plain [`PagedSparseMap`] format, rejecting keys and lengths
+    /// outside the concurrent map's capacity. Later entries replace earlier
+    /// entries at the same index in place, as in the plain map.
+    impl<'de, K: Key + Deserialize<'de>, V: Deserialize<'de>, const PAGE: usize, D: SharedDirectory>
+        Deserialize<'de> for ConcurrentSparseMap<K, V, PAGE, D>
+    {
+        fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
+            if !Index::<PAGE, D>::valid_page_capacity()
+                || !AppendLog::<(K, V), PAGE>::valid_page_capacity()
+            {
+                return Err(De::Error::custom(
+                    "ConcurrentSparseMap: invalid page capacity",
+                ));
+            }
+            deserialize_map(deserializer, Self::new(), |map, key: K, value: V| {
+                let index = key.index();
+                check_index::<PAGE, D>(index)?;
+                if let Some(pos) = map.index.position(index) {
+                    let (stored, old) = map.dense.get_mut(pos).expect("published entry is ready");
+                    if *stored != key {
+                        *stored = key;
+                    }
+                    *old = value;
+                } else {
+                    if !can_append_at::<(K, V), PAGE>(map.len()) {
+                        return Err("ConcurrentSparseMap: dense capacity exceeded");
+                    }
+                    let _ = map.try_insert(key, value);
+                }
+                Ok(())
+            })
+        }
     }
 }
 

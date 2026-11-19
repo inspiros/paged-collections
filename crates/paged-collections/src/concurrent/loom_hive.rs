@@ -11,6 +11,7 @@ use loom::thread;
 use std::sync::atomic::{AtomicBool as StdAtomicBool, Ordering as StdOrdering};
 
 use super::ConcurrentHive;
+use crate::hive::{Hive, RawPage, RawSlot};
 use crate::id_alloc::Id;
 
 fn model(f: impl Fn() + Send + Sync + 'static) {
@@ -20,6 +21,139 @@ fn model(f: impl Fn() + Send + Sync + 'static) {
     }
     builder.max_branches = 10_000;
     builder.check(f);
+}
+
+// Count actual branches reached by the shared scan across loom schedules.
+static SNAPSHOT_MARKED: StdAtomicBool = StdAtomicBool::new(false);
+static SNAPSHOT_BUSY: StdAtomicBool = StdAtomicBool::new(false);
+// Loom runs one thread at a time, so this plain flag is the writer's real
+// phase whenever the scan observes BUSY.
+static IN_FACTORY: StdAtomicBool = StdAtomicBool::new(false);
+static CLAIM_BUSY: StdAtomicBool = StdAtomicBool::new(false);
+static FINALIZE_BUSY: StdAtomicBool = StdAtomicBool::new(false);
+
+pub(super) fn record_snapshot_marked() {
+    SNAPSHOT_MARKED.store(true, StdOrdering::Relaxed);
+}
+
+pub(super) fn record_snapshot_busy(index: u32) {
+    if index == 0 {
+        SNAPSHOT_BUSY.store(true, StdOrdering::Relaxed);
+        if IN_FACTORY.load(StdOrdering::SeqCst) {
+            CLAIM_BUSY.store(true, StdOrdering::Relaxed);
+        } else {
+            FINALIZE_BUSY.store(true, StdOrdering::Relaxed);
+        }
+    }
+}
+
+#[test]
+fn snapshot_races_removal_and_slot_reuse() {
+    #[derive(Debug)]
+    struct SnapshotValue {
+        tag: u8,
+        yield_on_drop: bool,
+    }
+
+    impl Clone for SnapshotValue {
+        fn clone(&self) -> Self {
+            Self {
+                tag: self.tag,
+                yield_on_drop: false,
+            }
+        }
+    }
+
+    impl Drop for SnapshotValue {
+        fn drop(&mut self) {
+            if self.yield_on_drop {
+                thread::yield_now(); // let the snapshot see finalize-BUSY
+            }
+        }
+    }
+
+    static READ_REPLACEMENT: StdAtomicBool = StdAtomicBool::new(false);
+    static REUSED: StdAtomicBool = StdAtomicBool::new(false);
+    SNAPSHOT_MARKED.store(false, StdOrdering::Relaxed);
+    CLAIM_BUSY.store(false, StdOrdering::Relaxed);
+    FINALIZE_BUSY.store(false, StdOrdering::Relaxed);
+    READ_REPLACEMENT.store(false, StdOrdering::Relaxed);
+    REUSED.store(false, StdOrdering::Relaxed);
+    model(|| {
+        let plain = Hive::<_, 1>::try_from_raw_pages([RawPage {
+            floor: 0,
+            slots: alloc::vec![RawSlot::Occupied {
+                version: 3,
+                value: SnapshotValue {
+                    tag: 11,
+                    yield_on_drop: true
+                },
+            }],
+        }])
+        .unwrap();
+        IN_FACTORY.store(false, StdOrdering::SeqCst);
+        let hive = Arc::new(ConcurrentHive::from(plain));
+        let stale = Id::new(0, NonZeroU32::MIN);
+        let old = Id::new(0, NonZeroU32::new(2).unwrap());
+        let writer = hive.clone();
+        let mutation = thread::spawn(move || {
+            let hive = &*writer;
+            let guard = hive.get(old).unwrap();
+            assert!(hive.remove(old));
+            thread::yield_now(); // let the snapshot see MARKED
+            drop(guard);
+            hive.insert_with(|_| {
+                IN_FACTORY.store(true, StdOrdering::SeqCst);
+                thread::yield_now(); // let the snapshot see claim-BUSY
+                IN_FACTORY.store(false, StdOrdering::SeqCst);
+                SnapshotValue {
+                    tag: 22,
+                    yield_on_drop: false,
+                }
+            })
+        });
+        // Two yields: the first lets the writer reach MARKED, the second its
+        // claim; preemptions cover the other phases.
+        thread::yield_now();
+        thread::yield_now();
+
+        let mut snapshot = hive.snapshot();
+        let page = snapshot.raw_pages().next().unwrap();
+        match page.slots.as_slice() {
+            [RawSlot::Occupied { version: 3, value }] => assert_eq!(value.tag, 11),
+            [RawSlot::Occupied { version: 5, value }] => {
+                assert_eq!(value.tag, 22);
+                READ_REPLACEMENT.store(true, StdOrdering::Relaxed);
+            }
+            [RawSlot::Vacant { version: 4 }] => assert!(snapshot.get(old).is_none()),
+            slots => panic!("invalid snapshot of slot zero: {slots:?}"),
+        }
+        assert!(snapshot.get(stale).is_none());
+        let fork = snapshot.insert(SnapshotValue {
+            tag: 33,
+            yield_on_drop: false,
+        });
+        assert_ne!(fork, stale);
+        assert!(snapshot.get(stale).is_none());
+
+        let replacement = mutation.join().unwrap();
+        if replacement.index() == old.index() {
+            REUSED.store(true, StdOrdering::Relaxed);
+            assert_eq!(replacement.generation().get(), 3);
+        } else {
+            // The scan can pin the old value beyond the remover's guard,
+            // in which case the insert may need a fresh slot.
+            assert_eq!(replacement.index(), 1);
+        }
+        assert_eq!(hive.get(replacement).unwrap().tag, 22);
+        assert!(hive.get(old).is_none());
+        assert!(hive.get(stale).is_none());
+    });
+    assert!(SNAPSHOT_MARKED.load(StdOrdering::Relaxed));
+    assert!(CLAIM_BUSY.load(StdOrdering::Relaxed));
+    assert!(FINALIZE_BUSY.load(StdOrdering::Relaxed));
+    assert!(READ_REPLACEMENT.load(StdOrdering::Relaxed));
+    assert!(REUSED.load(StdOrdering::Relaxed));
 }
 
 struct Value {

@@ -163,10 +163,29 @@ impl<T, const PAGE: usize> ConcurrentPagedVec<T, PAGE> {
         self.log.clear();
     }
 
+    /// Clones the committed prefix into a plain [`PagedVec`] in O(prefix length).
+    /// Like [`len`](Self::len) and [`iter`](Self::iter), this can omit
+    /// completed pushes beyond an earlier unpublished reservation. The
+    /// prefix forms a valid plain vector.
+    pub fn snapshot(&self) -> PagedVec<T, PAGE>
+    where
+        T: Clone,
+    {
+        self.iter().cloned().collect()
+    }
+
     /// Moves the elements into a plain vector in index order, in O(len).
     /// Element addresses can change; no cloning is required.
     pub fn into_inner(self) -> PagedVec<T, PAGE> {
         self.log.into_inner()
+    }
+}
+
+/// Clones the committed prefix via [`ConcurrentPagedVec::snapshot`],
+/// which can omit completed pushes beyond an unpublished reservation.
+impl<T: Clone, const PAGE: usize> Clone for ConcurrentPagedVec<T, PAGE> {
+    fn clone(&self) -> Self {
+        Self::from(self.snapshot())
     }
 }
 
@@ -217,5 +236,28 @@ impl<T, const PAGE: usize> FromIterator<T> for ConcurrentPagedVec<T, PAGE> {
 impl<T, const PAGE: usize> From<PagedVec<T, PAGE>> for ConcurrentPagedVec<T, PAGE> {
     fn from(inner: PagedVec<T, PAGE>) -> Self {
         inner.into_iter().collect()
+    }
+}
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::*;
+    use serde::de::{Deserialize, Deserializer};
+    use serde::ser::{Serialize, Serializer};
+
+    /// Serializes the committed prefix as a valid plain vector sequence
+    /// in O(prefix length). The prefix can omit completed pushes beyond an
+    /// earlier unpublished reservation, as in [`ConcurrentPagedVec::iter`].
+    impl<T: Serialize, const PAGE: usize> Serialize for ConcurrentPagedVec<T, PAGE> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.iter())
+        }
+    }
+
+    /// Reads the plain [`PagedVec`] format and converts in O(len).
+    impl<'de, T: Deserialize<'de>, const PAGE: usize> Deserialize<'de> for ConcurrentPagedVec<T, PAGE> {
+        fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
+            PagedVec::deserialize(deserializer).map(Self::from)
+        }
     }
 }

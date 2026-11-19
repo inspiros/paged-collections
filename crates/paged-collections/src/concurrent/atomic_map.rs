@@ -35,11 +35,12 @@ unsafe impl<const PAGE: usize, D: SharedDirectory> Send for Words<PAGE, D> {}
 unsafe impl<const PAGE: usize, D: SharedDirectory> Sync for Words<PAGE, D> {}
 
 impl<const PAGE: usize, D: SharedDirectory> Words<PAGE, D> {
+    fn valid_page_capacity() -> bool {
+        PAGE > 0 && PAGE <= isize::MAX as usize / mem::size_of::<AtomicU64>()
+    }
+
     fn new(name: &str) -> Self {
-        assert!(
-            PAGE > 0 && PAGE <= isize::MAX as usize / mem::size_of::<AtomicU64>(),
-            "{name}: invalid page capacity"
-        );
+        assert!(Self::valid_page_capacity(), "{name}: invalid page capacity");
         Self {
             pages: D::Pages::<Page>::new(),
             len: StripedLen::new(),
@@ -400,6 +401,13 @@ impl<const PAGE: usize, D: SharedDirectory> AtomicDirectMap<PAGE, D> {
         self.words.clear();
     }
 
+    /// Copies a weakly consistent snapshot into a valid plain map,
+    /// scanning the directory and allocated slots. Includes entries that remain
+    /// unchanged throughout the call if their writes happen-before it.
+    pub fn snapshot(&self) -> PagedDirectMap<usize, u64, PAGE, D> {
+        self.iter().collect()
+    }
+
     /// Moves entries into a plain map with the same directory in slot order.
     pub fn into_inner(self) -> PagedDirectMap<usize, u64, PAGE, D> {
         self.iter().collect()
@@ -643,6 +651,13 @@ impl<const PAGE: usize> AtomicIdMap<PAGE> {
     }
 }
 
+/// Copies via [`AtomicDirectMap::snapshot`].
+impl<const PAGE: usize, D: SharedDirectory> Clone for AtomicDirectMap<PAGE, D> {
+    fn clone(&self) -> Self {
+        Self::from(self.snapshot())
+    }
+}
+
 impl<const PAGE: usize, D: SharedDirectory> Default for AtomicDirectMap<PAGE, D> {
     fn default() -> Self {
         Self::new()
@@ -686,6 +701,15 @@ impl<const PAGE: usize, D: SharedDirectory> From<PagedDirectMap<usize, u64, PAGE
     }
 }
 
+/// Copies a weakly consistent view, scanning the directory and allocated slots.
+/// Includes entries that remain unchanged throughout the call if their writes
+/// happen-before it.
+impl<const PAGE: usize> Clone for AtomicIdMap<PAGE> {
+    fn clone(&self) -> Self {
+        self.iter().collect()
+    }
+}
+
 impl<const PAGE: usize> Default for AtomicIdMap<PAGE> {
     fn default() -> Self {
         Self::new()
@@ -710,6 +734,76 @@ impl<const PAGE: usize> Extend<(Id, u32)> for AtomicIdMap<PAGE> {
     fn extend<T: IntoIterator<Item = (Id, u32)>>(&mut self, iter: T) {
         for (id, value) in iter {
             self.insert(id, value);
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::*;
+    use crate::concurrent::serde::deserialize_map;
+    use alloc::vec::Vec;
+    use serde::de::{Deserialize, Deserializer, Error};
+    use serde::ser::{Serialize, Serializer};
+
+    /// Serializes a weakly consistent snapshot as a valid plain map in slot
+    /// order, with the same consistency as [`AtomicDirectMap::snapshot`].
+    /// Scans the directory and allocated slots, buffering entries to
+    /// supply the exact serialized length.
+    impl<const PAGE: usize, D: SharedDirectory> Serialize for AtomicDirectMap<PAGE, D> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_map(self.iter().collect::<Vec<_>>())
+        }
+    }
+
+    /// Reads the plain [`PagedDirectMap`] format, rejecting `u64::MAX`
+    /// values and indices outside the concurrent directory's range.
+    impl<'de, const PAGE: usize, D: SharedDirectory> Deserialize<'de> for AtomicDirectMap<PAGE, D> {
+        fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
+            if !Words::<PAGE, D>::valid_page_capacity() {
+                return Err(De::Error::custom("AtomicDirectMap: invalid page capacity"));
+            }
+            deserialize_map(deserializer, Self::new(), |map, index, value| {
+                if value > Self::MAX_VALUE {
+                    return Err("AtomicDirectMap: u64::MAX cannot be stored");
+                }
+                if D::Pages::<Page>::page_number::<PAGE>(index).is_none() {
+                    return Err("AtomicDirectMap: key index exceeds direct spine range");
+                }
+                map.insert(index, value);
+                Ok(())
+            })
+        }
+    }
+
+    /// Serializes a weakly consistent snapshot as a valid `Id` to `u32`
+    /// map in slot order. Scans the directory and allocated slots,
+    /// buffering entries to supply the exact serialized length. Includes
+    /// entries that remain unchanged throughout the call if their writes
+    /// happen-before it.
+    impl<const PAGE: usize> Serialize for AtomicIdMap<PAGE> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_map(self.iter().collect::<Vec<_>>())
+        }
+    }
+
+    /// Reads an `Id` to `u32` map in O(len) entry insertions. The
+    /// last entry for each index wins, as with [`FromIterator`]. Rejects
+    /// indices outside the concurrent directory's range.
+    impl<'de, const PAGE: usize> Deserialize<'de> for AtomicIdMap<PAGE> {
+        fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
+            if !Words::<PAGE, Flat>::valid_page_capacity() {
+                return Err(De::Error::custom("AtomicIdMap: invalid page capacity"));
+            }
+            deserialize_map(deserializer, Self::new(), |map, id: Id, value| {
+                if <Flat as SharedDirectory>::Pages::<Page>::page_number::<PAGE>(id.index() as usize)
+                    .is_none()
+                {
+                    return Err("AtomicIdMap: id index exceeds direct spine range");
+                }
+                map.insert(id, value);
+                Ok(())
+            })
         }
     }
 }

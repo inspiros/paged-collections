@@ -1709,7 +1709,7 @@ mod rayon_impl {
 }
 
 #[cfg(feature = "serde")]
-mod serde_impl {
+pub(crate) mod serde_impl {
     use super::*;
     use serde::de::{Deserialize, Deserializer, Error};
     use serde::ser::{Serialize, Serializer};
@@ -1733,9 +1733,66 @@ mod serde_impl {
     }
 
     #[derive(serde::Serialize)]
-    struct PageRef<'a, T: Serialize> {
+    struct PageRef<Slots: Serialize> {
         floor: u32,
-        slots: SlotsRef<'a, T>,
+        slots: Slots,
+    }
+
+    #[cfg(all(
+        feature = "concurrent",
+        target_has_atomic = "ptr",
+        target_has_atomic = "64",
+        any(target_pointer_width = "32", target_pointer_width = "64")
+    ))]
+    pub(crate) mod raw_pages {
+        use super::*;
+        use core::ops::{Deref, Range};
+        use serde::ser::SerializeSeq;
+
+        struct SlotsRef<'a, F> {
+            indices: Range<u32>,
+            scan: &'a F,
+        }
+
+        impl<V: Deref, F: Fn(u32) -> RawSlot<V>> Serialize for SlotsRef<'_, F>
+        where
+            V::Target: Serialize,
+        {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(self.indices.len()))?;
+                // Each occupied value stays borrowed or guarded only for
+                // its own serialize call.
+                for index in self.indices.clone() {
+                    match (self.scan)(index) {
+                        RawSlot::Occupied { version, value } => {
+                            seq.serialize_element(&SlotRepr::Occupied(version, &*value))?;
+                        }
+                        RawSlot::Vacant { version } => {
+                            seq.serialize_element(&SlotRepr::<&V::Target>::Vacant(version))?;
+                        }
+                    }
+                }
+                seq.end()
+            }
+        }
+
+        /// Streams raw pages and their guarded or borrowed slot values.
+        pub(crate) fn serialize<S: Serializer, V: Deref>(
+            pages: impl Iterator<Item = (u32, Range<u32>)>,
+            scan: impl Fn(u32) -> RawSlot<V>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            V::Target: Serialize,
+        {
+            serializer.collect_seq(pages.map(|(floor, indices)| PageRef {
+                floor,
+                slots: SlotsRef {
+                    indices,
+                    scan: &scan,
+                },
+            }))
+        }
     }
 
     #[derive(serde::Deserialize)]
