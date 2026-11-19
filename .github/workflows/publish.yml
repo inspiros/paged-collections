@@ -1,6 +1,6 @@
 name: Publish
 
-# Manual only: Actions > Publish > Run workflow, with the release tag (v*) as
+# Manual only: Actions > Publish > Run workflow, choosing the release tag (v*) as
 # the ref. The Rust crate is the primary package and goes first; the Python
 # wheels follow from the same commit.
 on:
