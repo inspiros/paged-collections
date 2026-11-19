@@ -12,7 +12,7 @@ Paged sparse sets, maps, a priority queue and stable-address containers for
 Rust (`no_std` + `alloc`), with Python bindings built on PyO3 and NumPy.
 
 <p align="center">
-  <img src="docs/site/src/assets/paging-overview.svg" alt="A paged index allocates pages on demand. Paged storage grows by adding pages without moving existing elements.">
+  <img src="https://inspiros.github.io/paged-collections/assets/paging-overview.svg" alt="A paged index allocates pages on demand. Paged storage grows by adding pages without moving existing elements.">
 </p>
 
 - **Paged index**: a key-indexed table split into pages allocated on first
@@ -126,14 +126,14 @@ paged-collections/
     └── site/                      # mdBook documentation
 ```
 
-Development commands are in [CONTRIBUTING.md](CONTRIBUTING.md).
+Development commands are in [CONTRIBUTING.md](https://github.com/inspiros/paged-collections/blob/master/CONTRIBUTING.md).
 
 ## License
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/inspiros/paged-collections/blob/master/LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](https://github.com/inspiros/paged-collections/blob/master/LICENSE-MIT))
 
 at your option.
 
