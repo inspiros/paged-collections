@@ -1,12 +1,12 @@
 # paged-collections
 
+[![CI](https://img.shields.io/github/actions/workflow/status/inspiros/paged-collections/ci.yml?label=CI)](https://github.com/inspiros/paged-collections/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/paged-collections)](https://crates.io/crates/paged-collections)
 [![crates.io downloads](https://img.shields.io/crates/d/paged-collections)](https://crates.io/crates/paged-collections)
 [![PyPI](https://img.shields.io/pypi/v/paged-collections)](https://pypi.org/project/paged-collections/)
 [![PyPI monthly downloads](https://img.shields.io/pypi/dm/paged-collections)](https://pypi.org/project/paged-collections/)
-[![CI](https://img.shields.io/github/actions/workflow/status/inspiros/paged-collections/ci.yml?label=CI)](https://github.com/inspiros/paged-collections/actions/workflows/ci.yml)
 [![Documentation](https://img.shields.io/badge/docs-website-475d7a?logo=mdbook&logoColor=white)](https://inspiros.github.io/paged-collections/)
-[![License](https://img.shields.io/github/license/inspiros/paged-collections)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
 Paged sparse sets, maps, a priority queue and stable-address containers for
 Rust (`no_std` + `alloc`), with Python bindings built on PyO3 and NumPy.
@@ -130,4 +130,14 @@ Development commands are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
