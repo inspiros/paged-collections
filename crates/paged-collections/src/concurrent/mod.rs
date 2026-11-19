@@ -233,6 +233,7 @@ mod hive;
 mod id_alloc;
 mod index;
 mod lock;
+mod priority_queue;
 mod radix;
 mod recycle;
 #[cfg(feature = "serde")]
@@ -249,6 +250,7 @@ pub use direct::{
 pub use directory::SharedDirectory;
 pub use hive::{ConcurrentHive, Drain, Iter, IterMut, Ref};
 pub use id_alloc::ConcurrentIdAllocator;
+pub use priority_queue::ConcurrentPriorityQueue;
 pub use sparse::{ConcurrentSparseMap, ConcurrentSparseSet};
 pub use vec::ConcurrentPagedVec;
 
