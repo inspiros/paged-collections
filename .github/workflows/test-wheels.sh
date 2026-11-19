@@ -6,10 +6,12 @@ set -euo pipefail
 for py in $PYTHONS 3.15; do
   venv="$RUNNER_TEMP/venv-$py"
   uv venv -q --python "$py" "$venv"
-  bin="$venv/bin"; [ -d "$bin" ] || bin="$venv/Scripts"
-  uv pip install -q --python "$bin/python" numpy pytest
-  uv pip install -q --python "$bin/python" --no-index --find-links dist paged-collections
-  "$bin/python" - <<'EOF'
+  # uv needs the real file name: Scripts/python.exe on Windows.
+  python="$venv/bin/python"
+  [ -e "$python" ] || python="$venv/Scripts/python.exe"
+  uv pip install -q --python "$python" numpy pytest
+  uv pip install -q --python "$python" --no-index --find-links dist paged-collections
+  "$python" - <<'EOF'
 import sys, sysconfig
 import paged_collections
 ft = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
@@ -18,5 +20,5 @@ assert not ft or not sys._is_gil_enabled(), "importing paged_collections enabled
 EOF
   # From the repo root, `python -m pytest` imports the installed package:
   # the sources live under python/, which is not on sys.path.
-  "$bin/python" -m pytest -q -p no:cacheprovider tests
+  "$python" -m pytest -q -p no:cacheprovider tests
 done
