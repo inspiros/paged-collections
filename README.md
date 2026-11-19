@@ -1,11 +1,9 @@
 # paged-collections
 
-<!-- Uncomment after the first release.
 [![crates.io](https://img.shields.io/crates/v/paged-collections)](https://crates.io/crates/paged-collections)
 [![crates.io downloads](https://img.shields.io/crates/d/paged-collections)](https://crates.io/crates/paged-collections)
 [![PyPI](https://img.shields.io/pypi/v/paged-collections)](https://pypi.org/project/paged-collections/)
 [![PyPI monthly downloads](https://img.shields.io/pypi/dm/paged-collections)](https://pypi.org/project/paged-collections/)
--->
 [![CI](https://img.shields.io/github/actions/workflow/status/inspiros/paged-collections/ci.yml?label=CI)](https://github.com/inspiros/paged-collections/actions/workflows/ci.yml)
 [![Documentation](https://img.shields.io/badge/docs-website-475d7a?logo=mdbook&logoColor=white)](https://inspiros.github.io/paged-collections/)
 [![License](https://img.shields.io/github/license/inspiros/paged-collections)](LICENSE)
@@ -22,8 +20,6 @@ Rust (`no_std` + `alloc`), with Python bindings built on PyO3 and NumPy.
   directory still holds one pointer per page up to the largest key; for keys
   spread over a wide range, the `Radix` and `Tree` directories avoid that.
 - **Paged storage**: elements keep their addresses as the container grows.
-
-> Status: in development, not yet published.
 
 ## Install
 
