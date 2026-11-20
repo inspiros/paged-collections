@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 import math
 import pickle
+import random
 import threading
 from types import MappingProxyType
 import weakref
@@ -196,6 +197,49 @@ def test_priority_queue_exact_order(priority_queue_cls, is_min):
     for call in (queue.pop, queue.pop_exact, queue.peek_exact):
         with pytest.raises(IndexError):
             call()
+
+
+@pytest.mark.parametrize("is_min", [False, True])
+def test_pop_exact_is_globally_ordered_across_many_shards(priority_queue_cls, is_min):
+    # Many nonempty shards, so a relaxed pop in place of pop_exact would
+    # break the order with near certainty.
+    rng = random.Random(7)
+    priorities = rng.sample(range(-1000, 1000), 64)
+    items = [(index * 8192, priority) for index, priority in enumerate(priorities)]
+    queue = priority_queue_cls(items, min=is_min, shards=8)
+    expected = sorted(items, key=lambda item: item[1], reverse=not is_min)
+    assert [queue.pop_exact() for _ in expected] == expected
+
+
+def test_priority_queue_rejects_huge_shard_counts(priority_queue_cls):
+    assert priority_queue_cls(shards=65536).shards == 65536
+    for shards in (65537, 2**63, 2**100):
+        with pytest.raises(OverflowError):
+            priority_queue_cls(shards=shards)
+
+
+def test_priority_queue_is_not_a_sequence(priority_queue_cls):
+    queue = priority_queue_cls([(0, 7)])
+    with pytest.raises(TypeError):
+        iter(queue)
+
+
+def test_clear_lets_finalizers_push_back():
+    queue = pc.ConcurrentQueue()
+    pushed = []
+
+    class PushOnDel:
+        def __del__(self):
+            try:
+                queue.push("from finalizer")
+                pushed.append(True)
+            except RuntimeError:
+                pushed.append(False)
+
+    queue.push(PushOnDel())
+    queue.clear()
+    assert pushed == [True]
+    assert queue.drain() == ["from finalizer"]
 
 
 def test_priority_queue_relaxed_pop_drains(priority_queue_cls):

@@ -98,7 +98,9 @@ where
             }
         } else {
             for item in items.try_iter()? {
-                let (key, priority): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item?.extract()?;
+                // Keep the pair alive while its key and priority convert.
+                let item = item?;
+                let (key, priority): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
                 push(&key, &priority)?;
             }
         }

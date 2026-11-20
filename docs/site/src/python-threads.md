@@ -58,7 +58,7 @@ cannot collect reference cycles through a queue.
 `ConcurrentPriorityQueue` stores int64 priorities and
 `ConcurrentPriorityQueueF64` stores float64 priorities, with NaN rejected.
 Both take integer keys in `0 <= key < 2**32`. Pass `min=True` to prefer the
-lowest priority and `shards=` to choose a positive shard count. The initial
+lowest priority and `shards=` to choose a shard count from 1 to 65536. The initial
 items can be a mapping or iterable of pairs. Later duplicate keys win.
 `concurrent_priority_queue(dtype, items, min, shards=...)` selects the class
 by dtype.

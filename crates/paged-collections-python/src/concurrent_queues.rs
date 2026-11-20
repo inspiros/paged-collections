@@ -4,7 +4,7 @@ use paged_collections::concurrent::{
     ConcurrentPriorityQueue as RustPriorityQueue, ConcurrentQueue as RustQueue,
 };
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyKeyError, PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -22,6 +22,11 @@ fn index_at_least<'py>(
     }
     Ok(index)
 }
+
+/// Largest accepted shard count. The Rust default is at most 256; far larger
+/// counts only waste memory, and unbounded ones would overflow the shard
+/// array's allocation.
+const MAX_SHARDS: usize = 1 << 16;
 
 const QUEUE_COPY_ERROR: &str =
     "ConcurrentQueue cannot be copied or pickled; drain() into a list first";
@@ -90,9 +95,12 @@ impl ConcurrentQueue {
     }
 
     /// Remove all items. Requires exclusive access.
-    fn clear(&mut self) {
-        // Drop Python references while the thread is attached.
-        self.queue.clear();
+    fn clear(slf: &Bound<'_, Self>) -> PyResult<()> {
+        // Release the borrow before dropping the items: a finalizer may
+        // push onto this queue. The thread stays attached throughout.
+        let items: Vec<Py<PyAny>> = slf.try_borrow_mut()?.queue.drain().collect();
+        drop(items);
+        Ok(())
     }
 
     /// Remove and return all items in FIFO order. Requires exclusive access.
@@ -129,7 +137,9 @@ macro_rules! concurrent_priority_queue {
             "across shards. Clear requires exclusive access and conflicting calls raise ",
             "RuntimeError (Already borrowed)."
         )]
-        #[pyclass(module = "paged_collections._core", weakref)]
+        // `mapping`: no sequence fallback, so iter() raises TypeError rather
+        // than calling __getitem__ with 0, 1, ...
+        #[pyclass(module = "paged_collections._core", weakref, mapping)]
         pub(crate) struct $name {
             queue: RustPriorityQueue<Key, Prio<$t>>,
             min: bool,
@@ -148,7 +158,12 @@ macro_rules! concurrent_priority_queue {
             ) -> PyResult<Self> {
                 let shards = shards
                     .map(|value| {
-                        index_at_least(value, 1, "shards must be at least 1")?.extract::<usize>()
+                        let shards = index_at_least(value, 1, "shards must be at least 1")?;
+                        shards
+                            .extract::<usize>()
+                            .ok()
+                            .filter(|&shards| shards <= MAX_SHARDS)
+                            .ok_or_else(|| PyOverflowError::new_err("shards must be at most 65536"))
                     })
                     .transpose()?;
                 let pairs = extract_pairs::<$t>(items)?;
