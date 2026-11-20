@@ -479,6 +479,8 @@ mod tests {
     }
 
     #[test]
+    // Walks pages up to u32::MAX: over 9 hours under Miri, under a second natively.
+    #[cfg_attr(miri, ignore)]
     fn the_last_indices_below_u32_max_are_issued_freed_and_reused() {
         // Reservation resumes 3 below the limit: the last page is
         // [2^32 - 4096, 2^32), and its top slot (index u32::MAX) is NONE.
