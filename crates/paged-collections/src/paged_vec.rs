@@ -662,6 +662,45 @@ impl<T, const PAGE: usize> PagedVec<T, PAGE> {
         }
     }
 
+    /// Visits `range` in order, yielding each element for which `filter`
+    /// returns `true`. The filter may mutate each element before deciding.
+    ///
+    /// Dropping the iterator early keeps the unvisited elements in order.
+    /// If the filter panics, the element being tested is kept, including
+    /// any mutations to it. Pages are kept and no memory is allocated.
+    /// After the first removal, later elements are shifted down in one pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the start exceeds the end, the end exceeds `len`, or a
+    /// bound overflows `usize`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use paged_collections::paged_vec::PagedVec;
+    ///
+    /// let mut values: PagedVec<i32, 2> = (0..6).collect();
+    /// let removed: Vec<_> = values.extract_if(1..5, |x| *x % 2 == 0).collect();
+    /// assert_eq!(removed, [2, 4]);
+    /// assert!(values.into_iter().eq([0, 1, 3, 5]));
+    /// ```
+    pub fn extract_if<R, F>(&mut self, range: R, filter: F) -> ExtractIf<'_, T, F, PAGE>
+    where
+        R: RangeBounds<usize>,
+        F: FnMut(&mut T) -> bool,
+    {
+        let original_len = self.len;
+        let (next, end) = range_indices(range, original_len);
+        ExtractIf {
+            vec: self,
+            next,
+            end,
+            original_len,
+            filter,
+        }
+    }
+
     /// Removes consecutive equal elements, keeping the first of each run.
     /// Costs O(len), without allocation. Elements before the first removed
     /// one keep their addresses; later kept elements move down. If equality
@@ -1436,6 +1475,109 @@ impl<T: fmt::Debug, const PAGE: usize> fmt::Debug for Drain<'_, T, PAGE> {
                     .chain(self.inner.back.as_slice()),
             )
             .finish()
+    }
+}
+
+/// The elements removed by [`PagedVec::extract_if`].
+///
+/// Dropping this iterator moves any unvisited elements down to fill the gap
+/// left by removals. Forgetting it after a removal leaks the unvisited
+/// suffix and leaves the compacted prefix in the vector.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct ExtractIf<'a, T, F, const PAGE: usize = DEFAULT_PAGE> {
+    vec: &'a mut PagedVec<T, PAGE>,
+    // Before the first removal, all slots up to original_len are owned by
+    // vec. After it, vec owns 0..vec.len, while next..original_len holds
+    // initialized elements owned by this iterator. Slots in the gap
+    // vec.len..next are logically uninitialized.
+    next: usize,
+    end: usize,
+    original_len: usize,
+    filter: F,
+}
+
+impl<T, F, const PAGE: usize> ExtractIf<'_, T, F, PAGE> {
+    /// Shortens the vector on the first removal, transferring ownership
+    /// of the suffix to this iterator without dropping or moving elements.
+    fn hide_tail(&mut self) {
+        let (page, mut len) = split::<PAGE>(self.next);
+        let used = self.vec.used_pages();
+        for page in &mut self.vec.pages[page..used] {
+            // SAFETY: len is at most the current page length. The iterator
+            // takes ownership of the elements beyond it in this page.
+            unsafe { page.set_len(len) };
+            len = 0;
+        }
+        self.vec.len = self.next;
+    }
+
+    fn current_ptr(&mut self) -> *mut T {
+        let (page, offset) = split::<PAGE>(self.next);
+        self.vec.pages[page].as_mut_ptr().wrapping_add(offset)
+    }
+
+    fn take_next(&mut self) -> T {
+        let slot = self.current_ptr();
+        self.next += 1;
+        // SAFETY: the caller has hidden the tail, and the previous next
+        // index names its first initialized element. Advancing next moves
+        // ownership of this slot out of the iterator.
+        unsafe { slot.read() }
+    }
+}
+
+impl<T, F: FnMut(&mut T) -> bool, const PAGE: usize> Iterator for ExtractIf<'_, T, F, PAGE> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        while self.next < self.end {
+            let slot = self.current_ptr();
+            // SAFETY: next is below original_len and names an initialized
+            // element, including when the tail is hidden from the vector.
+            // The reference is exclusive and ends before we move the value.
+            let value = unsafe { &mut *slot };
+            if (self.filter)(value) {
+                if self.vec.len == self.original_len {
+                    self.hide_tail();
+                }
+                return Some(self.take_next());
+            }
+            if self.vec.len == self.original_len {
+                self.next += 1;
+            } else {
+                let kept = self.take_next();
+                self.vec.push(kept);
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.end - self.next))
+    }
+}
+
+impl<T, F: FnMut(&mut T) -> bool, const PAGE: usize> FusedIterator for ExtractIf<'_, T, F, PAGE> {}
+
+impl<T, F, const PAGE: usize> Drop for ExtractIf<'_, T, F, PAGE> {
+    fn drop(&mut self) {
+        if self.vec.len == self.original_len {
+            return;
+        }
+        while self.next < self.original_len {
+            let kept = self.take_next();
+            // The gap leaves room in the original pages, so push cannot
+            // allocate. No filter or destructors run during compaction.
+            self.vec.push(kept);
+        }
+    }
+}
+
+impl<T, F, const PAGE: usize> fmt::Debug for ExtractIf<'_, T, F, PAGE> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtractIf")
+            .field("remaining", &(self.end - self.next))
+            .finish_non_exhaustive()
     }
 }
 

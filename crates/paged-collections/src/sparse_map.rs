@@ -25,6 +25,7 @@
 //! | Method | Slot held by another key |
 //! |---|---|
 //! | [`insert`](PagedSparseMap::insert), [`get_or_insert_with`](PagedSparseMap::get_or_insert_with) | evicts it |
+//! | [`entry`](PagedSparseMap::entry) | reports a vacant entry. Inserting through it evicts the other key |
 //! | [`replace`](PagedSparseMap::replace) | evicts it and returns the evicted entry |
 //! | [`try_insert`](PagedSparseMap::try_insert) | refuses, like [`PagedSparseSet::insert`] |
 //!
@@ -312,23 +313,41 @@ impl<K: Key, V, const PAGE: usize, D: Directory> PagedSparseMap<K, V, PAGE, D> {
     ///
     /// As [`insert`](Self::insert).
     pub fn get_or_insert_with(&mut self, key: K, make: impl FnOnce() -> V) -> &mut V {
+        self.entry(key).or_insert_with(make)
+    }
+
+    /// The entry for `key`, for in-place access or insertion.
+    ///
+    /// [`Entry::Occupied`] holds the exact stored key. If another generation
+    /// holds the slot, this returns [`Entry::Vacant`]. Inserting through it
+    /// evicts that generation and keeps its dense position, as
+    /// [`insert`](Self::insert) does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use paged_collections::sparse_map::PagedSparseMap;
+    ///
+    /// let mut counts: PagedSparseMap<usize, u32> = PagedSparseMap::new();
+    /// for key in [3, 1, 3, 3] {
+    ///     counts.entry(key).and_modify(|n| *n += 1).or_insert(1);
+    /// }
+    /// assert_eq!((counts[3], counts[1]), (3, 1));
+    /// ```
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, PAGE, D> {
         let index = key.index();
-        let pos = match self.keys.occupant_pos(index) {
-            Some(pos) if self.keys.as_slice()[pos] == key => pos,
-            Some(pos) => {
-                let value = make();
-                self.keys.overwrite_at(pos, key);
-                // Drop the evicted value only once the entry is consistent:
-                // `V::drop` may panic.
-                drop(core::mem::replace(&mut self.values[pos], value));
-                pos
+        let occupant = self.keys.occupant_pos(index);
+        match occupant {
+            Some(pos) if self.keys.as_slice()[pos] == key => {
+                Entry::Occupied(OccupiedEntry { map: self, pos })
             }
-            None => {
-                let value = make();
-                self.push_vacant(key, index, value)
-            }
-        };
-        &mut self.values[pos]
+            _ => Entry::Vacant(VacantEntry {
+                map: self,
+                key,
+                index,
+                occupant,
+            }),
+        }
     }
 
     /// Removes the entry at dense position `pos` by moving the last entry
@@ -1045,6 +1064,225 @@ impl<'a, K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory + '
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+/// A view into one key's place in a [`PagedSparseMap`], from
+/// [`PagedSparseMap::entry`].
+pub enum Entry<'a, K: Key, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+    /// The key is in the map.
+    Occupied(OccupiedEntry<'a, K, V, PAGE, D>),
+    /// The key's slot is empty or held by another generation.
+    Vacant(VacantEntry<'a, K, V, PAGE, D>),
+}
+
+/// An [`Entry`] for a key that is in the map.
+pub struct OccupiedEntry<'a, K: Key, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+    map: &'a mut PagedSparseMap<K, V, PAGE, D>,
+    pos: usize,
+}
+
+/// An [`Entry`] for a key that is absent from the map.
+pub struct VacantEntry<'a, K: Key, V, const PAGE: usize = DEFAULT_PAGE, D: Directory = Flat> {
+    map: &'a mut PagedSparseMap<K, V, PAGE, D>,
+    key: K,
+    index: usize,
+    occupant: Option<usize>,
+}
+
+impl<'a, K: Key, V, const PAGE: usize, D: Directory> Entry<'a, K, V, PAGE, D> {
+    /// The stored key if occupied, or the key given to [`PagedSparseMap::entry`].
+    #[inline]
+    pub fn key(&self) -> &K {
+        match self {
+            Entry::Occupied(entry) => entry.key(),
+            Entry::Vacant(entry) => entry.key(),
+        }
+    }
+
+    /// The value, inserting `default` first if the key is absent.
+    #[inline]
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// The value, inserting `make()` first if the key is absent. If `make`
+    /// panics, the map is unchanged.
+    #[inline]
+    pub fn or_insert_with(self, make: impl FnOnce() -> V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(make()),
+        }
+    }
+
+    /// Like [`or_insert_with`](Self::or_insert_with), giving `make` the key.
+    #[inline]
+    pub fn or_insert_with_key(self, make: impl FnOnce(&K) -> V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let value = make(entry.key());
+                entry.insert(value)
+            }
+        }
+    }
+
+    /// The value, inserting `V::default()` first if the key is absent.
+    #[inline]
+    pub fn or_default(self) -> &'a mut V
+    where
+        V: Default,
+    {
+        self.or_insert_with(V::default)
+    }
+
+    /// Calls `f` on the value if the key is present, and returns the entry.
+    #[inline]
+    pub fn and_modify(mut self, f: impl FnOnce(&mut V)) -> Self {
+        if let Entry::Occupied(entry) = &mut self {
+            f(entry.get_mut());
+        }
+        self
+    }
+
+    /// Stores `value` for the key and returns the occupied entry. An occupied
+    /// entry keeps its stored key. Inserting into a vacant entry evicts any
+    /// other generation in the slot.
+    #[inline]
+    pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, PAGE, D> {
+        match self {
+            Entry::Occupied(mut entry) => {
+                entry.insert(value);
+                entry
+            }
+            Entry::Vacant(entry) => entry.insert_entry(value),
+        }
+    }
+}
+
+impl<'a, K: Key, V, const PAGE: usize, D: Directory> OccupiedEntry<'a, K, V, PAGE, D> {
+    /// The stored key.
+    #[inline]
+    pub fn key(&self) -> &K {
+        &self.map.keys.as_slice()[self.pos]
+    }
+
+    /// The stored value.
+    #[inline]
+    pub fn get(&self) -> &V {
+        &self.map.values[self.pos]
+    }
+
+    /// Mutable access to the stored value.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut V {
+        &mut self.map.values[self.pos]
+    }
+
+    /// Mutable access to the value for the lifetime of the map borrow.
+    #[inline]
+    pub fn into_mut(self) -> &'a mut V {
+        &mut self.map.values[self.pos]
+    }
+
+    /// Replaces the value and returns the old one, keeping the stored key.
+    #[inline]
+    pub fn insert(&mut self, value: V) -> V {
+        core::mem::replace(self.get_mut(), value)
+    }
+
+    /// Removes the entry and returns its value.
+    #[inline]
+    pub fn remove(self) -> V {
+        self.remove_entry().1
+    }
+
+    /// Removes the entry and returns the stored key and its value.
+    ///
+    /// The last entry moves into the removed entry's position.
+    pub fn remove_entry(self) -> (K, V) {
+        self.map.remove_at(self.pos)
+    }
+}
+
+impl<'a, K: Key, V, const PAGE: usize, D: Directory> VacantEntry<'a, K, V, PAGE, D> {
+    /// The key given to [`PagedSparseMap::entry`].
+    #[inline]
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Returns the key without changing the map.
+    #[inline]
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    /// Stores `value` for the key and returns mutable access to it, evicting
+    /// and dropping any other generation in the slot.
+    ///
+    /// # Panics
+    ///
+    /// As [`PagedSparseMap::insert`]. If an evicted value's destructor panics,
+    /// the new entry is already in place.
+    #[inline]
+    pub fn insert(self, value: V) -> &'a mut V {
+        self.insert_entry(value).into_mut()
+    }
+
+    fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, PAGE, D> {
+        let Self {
+            map,
+            key,
+            index,
+            occupant,
+        } = self;
+        let pos = match occupant {
+            Some(pos) => {
+                map.keys.overwrite_at(pos, key);
+                // Drop the evicted value only after both arrays agree.
+                drop(core::mem::replace(&mut map.values[pos], value));
+                pos
+            }
+            None => map.push_vacant(key, index, value),
+        };
+        OccupiedEntry { map, pos }
+    }
+}
+
+impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
+    for Entry<'_, K, V, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Entry::Occupied(entry) => f.debug_tuple("Occupied").field(entry).finish(),
+            Entry::Vacant(entry) => f.debug_tuple("Vacant").field(entry).finish(),
+        }
+    }
+}
+
+impl<K: Key + fmt::Debug, V: fmt::Debug, const PAGE: usize, D: Directory> fmt::Debug
+    for OccupiedEntry<'_, K, V, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OccupiedEntry")
+            .field("key", self.key())
+            .field("value", self.get())
+            .finish()
+    }
+}
+
+impl<K: Key + fmt::Debug, V, const PAGE: usize, D: Directory> fmt::Debug
+    for VacantEntry<'_, K, V, PAGE, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VacantEntry")
+            .field("key", self.key())
+            .finish()
     }
 }
 

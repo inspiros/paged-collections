@@ -55,11 +55,16 @@ keys the methods differ when the slot is held by a *different* key:
 | Method | Slot held by another generation |
 |---|---|
 | `insert`, `get_or_insert_with` | evicts it |
+| `entry` | returns `Vacant`. Inserting through it evicts the other generation in place |
 | `replace` | evicts it and returns the evicted entry |
 | `try_insert` | refuses |
 
 `insert` evicts so that `get(key)` returns the new value afterwards, as with
 `HashMap`.
+
+In Rust, `entry(key)` gives mutable access to an exact key or lets you insert
+it after a single slot lookup. For example, use
+`*counts.entry(key).or_default() += 1` to update a counter.
 
 ## Rust and Python
 
@@ -68,6 +73,7 @@ keys the methods differ when the slot is held by a *different* key:
 | `insert(k, v)` | `m[k] = v`, `set_many(keys, values)`, `update(mapping)` |
 | `get(k)`, `get_mut(k)` | `m[k]`, `get(k, default)`, `get_many(keys, default)` |
 | `get_or_insert_with` | `setdefault(k, default)` |
+| `entry(k)` | |
 | `remove(k)` | `del m[k]`, `pop(k[, default])`, `popitem()`, `discard_many(keys)` |
 | `first_key_value()`, `last_key_value()` | `first_item()`, `last_item()` |
 | `pop_first()`, `pop_last()` | `pop_first()`, `pop_last()` |

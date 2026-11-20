@@ -50,6 +50,7 @@
 //! # }
 //! ```
 
+use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -60,6 +61,7 @@ use core::slice;
 use crate::hash::hash_unordered;
 use crate::key::Key;
 use crate::page::{DEFAULT_PAGE, Directory, Flat};
+use crate::paged_vec::capacity_overflow;
 use crate::sparse_set::{PagedSparseSet, Slot};
 
 const ARITY: usize = 4;
@@ -116,6 +118,45 @@ impl<K: Key, P, const PAGE: usize, D: Directory> PagedPriorityQueue<K, P, PAGE, 
     pub fn reserve(&mut self, additional: usize) {
         self.keys.reserve(additional);
         self.priorities.reserve(additional);
+    }
+
+    /// Reserves room for at least `additional` more entries in both dense arrays.
+    ///
+    /// Returns an error if the capacity overflows or allocation fails. On
+    /// error the entries, capacity and array addresses are preserved.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use paged_collections::priority_queue::PagedPriorityQueue;
+    ///
+    /// let mut queue: PagedPriorityQueue<usize, i32> = PagedPriorityQueue::new();
+    /// queue.try_reserve(16).unwrap();
+    /// assert!(queue.capacity() >= 16);
+    /// ```
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        let needed = self
+            .len()
+            .checked_add(additional)
+            .ok_or_else(capacity_overflow)?;
+        if self.keys.capacity() >= needed {
+            return self.priorities.try_reserve(additional);
+        }
+        if self.priorities.capacity() >= needed {
+            return self.keys.try_reserve(additional);
+        }
+
+        // Stage the priority allocation so a key allocation failure leaves
+        // both original arrays in place. Moving priorities into the staged
+        // buffer cannot allocate or run user code.
+        let mut priorities = Vec::new();
+        priorities.try_reserve(needed)?;
+        self.keys.try_reserve(additional)?;
+        for priority in self.priorities.drain(..) {
+            priorities.push(priority);
+        }
+        self.priorities = priorities;
+        Ok(())
     }
 
     /// Shrinks the dense arrays and index directory. Frees every index page

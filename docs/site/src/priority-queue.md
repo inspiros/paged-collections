@@ -47,6 +47,10 @@ The Rust example prints the first three lines.
 
 Equal priorities come out in unspecified order.
 
+In Rust, `try_reserve(additional)` reserves room in both dense arrays.
+If capacity overflows or allocation fails, the queue keeps its entries,
+array addresses and capacity.
+
 ## Generational Keys
 
 A slot holds one key. `push` evicts another generation of the key's slot;
@@ -73,5 +77,6 @@ mutability. Neither causes undefined behaviour.
 | `remove(&k)` | `remove(k)`, `del q[k]` |
 | `into_sorted_vec`, `into_sorted_iter` | `sorted()` |
 | `keys`, `priorities`, `key_slice`, `priority_slice` | `keys()`, `items()` |
+| `reserve`, `try_reserve` | |
 
 API: [`PagedPriorityQueue`](https://docs.rs/paged-collections/latest/paged_collections/priority_queue/struct.PagedPriorityQueue.html).

@@ -30,7 +30,7 @@ The Rust example prints the same lines without the set algebra.
 
 | Operation | Cost |
 |---|---|
-| insert, remove, contains | O(1) with `Flat`; O(depth) with `Radix`; O(log pages) with `Tree` |
+| insert, remove, contains, get, take | O(1) with `Flat`; O(depth) with `Radix`; O(log pages) with `Tree` |
 | clear | O(1): pages are kept, stale slots are ignored |
 | iteration, `as_slice` | dense array only, O(len) |
 | sort | O(n log n) comparisons, then one index write per key |
@@ -56,7 +56,9 @@ lasts until the next removal or insertion out of order.
 The set holds at most one key per slot index. With generational keys,
 `insert` refuses a key whose slot is held by another generation and returns
 `false`; `replace` evicts the other generation; `occupant(index)` returns the
-key holding a slot. See [Ids and Side Tables](ids.md).
+key holding a slot. `get(key)` borrows the stored key and `take(key)`
+removes and returns it. Both require an exact generation match.
+See [Ids and Side Tables](ids.md).
 
 ## Rust and Python
 
@@ -65,6 +67,8 @@ key holding a slot. See [Ids and Side Tables](ids.md).
 | `insert(k) -> bool` | `add(k)`, `add_many(keys) -> int` | |
 | `remove(k) -> bool` | `discard(k)`, `remove(k)` (raises `KeyError`), `discard_many(keys)` | swap removal |
 | `contains(k)` | `k in s`, `contains_many(keys) -> ndarray[bool]` | |
+| `get(k)` | | borrows the stored key |
+| `take(k)` | | returns the stored key by swap removal |
 | `as_slice()` | `to_array()` (copy), `view()` (zero-copy, read-only) | |
 | `iter()` | `iter(s)` | dense order |
 | `first()`, `last()` | `first()`, `last()` | smallest and largest keys |

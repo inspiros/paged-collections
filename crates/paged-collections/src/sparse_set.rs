@@ -219,6 +219,23 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
         self.position(key).is_some()
     }
 
+    /// The stored key equal to `key`, including its generation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let mut set: PagedSparseSet<usize> = PagedSparseSet::new();
+    /// set.insert(7);
+    /// assert_eq!(set.get(7), Some(&7));
+    /// assert_eq!(set.get(8), None);
+    /// ```
+    #[inline]
+    pub fn get(&self, key: K) -> Option<&K> {
+        self.position(key).map(|pos| &self.dense[pos])
+    }
+
     /// The key occupying slot `index`, if any.
     ///
     /// With generational keys this finds whichever generation is present.
@@ -307,13 +324,24 @@ impl<K: Key, const PAGE: usize, D: Directory> PagedSparseSet<K, PAGE, D> {
     ///
     /// The last key moves into the removed key's position.
     pub fn remove(&mut self, key: K) -> bool {
-        match self.position(key) {
-            Some(pos) => {
-                self.remove_at(pos);
-                true
-            }
-            None => false,
-        }
+        self.take(key).is_some()
+    }
+
+    /// Removes and returns the stored key equal to `key`, including its
+    /// generation. The last key moves into the removed key's position.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use paged_collections::sparse_set::PagedSparseSet;
+    ///
+    /// let mut set: PagedSparseSet<usize> = PagedSparseSet::new();
+    /// set.insert(7);
+    /// assert_eq!(set.take(7), Some(7));
+    /// assert_eq!(set.take(7), None);
+    /// ```
+    pub fn take(&mut self, key: K) -> Option<K> {
+        self.position(key).map(|pos| self.remove_at(pos))
     }
 
     /// Removes whichever key occupies slot `index` and returns it.
