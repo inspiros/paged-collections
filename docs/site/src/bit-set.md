@@ -15,6 +15,11 @@ allocated as keys are inserted. Clearing the set or removing keys keeps the
 pages for reuse. In Rust, `shrink_to_fit()` frees empty pages and `reset()`
 frees all pages.
 
+<figure class="pc-figure">
+  <img src="assets/bit-set-lookup.svg" alt="In a bit set with two 64-bit words per page, key 138 selects page 1, word 0, and bit 10. That bit is set." />
+  <figcaption>Each word stores membership for 64 consecutive keys. In this example, page 1 starts at key 128, so key 138 is 10 bits into its first word.</figcaption>
+</figure>
+
 The Python binding uses the `Flat` directory and accepts the sizes in
 `PAGE_SIZES`. Each directory slot holds one page pointer up to the
 highest allocated page. At the default size, the full Python key domain

@@ -19,7 +19,7 @@
 | `PAGE` const generic | `page_size=` keyword | `PAGE_SIZES`, `DEFAULT_PAGE_SIZE` |
 | `page::Flat`, `Radix`, `Tree` | always `Flat` | |
 
-Module constants: `KEY_LIMIT` (2**32), `MAX_GENERATION` (2**31),
+Module constants: `KEY_LIMIT` (2<sup>32</sup>), `MAX_GENERATION` (2<sup>31</sup>),
 `MAX_INDICES`.
 
 Reference documentation:

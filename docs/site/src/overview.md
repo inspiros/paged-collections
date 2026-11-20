@@ -2,7 +2,7 @@
 
 `paged-collections` provides sparse sets, maps, a priority queue and
 stable-address containers whose memory is split into fixed-size pages. The
-core is a `no_std` Rust crate (`alloc` only); the Python package wraps it with
+core is a `no_std` Rust crate (`alloc` only). The Python package wraps it with
 PyO3 and exchanges batches with NumPy.
 
 <figure class="pc-figure pc-figure-wide">
@@ -38,8 +38,8 @@ See [Paging Model](paging.md) for page sizes, directories and memory behaviour.
 
 ## Example
 
-A `Hive` stores elements at stable addresses and returns generational ids. The
-ids index the other maps directly, which makes side tables:
+A `Hive` stores elements at stable addresses and returns generational ids.
+Those ids can index the other maps directly to create side tables:
 
 <div class="lang-tabs">
 
@@ -59,7 +59,8 @@ Python output:
 {{#include ../examples/overview.python.txt}}
 ```
 
-The Rust example prints `range = [30, 20]` in place of the last line: it queries the direct map by key range.
+The Rust example queries the direct map by key range and prints
+`range = [30, 20]` in place of the last line.
 
 ## Containers
 

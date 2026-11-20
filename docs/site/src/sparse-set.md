@@ -35,16 +35,16 @@ The Rust example prints the same lines without the set algebra.
 | iteration, `as_slice` | dense array only, O(len) |
 | sort | O(n log n) comparisons, then one index write per key |
 
-Lookups follow Briggs and Torczon: a slot is trusted only if it points inside
-the dense array at a key with the same slot index, so stale slots left by
-`clear` are harmless and clearing does not touch the pages.
+Lookups follow Briggs and Torczon. A lookup accepts a slot only if it points
+inside the dense array to a key with the same slot index. This check lets
+`clear` leave the index pages untouched.
 
 ## Order
 
-Iteration follows the dense array: insertion order until a removal. `remove`
-swaps the last key into the removed position (O(1)), so removal changes the
-order. `sort` and its variants reorder the dense array; sorted order then
-lasts until the next removal or insertion out of order.
+Iteration follows the dense array in insertion order until a removal. `remove`
+swaps the last key into the removed position (O(1)), changing the order.
+`sort` and its variants reorder the dense array. Sorted order then lasts until
+the next removal or insertion out of order.
 
 <figure class="pc-figure">
   <img src="assets/sparse-set-removal.svg" alt="Removing 9 from the dense keys 11, 9, 2 moves the last key, 2, into the middle slot." />

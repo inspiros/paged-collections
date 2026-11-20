@@ -5,8 +5,8 @@
 Every keyed collection stores at most one key per *slot*, and `Key::index`
 names the slot. For integers the slot is the integer. For generational ids
 (an index plus a generation counter) the slot is the index part, so all
-generations of an id share one slot. Collections compare the stored key with
-`==` on every lookup, so an older generation is not found.
+generations of an id share one slot. A lookup with a generational id matches
+only the generation stored in that collection.
 
 What happens when an insert meets a slot held by another generation is
 documented per method: `insert` evicts, `replace` evicts and returns,
@@ -28,6 +28,16 @@ indices, which keeps the paged indices of the maps compact.
 Each index issues at most `MAX_GENERATION` (2<sup>31</sup>) ids, then retires.
 The stale-id guarantee has the same scope as for the [hive](hive.md#limits-and-stale-ids):
 one allocation history.
+
+## Side Tables
+
+Use the same id as a key in separate maps when each entity has several
+associated values. The allocator and each map manage their own entries.
+
+<figure class="pc-figure">
+  <img src="assets/id-side-table.svg" alt="Freeing id (0, 1) and allocating again produces id (0, 2). The score map still holds score 10 for (0, 1), so looking up (0, 2) misses." />
+  <figcaption>The allocator increments the generation when it reuses a slot. Remove the old entry from each side table explicitly, or replace it when inserting the new generation.</figcaption>
+</figure>
 
 ## Example
 

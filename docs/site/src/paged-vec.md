@@ -8,8 +8,8 @@ See [how paged storage grows](paging.md#paged-storage).
 
 Python: `PagedList` (objects) and `PagedListF64`, `PagedListF32`,
 `PagedListI64`, `PagedListI32`, `PagedListU64`, `PagedListU32`,
-`PagedListBool`; `paged_list(dtype)` creates an instance of the class for a dtype. They implement the
-`list` protocol.
+`PagedListBool`. These classes implement the `list` protocol.
+`paged_list(dtype)` creates an instance of the class for a dtype.
 
 ## Example
 
@@ -31,7 +31,8 @@ Python output:
 {{#include ../examples/paged_vec.python.txt}}
 ```
 
-The Rust example also prints `same address = true`: element 0 kept its address through 10,000 pushes.
+The Rust example also prints `same address = true`. Element 0 kept its
+address through 10,000 pushes.
 
 ## Address Stability
 

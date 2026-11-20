@@ -88,7 +88,7 @@ ids removed since.
 
 `Id` implements `Key` and `DirectKey`, so `PagedSparseMap<Id, V>` and
 `PagedDirectMap<Id, V>` hold extra data per element. In Python use `IdMap`.
-See [Ids and Side Tables](ids.md).
+See [how side tables handle recycled ids](ids.md#side-tables).
 
 ## Rust and Python
 

@@ -38,8 +38,8 @@ keys are scattered thinly or when you need contiguous slices.
 
 ## Hive or `IdAllocator` with a Map
 
-`Hive<T>` owns the elements; a removed element's id goes stale. An
-`IdAllocator` owns only the ids; values live in one or more paged maps keyed
+`Hive<T>` owns the elements. A removed element's id goes stale. An
+`IdAllocator` owns only the ids. Values live in one or more paged maps keyed
 by `Id`. Use the allocator when an entity has several components stored in
 separate tables, and the hive when one value per id is enough.
 

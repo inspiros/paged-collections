@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="232" viewBox="0 0 480 232" role="img" aria-labelledby="title desc">
+  <title id="title">A membership bit inside a PagedBitSet page</title>
+  <desc id="desc">With 128 keys per page, key 138 has offset 10 in page 1. Word 0, bit 10 is set, so the key is present.</desc>
+  <style>
+    text { fill: #202b45; font: 600 17px system-ui, sans-serif; }
+    .heading { font-size: 20px; font-weight: 700; }
+    .small { fill: #53627c; font-size: 16px; font-weight: 500; }
+    .mono { font-family: ui-monospace, monospace; }
+    .index-text { fill: #3730a3; }
+    .frame { fill: #f7f8fc; stroke: #d2daea; }
+    .panel { fill: #ffffff; stroke: #d2daea; }
+    .cell { fill: #ffffff; stroke: #8795b0; }
+    .index { fill: #e7e9ff; stroke: #3730a3; }
+    .connector { fill: none; stroke: #8795b0; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+    .index-line { stroke: #3730a3; }
+    .index-arrowhead { fill: #3730a3; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #edf2fc; }
+      .small { fill: #becbe3; }
+      .index-text { fill: #c1c7ff; }
+      .frame { fill: #141e32; stroke: #41516e; }
+      .panel { fill: #1c2940; stroke: #41516e; }
+      .cell { fill: #1c2940; stroke: #8294b6; }
+      .index { fill: #2d3565; stroke: #c1c7ff; }
+      .connector { stroke: #8294b6; }
+      .index-line { stroke: #c1c7ff; }
+      .index-arrowhead { fill: #c1c7ff; }
+    }
+  </style>
+  <defs>
+    <marker id="index" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path class="index-arrowhead" d="M0 0 L8 4 L0 8 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="frame" x="0.5" y="0.5" width="479" height="231" rx="16"/>
+  <text x="22" y="37" class="heading">Key 138 → page 1</text>
+  <text x="22" y="61" class="small">2 words per page · 128 keys per page</text>
+  <rect class="index" x="22" y="77" width="211" height="51" rx="6"/>
+  <rect class="panel" x="247" y="77" width="211" height="51" rx="6"/>
+  <text x="127.5" y="98" text-anchor="middle">Word 0</text>
+  <text x="127.5" y="118" class="small" text-anchor="middle">Keys 128–191</text>
+  <text x="352.5" y="98" text-anchor="middle">Word 1</text>
+  <text x="352.5" y="118" class="small" text-anchor="middle">Keys 192–255</text>
+  <path class="connector index-line" d="M127.5 128 V146 H279 V166" marker-end="url(#index)"/>
+  <text x="22" y="185">Word 0 detail</text>
+  <text x="22" y="207" class="small">By bit index</text>
+  <rect class="cell" x="152" y="170" width="46" height="44" rx="6"/>
+  <text x="175" y="187" class="small mono" text-anchor="middle">12</text>
+  <text x="175" y="208" class="mono" text-anchor="middle">0</text>
+  <rect class="cell" x="204" y="170" width="46" height="44" rx="6"/>
+  <text x="227" y="187" class="small mono" text-anchor="middle">11</text>
+  <text x="227" y="208" class="mono" text-anchor="middle">0</text>
+  <rect class="index" x="256" y="170" width="46" height="44" rx="6"/>
+  <text x="279" y="187" class="small mono" text-anchor="middle">10</text>
+  <text x="279" y="208" class="mono index-text" text-anchor="middle">1</text>
+  <rect class="cell" x="308" y="170" width="46" height="44" rx="6"/>
+  <text x="331" y="187" class="small mono" text-anchor="middle">9</text>
+  <text x="331" y="208" class="mono" text-anchor="middle">0</text>
+  <rect class="cell" x="360" y="170" width="46" height="44" rx="6"/>
+  <text x="383" y="187" class="small mono" text-anchor="middle">8</text>
+  <text x="383" y="208" class="mono" text-anchor="middle">0</text>
+</svg>

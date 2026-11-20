@@ -1,7 +1,7 @@
 # Sparse Map
 
 `PagedSparseMap<K, V, PAGE = 1024, D = Flat>` is a [sparse set](sparse-set.md)
-of keys plus a dense value array kept parallel to the dense keys: the value at
+of keys plus a dense value array kept parallel to the dense keys. The value at
 position `i` belongs to the key at position `i`. Keys and values can be
 iterated or borrowed as slices without touching the index.
 

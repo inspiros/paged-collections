@@ -27,7 +27,7 @@ need `&mut self`.
 |---|---|---|---|
 | `ConcurrentHive<T>` | insert, remove, take | iteration with `&mut`, drain, `shrink_to_fit`, `into_hive` | `Ref` guard (two atomic writes per lookup) |
 | `ConcurrentAppendHive<T>` | insert | remove, mutable access, `shrink_to_fit`, `into_hive` | `&T` (one Acquire load) |
-| `ConcurrentPagedVec<T>` | push | removal, editing, `shrink_to_fit`, conversion | `&T` |
+| [`ConcurrentPagedVec<T>`](#concurrentpagedvec) | push | removal, editing, `shrink_to_fit`, conversion | `&T` |
 | `ConcurrentQueue<T>` (Python `ConcurrentQueue`) | push, pop | clear, drain, `shrink_to_fit` | owned value from `pop` |
 | `ConcurrentPriorityQueue<K, P>` (Python `ConcurrentPriorityQueue`, `ConcurrentPriorityQueueF64`) | push, change priority, remove, pop | clear, drain, `shrink_to_fit` | cloned priority or closure |
 | `ConcurrentSparseSet<K>`, `ConcurrentSparseMap<K, V>` | insert | removal, clear, drain, `shrink_to_fit`, conversion | `&K`, `&V` |
@@ -44,10 +44,6 @@ Notes per type:
 - **ConcurrentAppendHive**: iteration may miss insertions in flight.
   `From<Hive>` and `into_hive` keep live ids and stale-id history, in
   O(index bound).
-- **ConcurrentPagedVec**: pushes do not wait for earlier writers. Point
-  lookups see completed pushes; `len`, iteration and page slices use a
-  hole-free prefix that can lag while an earlier push is in flight.
-  `shrink_to_fit` frees pages wholly beyond the vector's length.
 - **Sparse set and map**: entries cannot be removed or changed while shared.
   `shrink_to_fit` frees index pages with no entry and dense pages beyond the
   last entry; stored entries keep their addresses.
@@ -74,6 +70,19 @@ Use `for item in &collection` on containers with `iter` and `for item in
 &mut collection` on containers with `iter_mut`. These loops use the same
 item types, order and consistency as the respective iterator methods.
 
+## ConcurrentPagedVec
+
+Concurrent pushes can finish out of order. A point lookup can read a published
+element beyond the first pending slot. Length, iteration and page slices all
+use the contiguous published prefix.
+
+<figure class="pc-figure">
+  <img src="assets/concurrent-vec-prefix.svg" alt="Slots 0 and 1 are published while slot 2 is pending. Slot 3 already contains D. The length is 2, but get(3) can read D." />
+  <figcaption>When slot 2 finishes publishing, the visible prefix can advance through slot 3. An iterator created earlier retains the prefix it started with.</figcaption>
+</figure>
+
+`shrink_to_fit` frees pages wholly beyond the vector's length.
+
 ## ConcurrentQueue
 
 `ConcurrentQueue` is an unbounded multi-producer, multi-consumer FIFO queue,
@@ -82,7 +91,13 @@ waits at page boundaries. A pop can also wait for a push that has claimed a
 slot to publish its value. Shared peeking, iteration, cloning, snapshots and
 serialization are unavailable; an owned queue can be converted to a
 `PagedDeque` for serialization. The Python `ConcurrentQueue` holds Python
-objects and drains into a list. See [Python Threads](python-threads.md#concurrentqueue).
+objects and drains into a list. See [Python Threads](python-threads.md#concurrentqueue)
+and the [Python FIFO benchmarks](benchmarks.md#fifo).
+
+<figure class="pc-figure">
+  <img src="assets/concurrent-queue-pages.svg" alt="A pop takes A from the head page. A push writes E into the next free slot after D on the tail page." />
+  <figcaption>Producers claim slots at the tail and consumers take them from the head. A drained head page can be recycled for future pushes.</figcaption>
+</figure>
 
 ```rust
 {{#include ../../../crates/paged-collections/examples/doc_concurrent.rs:queue}}
@@ -97,7 +112,13 @@ Use `pop_exact` to select the global maximum. Per-key operations lock one
 shard; `pop_exact` locks all shards. Callbacks and user trait implementations
 run under shard locks and must not call back into the same queue. The Python
 classes `ConcurrentPriorityQueue` and `ConcurrentPriorityQueueF64` store
-numeric priorities and also support min queues. See [Python Threads](python-threads.md#concurrent-priority-queues).
+numeric priorities and also support min queues. See [Python Threads](python-threads.md#concurrent-priority-queues)
+and the [Python priority-queue benchmarks](benchmarks.md#priority-queues).
+
+<figure class="pc-figure">
+  <img src="assets/concurrent-priority-pop.svg" alt="Four shard tops have priorities 45, 70, 95, and 35. A pop that samples the first two takes 70. An exact pop from the same state takes 95." />
+  <figcaption>In this max-queue, the sampled shards determine which entry <code>pop</code> returns. <code>pop_exact</code> locks all shards and selects the global maximum.</figcaption>
+</figure>
 
 ```rust
 {{#include ../../../crates/paged-collections/examples/doc_concurrent.rs:priority_queue}}

@@ -15,11 +15,13 @@ Rust (`no_std` + `alloc`), with Python bindings built on PyO3 and NumPy.
   <img src="https://inspiros.github.io/paged-collections/assets/paging-overview.svg" alt="A paged index allocates pages on demand. Paged storage grows by adding pages without moving existing elements.">
 </p>
 
-- **Paged index**: a key-indexed table split into pages allocated on first
-  use, so index pages follow the occupied key ranges. The default `Flat`
-  directory still holds one pointer per page up to the largest key; for keys
-  spread over a wide range, the `Radix` and `Tree` directories avoid that.
-- **Paged storage**: elements keep their addresses as the container grows.
+The keyed collections use a paged index. The first write to a page
+allocates it. The default `Flat` directory stores a pointer slot for every
+page number up to the highest one used. `Radix` and `Tree` can skip gaps
+between page numbers, which saves directory space when keys are far apart.
+
+With paged storage, existing elements keep their addresses as the container
+grows.
 
 ## Install
 

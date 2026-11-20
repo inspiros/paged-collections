@@ -49,7 +49,7 @@ The Rust example prints the same lines without the rotation.
 Front operations change indices without moving the remaining elements.
 Insertion, removal, swapping and retention can move elements.
 
-Elements are not contiguous: `pages()` returns the initialized part of each
+Elements are not contiguous. `pages()` returns the initialized part of each
 used page, and the first and last slices can be partial.
 
 ## Rust and Python

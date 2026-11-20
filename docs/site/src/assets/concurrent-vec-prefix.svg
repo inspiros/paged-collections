@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="182" viewBox="0 0 480 182" role="img" aria-labelledby="title desc">
+  <title id="title">A published element beyond the contiguous prefix</title>
+  <desc id="desc">Slots 0 and 1 contain A and B. Slot 2 is still pending. Slot 3 is published, so get(3) can read D while len() is 2 and iter() visits only A and B.</desc>
+  <style>
+    text { fill: #202b45; font: 600 17px system-ui, sans-serif; }
+    .heading { font-size: 20px; font-weight: 700; }
+    .small { fill: #53627c; font-size: 16px; font-weight: 500; }
+    .mono { font-family: ui-monospace, monospace; }
+    .index-text { fill: #3730a3; }
+    .storage-text { fill: #0c6656; }
+    .frame { fill: #f7f8fc; stroke: #d2daea; }
+    .empty { fill: none; stroke: #8795b0; stroke-dasharray: 4 3; }
+    .index { fill: #e7e9ff; stroke: #3730a3; }
+    .storage { fill: #def6ed; stroke: #0c6656; }
+    .connector { fill: none; stroke: #8795b0; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+    .index-line { stroke: #3730a3; }
+    .index-arrowhead { fill: #3730a3; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #edf2fc; }
+      .small { fill: #becbe3; }
+      .index-text { fill: #c1c7ff; }
+      .storage-text { fill: #9aead1; }
+      .frame { fill: #141e32; stroke: #41516e; }
+      .empty { stroke: #8294b6; }
+      .index { fill: #2d3565; stroke: #c1c7ff; }
+      .storage { fill: #193f42; stroke: #9aead1; }
+      .connector { stroke: #8294b6; }
+      .index-line { stroke: #c1c7ff; }
+      .index-arrowhead { fill: #c1c7ff; }
+    }
+  </style>
+  <defs>
+    <marker id="index" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path class="index-arrowhead" d="M0 0 L8 4 L0 8 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="frame" x="0.5" y="0.5" width="479" height="181" rx="16"/>
+  <text x="22" y="38" class="heading">ConcurrentPagedVec</text>
+  <text x="411" y="38" class="mono index-text" text-anchor="middle">get(3) → D</text>
+  <path class="connector index-line" d="M411 46 V67" marker-end="url(#index)"/>
+  <rect class="storage" x="22" y="71" width="106" height="46" rx="6"/>
+  <text x="75" y="100" class="mono storage-text" text-anchor="middle">A</text>
+  <text x="75" y="138" class="small mono" text-anchor="middle">0</text>
+  <rect class="storage" x="134" y="71" width="106" height="46" rx="6"/>
+  <text x="187" y="100" class="mono storage-text" text-anchor="middle">B</text>
+  <text x="187" y="138" class="small mono" text-anchor="middle">1</text>
+  <rect class="empty" x="246" y="71" width="106" height="46" rx="6"/>
+  <text x="299" y="100" class="small" text-anchor="middle">Pending</text>
+  <text x="299" y="138" class="small mono" text-anchor="middle">2</text>
+  <rect class="index" x="358" y="71" width="106" height="46" rx="6"/>
+  <text x="411" y="100" class="mono index-text" text-anchor="middle">D</text>
+  <text x="411" y="138" class="small mono" text-anchor="middle">3</text>
+  <path class="connector" d="M22 145 V151 H240 V145"/>
+  <text x="131" y="172" class="small storage-text" text-anchor="middle">len() = 2 · iter() sees A, B</text>
+</svg>

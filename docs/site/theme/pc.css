@@ -141,6 +141,9 @@ body { font-size: 1.6rem; }
 
 /* Keep long signatures and tables scrollable within the reading column. */
 .content .table-wrapper { margin: 24px 0; border: 1px solid var(--pc-border); border-radius: 10px; overflow-x: auto; }
+.pc-bench-results { margin: 12px 0; }
+.pc-bench-results > summary { padding: 10px 14px; border: 1px solid var(--pc-border); border-radius: 8px; background: var(--pc-soft); cursor: pointer; font-weight: 600; }
+.pc-bench-results .table-wrapper { margin: 10px 0 20px; }
 .content table { border-collapse: collapse; margin: 0; width: 100%; font-size: 1.4rem; line-height: 1.6; }
 .content th, .content td { padding: 14px 16px; border: 0; border-bottom: 1px solid var(--pc-border); text-align: left; vertical-align: top; }
 .content th { font-weight: 650; }

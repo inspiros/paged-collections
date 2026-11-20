@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="157" viewBox="0 0 480 157" role="img" aria-labelledby="title desc">
+  <title id="title">Push and pop take place at opposite ends of a paged FIFO</title>
+  <desc id="desc">The next pop takes A from the head page. The next push writes E into the free slot after D on the tail page.</desc>
+  <style>
+    text { fill: #202b45; font: 600 17px system-ui, sans-serif; }
+    .small { fill: #53627c; font-size: 16px; font-weight: 500; }
+    .mono { font-family: ui-monospace, monospace; }
+    .index-text { fill: #3730a3; }
+    .storage-text { fill: #0c6656; }
+    .frame { fill: #f7f8fc; stroke: #d2daea; }
+    .panel { fill: #ffffff; stroke: #d2daea; }
+    .empty { fill: none; stroke: #8795b0; stroke-dasharray: 4 3; }
+    .index { fill: #e7e9ff; stroke: #3730a3; }
+    .storage { fill: #def6ed; stroke: #0c6656; }
+    .connector { fill: none; stroke: #8795b0; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+    .index-line { stroke: #3730a3; }
+    .index-arrowhead { fill: #3730a3; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #edf2fc; }
+      .small { fill: #becbe3; }
+      .index-text { fill: #c1c7ff; }
+      .storage-text { fill: #9aead1; }
+      .frame { fill: #141e32; stroke: #41516e; }
+      .panel { fill: #1c2940; stroke: #41516e; }
+      .empty { stroke: #8294b6; }
+      .index { fill: #2d3565; stroke: #c1c7ff; }
+      .storage { fill: #193f42; stroke: #9aead1; }
+      .connector { stroke: #8294b6; }
+      .index-line { stroke: #c1c7ff; }
+      .index-arrowhead { fill: #c1c7ff; }
+    }
+  </style>
+  <defs>
+    <marker id="index" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path class="index-arrowhead" d="M0 0 L8 4 L0 8 Z"/>
+    </marker>
+  </defs>
+
+  <rect class="frame" x="0.5" y="0.5" width="479" height="156" rx="16"/>
+  <text x="123" y="36" class="mono index-text" text-anchor="middle">pop → A</text>
+  <text x="357" y="36" class="mono index-text" text-anchor="middle">push(E)</text>
+  <path class="connector index-line" d="M123 69 V44" marker-end="url(#index)"/>
+  <path class="connector index-line" d="M357 44 V68" marker-end="url(#index)"/>
+  <rect class="panel" x="50" y="72" width="159" height="49" rx="8"/>
+  <rect class="empty" x="55" y="77" width="40" height="39" rx="6"/>
+  <text x="75.0" y="102.5" class="mono small" text-anchor="middle">–</text>
+  <rect class="index" x="103" y="77" width="40" height="39" rx="6"/>
+  <text x="123.0" y="102.5" class="mono index-text" text-anchor="middle">A</text>
+  <rect class="storage" x="151" y="77" width="40" height="39" rx="6"/>
+  <text x="171.0" y="102.5" class="mono storage-text" text-anchor="middle">B</text>
+  <text x="123" y="143" class="small" text-anchor="middle">Head page</text>
+  <rect class="panel" x="236" y="72" width="159" height="49" rx="8"/>
+  <rect class="storage" x="241" y="77" width="40" height="39" rx="6"/>
+  <text x="261.0" y="102.5" class="mono storage-text" text-anchor="middle">C</text>
+  <rect class="storage" x="289" y="77" width="40" height="39" rx="6"/>
+  <text x="309.0" y="102.5" class="mono storage-text" text-anchor="middle">D</text>
+  <rect class="index" x="337" y="77" width="40" height="39" rx="6"/>
+  <text x="357.0" y="102.5" class="mono index-text" text-anchor="middle">–</text>
+  <text x="309" y="143" class="small" text-anchor="middle">Tail page</text>
+</svg>

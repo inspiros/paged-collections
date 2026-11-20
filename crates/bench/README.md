@@ -10,7 +10,7 @@ GiB, especially direct maps, and Criterion repeats each case. Filter the
 benchmarks when exploring on a smaller machine.
 
 Memory rows count allocations requested through the Rust global allocator,
-relative to the live allocations before each build; input key vectors are
+relative to the live allocations before each build. Input key vectors are
 excluded. The reported peak is the peak tracked live allocation size, not RSS
 or allocator overhead. ID, sequence and priority-queue rows use sequential
-inputs; the key patterns apply to the sparse and direct groups.
+inputs. The key patterns apply to the sparse and direct groups.

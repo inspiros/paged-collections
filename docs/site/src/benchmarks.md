@@ -1,95 +1,72 @@
 # Benchmarks
 
-These numbers are a reference from one machine. Ratios move with the CPU,
-the allocator and the key distribution; measure your own workload with the
-commands below before choosing a container on speed.
+These measurements come from one machine at the source revisions listed
+in [Setup and Reproduction](#setup-and-reproduction).
 
-## Setup
+- **Rust timings** · [Keyed collections](#keyed-collections) · [Priority queues](#priority-queue) · [Vectors and deques](#paged-vector-and-deque) · [Generational ids](#generational-ids)
+- **Memory** · [Allocated bytes and shrinking](#memory) · [Page-size sweep](#page-size)
+- **Throughput** · [Thread scaling](#concurrent-scaling) · [Python queues](#python-queues)
 
-| Item | Value |
+## How to Read the Results
+
+| Metric | What each value measures | Better |
+|---|---|---|
+| **ns/key** or **ns/element** | Median timed workload divided by the input size, `n`. Some workloads perform more or fewer than `n` calls. | Lower |
+| **ns/query** | Median time per ordered query. A range query can visit many entries. | Lower |
+| **Bytes/key** or **MB** | Live bytes requested from Rust's global allocator at the stated checkpoint. MB is 1,000,000 bytes. | Lower |
+| **Throughput** | The stated unit of work divided by median elapsed wall time, in millions per second. See each table for what counts as one unit. | Higher |
+| **Speedup** | Throughput at the stated worker count divided by throughput for the same workload on one thread. | Higher |
+
+In each timing table, `n` is the number of input entries or the starting
+container size. A dash means no measurement is reported. Bold highlights the
+lowest time in the Rust timing tables and the highest throughput in the
+Python FIFO table. Small gaps on this machine are weak evidence of a
+performance difference.
+
+## Comparison Implementations
+
+| Workload | Baselines |
 |---|---|
-| Machine | 4 × Intel Xeon E7-8860 v4 at 2.20 GHz (72 cores, 144 threads), 503 GB RAM |
-| OS | Linux 5.15, glibc 2.35 (system allocator) |
-| Rust | rustc 1.100.0, `--release`, no `target-cpu` flags |
-| Source | commit `b814a0e` |
-| Pinning | each Criterion group on its own physical core (`taskset`), groups in parallel on separate cores; scaling runs alone on 8 physical cores of one NUMA node |
-| Load | other users idle (load average 0.0 at start) |
-
-Comparisons:
-
-| Name in tables | Type |
-|---|---|
-| `HashMap`, `HashSet` | `hashbrown` 0.17 with `FxHasher` (`rustc-hash` 2) |
-| `BTreeMap`, `BTreeSet`, `Vec`, `VecDeque`, `BinaryHeap` | `std` |
-| `VecOption`, `VecBool` | `Vec<Option<u64>>` / `Vec<bool>` indexed by key (dense keys only) |
-| `PriorityQueue` | `priority-queue` 2 |
-| `SlotMap`, `DenseSlotMap` | `slotmap` 1 |
-| `Slab` | `slab` 0.4 |
-| `Arena` | `thunderdome` 0.6 |
-| `IdAllocatorIdMap` | `IdAllocator` + `PagedSparseMap<Id, u64>` |
-
-## Method
-
-- Times are Criterion medians (default settings, one run), divided by the
-  number of keys or elements `n`, so they read as nanoseconds per element.
-  Differences under about 10% are noise.
-- **insert** builds the container from `n` keys in pattern order, including
-  allocation. **hit** looks up all keys in shuffled order; **miss** looks up
-  `n` absent keys from the same pattern. **iterate** visits every entry.
-  **remove** removes all keys in shuffled order.
-- Key patterns (`u32` keys):
-  - **dense**: `0..n`.
-  - **clustered**: runs of 64 consecutive keys, run starts spread
-    pseudo-randomly over the `u32` range.
-  - **uniform**: pseudo-random `u32` keys (a xorshift permutation).
-- Uniform keys stop at 10⁵: at 10⁷ the paged containers would need tens of
-  GiB, one page per key.
-- Memory counts bytes requested from the global allocator by the container,
-  not RSS. Bold marks the smallest value in a row.
-
-## Reproduce
-
-```sh
-git clone https://github.com/inspiros/paged-collections
-cd paged-collections
-cargo bench -p paged-collections-bench --bench sparse     # also: direct, ids, seq, pq
-cargo run --release -p paged-collections-bench --bin memory
-cargo run --release -p paged-collections-bench --bin churn
-cargo run --release -p paged-collections-bench --bin page_sweep
-cargo run --release -p paged-collections-bench --bin concurrent_scaling -- 2000000 7
-python benchmarks/python/concurrent_scaling.py --threads 1 2 4 8 --repeat 7
-python benchmarks/python/queues.py --threads 1 2 4 8 --repeat 5
-```
-
-The largest cases need tens of GiB of memory; pass a Criterion filter
-(for example `-- /1000/`) on smaller machines. Source:
-[`crates/bench`](https://github.com/inspiros/paged-collections/tree/master/crates/bench),
-[`benchmarks/python`](https://github.com/inspiros/paged-collections/tree/master/benchmarks/python).
+| Keyed maps and sets | [`hashbrown::HashMap`][hash-map] and [`hashbrown::HashSet`][hash-set] (0.17.1) with [`rustc_hash::FxHasher`][fx-hasher] (2.1.3), plus Rust's [`BTreeMap`][btree-map] and [`BTreeSet`][btree-set]. |
+| Direct indexing | `VecOption` and `VecBool` are benchmark wrappers around [`Vec<Option<u64>>`][vec] and [`Vec<bool>`][vec], respectively. They allocate one slot per index through the highest key and run only where that fits the harness's size limit. |
+| Rust priority queue | [`priority_queue::PriorityQueue`][rust-pq] (2.7.0), an indexed heap, and [`BinaryHeap`][binary-heap], a standard-library heap with push and pop. |
+| Sequences | Rust's [`Vec`][vec] and [`VecDeque`][vec-deque]. |
+| Generational ids | [`SlotMap`][slot-map] and [`DenseSlotMap`][dense-slot-map] (1.1.1), [`slab::Slab`][slab] (0.4.12), and [`thunderdome::Arena`][arena] (0.6.1). `IdAllocatorIdMap` is this package's [`IdAllocator`][ids] paired with a [`PagedSparseMap<Id, u64>`][sparse-map]. A slab uses reusable integer keys. |
+| Python FIFO | CPython's [`collections.deque`][py-deque] and [`queue.SimpleQueue`][py-simple-queue]. |
+| Python priority queues | CPython's [`heapq`][py-heapq] on `(priority, key)` tuples, with a dictionary for lazy invalidation in the update workload or a [`threading.Lock`][py-lock] for the multi-worker workload. |
 
 ## Keyed Collections
 
-Findings:
+These tables compare [sparse maps][sparse-map], [sparse sets][sparse-set],
+and [direct maps][direct-map] with the linked [baseline implementations](#comparison-implementations).
+`PagedDirectMapFlat` and `PagedDirectMapRadix` use the same map with different
+[page directories](paging.md#directories).
 
-- **Misses** with the `Flat` directory cost 1 to 4 ns on every pattern: an
-  unallocated page answers without touching a slot. Hash misses cost 4 to
-  13 ns, B-tree misses 24 to 80 ns.
-- **Iteration** over the sparse set and map reads only the dense array and
-  is 4 to 13 times faster than `HashMap`. The direct map scans whole pages,
-  so it is slow when pages are sparsely filled (clustered and uniform keys).
-- **Dense keys**: inserts are 4 to 19 times faster than `HashMap`. Direct-map
-  hits are 2 to 2.6 times faster; sparse-map hits range from 1.2 times faster
-  (10⁵) to 1.1 times slower (10⁷). A plain `Vec` indexed by key is faster
-  still, but needs memory up to the largest key.
-- **Uniform keys** are the worst case: each insert allocates and zeroes a
-  page (3 to 11 µs per key). Use a hash map.
-- **Radix** matches Flat on dense keys and is 3 to 4 times slower on
-  clustered hits; use it only for keys beyond the `u32` range.
+| Workload | Timed work |
+|---|---|
+| Insert | Build from `n` keys in pattern order, including allocation. |
+| Hit | Look up each present key once in shuffled order. |
+| Miss | Look up `n` absent keys from a disjoint part of the same pattern. |
+| Iterate | Traverse the entries and fold them into a checksum. |
+| Remove | Remove all keys from a prebuilt container in shuffled order. |
+
+**Dense** keys are `0..n`. **Clustered** keys form runs of 64 consecutive
+integers with run starts spread across the `u32` range. **Uniform** keys come
+from a pseudo-random permutation of `u32`. The harness skips the 10⁷-key
+uniform cases because of the cost of allocating and initializing many pages.
+
+For 10⁵ dense keys, the flat direct map took 4.25 ns/hit against 10.9 for
+`hashbrown`, and the sparse map iterated at 0.265 ns/entry against 1.84.
+For 10⁵ uniform keys, `hashbrown` inserted at 33.1 ns/key in the sparse-map
+comparison, against 3,345 for the sparse map. Use the key pattern closest to
+your workload when reading the tables.
 
 ### Sparse Map (`u32 -> u64`)
 
-**dense**, ns per key
+<details class="pc-bench-results" open>
+<summary>Dense keys (ns/key)</summary>
 
-| n, op | PagedSparseMap | HashMap | BTreeMap | VecOption |
+| n, op | PagedSparseMap | [`HashMap`][hash-map] | [`BTreeMap`][btree-map] | [`VecOption`](#comparison-implementations) |
 |---|---:|---:|---:|---:|
 | 10³ insert | 6.44 | 24.1 | 75.2 | **4.7** |
 | 10³ hit | 2.8 | 5.26 | 45.6 | **1.15** |
@@ -107,9 +84,12 @@ Findings:
 | 10⁷ iterate | **0.907** | 3.86 | 8.87 | 2.27 |
 | 10⁷ remove | 194 | 141 | 543 | **107** |
 
-**clustered**, ns per key
+</details>
 
-| n, op | PagedSparseMap | HashMap | BTreeMap | VecOption |
+<details class="pc-bench-results">
+<summary>Clustered keys (ns/key)</summary>
+
+| n, op | PagedSparseMap | [`HashMap`][hash-map] | [`BTreeMap`][btree-map] | [`VecOption`](#comparison-implementations) |
 |---|---:|---:|---:|---:|
 | 10³ insert | 41.1 | **25.8** | 75.6 | 57.4 |
 | 10³ hit | 2.94 | 5.23 | 49.6 | **1.15** |
@@ -127,9 +107,12 @@ Findings:
 | 10⁷ iterate | **0.894** | 3.9 | 9.91 | – |
 | 10⁷ remove | 307 | **129** | 573 | – |
 
-**uniform**, ns per key
+</details>
 
-| n, op | PagedSparseMap | HashMap | BTreeMap | VecOption |
+<details class="pc-bench-results">
+<summary>Uniform keys (ns/key)</summary>
+
+| n, op | PagedSparseMap | [`HashMap`][hash-map] | [`BTreeMap`][btree-map] | [`VecOption`](#comparison-implementations) |
 |---|---:|---:|---:|---:|
 | 10³ insert | 825 | **26.8** | 83.6 | – |
 | 10³ hit | 5.4 | **5.24** | 46.9 | – |
@@ -142,11 +125,14 @@ Findings:
 | 10⁵ iterate | **0.265** | 1.84 | 3.68 | – |
 | 10⁵ remove | 813 | **22.6** | 172 | – |
 
+</details>
+
 ### Sparse Set (`u32`)
 
-**dense**, ns per key
+<details class="pc-bench-results" open>
+<summary>Dense keys (ns/key)</summary>
 
-| n, op | PagedSparseSet | HashSet | BTreeSet | VecBool |
+| n, op | PagedSparseSet | [`HashSet`][hash-set] | [`BTreeSet`][btree-set] | [`VecBool`](#comparison-implementations) |
 |---|---:|---:|---:|---:|
 | 10³ insert | 6.2 | 21.9 | 63.9 | **3.47** |
 | 10³ hit | 2.69 | 4.82 | 48.7 | **0.967** |
@@ -164,9 +150,12 @@ Findings:
 | 10⁷ iterate | **0.341** | 1.93 | 4.91 | 0.565 |
 | 10⁷ remove | 128 | 113 | 433 | **21.5** |
 
-**clustered**, ns per key
+</details>
 
-| n, op | PagedSparseSet | HashSet | BTreeSet | VecBool |
+<details class="pc-bench-results">
+<summary>Clustered keys (ns/key)</summary>
+
+| n, op | PagedSparseSet | [`HashSet`][hash-set] | [`BTreeSet`][btree-set] | [`VecBool`](#comparison-implementations) |
 |---|---:|---:|---:|---:|
 | 10³ insert | 41.5 | **23.8** | 64.1 | 1,557 |
 | 10³ hit | 2.74 | 4.83 | 48.6 | **0.952** |
@@ -184,9 +173,12 @@ Findings:
 | 10⁷ iterate | **0.343** | 2.3 | 9.31 | – |
 | 10⁷ remove | 238 | **109** | 437 | – |
 
-**uniform**, ns per key
+</details>
 
-| n, op | PagedSparseSet | HashSet | BTreeSet | VecBool |
+<details class="pc-bench-results">
+<summary>Uniform keys (ns/key)</summary>
+
+| n, op | PagedSparseSet | [`HashSet`][hash-set] | [`BTreeSet`][btree-set] | [`VecBool`](#comparison-implementations) |
 |---|---:|---:|---:|---:|
 | 10³ insert | 837 | **24.4** | 69.9 | – |
 | 10³ hit | **4.49** | 4.81 | 48.9 | – |
@@ -199,11 +191,14 @@ Findings:
 | 10⁵ iterate | **0.21** | 1.77 | 3.63 | – |
 | 10⁵ remove | 797 | **22.4** | 151 | – |
 
+</details>
+
 ### Direct Map (`u32 -> u64`)
 
-**dense**, ns per key
+<details class="pc-bench-results" open>
+<summary>Dense keys (ns/key)</summary>
 
-| n, op | PagedDirectMapFlat | PagedDirectMapRadix | HashMap | BTreeMap | VecOption |
+| n, op | PagedDirectMapFlat | PagedDirectMapRadix | [`HashMap`][hash-map] | [`BTreeMap`][btree-map] | [`VecOption`](#comparison-implementations) |
 |---|---:|---:|---:|---:|---:|
 | 10³ insert | 4.69 | 7.3 | 24.7 | 80.1 | **4.62** |
 | 10³ hit | 2.37 | 2.38 | 5 | 45.1 | **1.15** |
@@ -221,9 +216,12 @@ Findings:
 | 10⁷ iterate | 2.56 | 2.82 | 3.83 | 9.54 | **2.26** |
 | 10⁷ remove | **29.3** | 30.4 | 140 | 539 | 106 |
 
-**clustered**, ns per key
+</details>
 
-| n, op | PagedDirectMapFlat | PagedDirectMapRadix | HashMap | BTreeMap | VecOption |
+<details class="pc-bench-results">
+<summary>Clustered keys (ns/key)</summary>
+
+| n, op | PagedDirectMapFlat | PagedDirectMapRadix | [`HashMap`][hash-map] | [`BTreeMap`][btree-map] | [`VecOption`](#comparison-implementations) |
 |---|---:|---:|---:|---:|---:|
 | 10³ insert | 50.8 | 38.5 | **26.4** | 81.3 | 56.4 |
 | 10³ hit | 2.49 | 17 | 4.91 | 45.1 | **1.15** |
@@ -241,9 +239,12 @@ Findings:
 | 10⁷ iterate | 33.2 | 47.4 | **3.91** | 10.3 | – |
 | 10⁷ remove | 177 | 196 | **125** | 569 | – |
 
-**uniform**, ns per key
+</details>
 
-| n, op | PagedDirectMapFlat | PagedDirectMapRadix | HashMap | BTreeMap | VecOption |
+<details class="pc-bench-results">
+<summary>Uniform keys (ns/key)</summary>
+
+| n, op | PagedDirectMapFlat | PagedDirectMapRadix | [`HashMap`][hash-map] | [`BTreeMap`][btree-map] | [`VecOption`](#comparison-implementations) |
 |---|---:|---:|---:|---:|---:|
 | 10³ insert | 8,687 | 6,401 | **27** | 85.3 | – |
 | 10³ hit | **4.61** | 21 | 5.16 | 47 | – |
@@ -256,13 +257,17 @@ Findings:
 | 10⁵ iterate | 2,093 | 3,001 | **1.79** | 3.67 | – |
 | 10⁵ remove | 1,484 | 1,062 | **22.6** | 173 | – |
 
+</details>
+
 ### Ordered Queries
 
-Dense keys, 1,000 queries per measurement; time per query. `next` finds the
-first entry at or after a random key; `range_1000` visits the 1,000 entries
-of a key range.
+The input is dense. Each measurement issues 1,000 queries from shuffled
+starting keys and reports **ns/query**. `next` finds the first entry at or
+after the starting key, using `BTreeMap::range(k..).next()` for the
+baseline. `range_1000` visits entries within a 1,000-key window. Windows
+near the end of the input can contain fewer entries.
 
-| n, query | PagedDirectMapFlat | PagedDirectMapRadix | BTreeMap |
+| n, query | PagedDirectMapFlat | PagedDirectMapRadix | [`BTreeMap`][btree-map] |
 |---|---:|---:|---:|
 | 10³ next | **18.7** | 39.5 | 52.2 |
 | 10⁵ next | **20.2** | 42.4 | 129 |
@@ -271,73 +276,99 @@ of a key range.
 | 10⁵ range_1000 | 7,930 | 5,799 | **2,989** |
 | 10⁷ range_1000 | 8,012 | 5,863 | **3,252** |
 
-With `Flat`, `next_occupant` is 2.8 times faster than
-`BTreeMap::range(k..).next()` at 10³ keys and 6 to 12 times faster at 10⁵ and
-10⁷; with `Radix`, 1.3 to 6 times faster.
-Scanning a range is 2 to 2.7 times slower than a B-tree range, because the
-direct map checks every slot for occupancy.
+At 10⁵ keys, a flat direct-map `next` query took 20.2 ns versus 129 ns
+for the B-tree. At the same size, scanning the window took 7,930 ns
+for the flat direct map and 2,989 ns for the B-tree.
 
 ## Memory
 
-Bytes requested from the allocator after building, divided by the number of
-keys.
+Tables report **bytes/key** after building the container: live allocator
+bytes above the pre-build baseline divided by `n`. Input key arrays are
+allocated before that baseline. RSS, allocator bookkeeping and temporary
+peak allocations are outside this metric.
 
-| pattern, n | PagedSparseMap | HashMap | BTreeMap | PagedSparseSet | HashSet | BTreeSet | VecOption | VecBool |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| dense 10³ | 16.4 | 34.8 | 26.4 | 8.22 | 10.3 | 11.7 | 16 | **1** |
-| dense 10⁵ | 19.8 | 22.3 | 26.3 | 9.27 | 6.55 | 11.6 | 16 | **1** |
-| dense 10⁷ | 24.1 | 28.5 | 26.3 | 10.7 | 8.39 | 11.6 | 16 | **1** |
-| clustered 10³ | 343 | 34.8 | 26.4 | 335 | **10.3** | 11.7 | 506,344 | 31,647 |
-| clustered 10⁵ | 419 | 22.3 | 25.8 | 409 | **6.55** | 11.3 | – | – |
-| clustered 10⁷ | 87.5 | 28.5 | 25.8 | 74.1 | **8.39** | 11.3 | – | – |
-| uniform 10³ | 6,279 | 34.8 | 24.3 | 6,271 | **10.3** | 10.7 | – | – |
-| uniform 10⁵ | 4,459 | 22.3 | 19.7 | 4,449 | **6.55** | 8.53 | – | – |
+### Sparse Map
 
-| pattern, n | PagedDirectMapFlat | PagedDirectMapRadix | HashMap | BTreeMap | VecOption |
+| pattern, n | PagedSparseMap | [`HashMap`][hash-map] | [`BTreeMap`][btree-map] | [`VecOption`](#comparison-implementations) |
+| --- | ---: | ---: | ---: | ---: |
+| dense 10³ | 16.4 | 34.8 | 26.4 | 16 |
+| dense 10⁵ | 19.8 | 22.3 | 26.3 | 16 |
+| dense 10⁷ | 24.1 | 28.5 | 26.3 | 16 |
+| clustered 10³ | 343 | 34.8 | 26.4 | 506,344 |
+| clustered 10⁵ | 419 | 22.3 | 25.8 | – |
+| clustered 10⁷ | 87.5 | 28.5 | 25.8 | – |
+| uniform 10³ | 6,279 | 34.8 | 24.3 | – |
+| uniform 10⁵ | 4,459 | 22.3 | 19.7 | – |
+
+### Sparse Set
+
+| pattern, n | PagedSparseSet | [`HashSet`][hash-set] | [`BTreeSet`][btree-set] | [`VecBool`](#comparison-implementations) |
+| --- | ---: | ---: | ---: | ---: |
+| dense 10³ | 8.22 | 10.3 | 11.7 | 1 |
+| dense 10⁵ | 9.27 | 6.55 | 11.6 | 1 |
+| dense 10⁷ | 10.7 | 8.39 | 11.6 | 1 |
+| clustered 10³ | 335 | 10.3 | 11.7 | 31,647 |
+| clustered 10⁵ | 409 | 6.55 | 11.3 | – |
+| clustered 10⁷ | 74.1 | 8.39 | 11.3 | – |
+| uniform 10³ | 6,271 | 10.3 | 10.7 | – |
+| uniform 10⁵ | 4,449 | 6.55 | 8.53 | – |
+
+### Direct Map
+
+| pattern, n | PagedDirectMapFlat | PagedDirectMapRadix | [`HashMap`][hash-map] | [`BTreeMap`][btree-map] | [`VecOption`](#comparison-implementations) |
 |---|---:|---:|---:|---:|---:|
-| dense 10³ | 16.4 | 16.4 | 34.8 | 26.4 | **16** |
-| dense 10⁵ | 16.1 | 16.1 | 22.3 | 26.3 | **16** |
-| dense 10⁷ | 16 | 16 | 28.5 | 26.3 | **16** |
-| clustered 10³ | 527 | 263 | 34.8 | **26.4** | 506,344 |
-| clustered 10⁵ | 596 | 257 | **22.3** | 25.8 | – |
-| clustered 10⁷ | 259 | 260 | 28.5 | **25.8** | – |
-| uniform 10³ | 18,555 | 16,435 | 34.8 | **24.3** | – |
-| uniform 10⁵ | 16,731 | 16,639 | 22.3 | **19.7** | – |
+| dense 10³ | 16.4 | 16.4 | 34.8 | 26.4 | 16 |
+| dense 10⁵ | 16.1 | 16.1 | 22.3 | 26.3 | 16 |
+| dense 10⁷ | 16 | 16 | 28.5 | 26.3 | 16 |
+| clustered 10³ | 527 | 263 | 34.8 | 26.4 | 506,344 |
+| clustered 10⁵ | 596 | 257 | 22.3 | 25.8 | – |
+| clustered 10⁷ | 259 | 260 | 28.5 | 25.8 | – |
+| uniform 10³ | 18,555 | 16,435 | 34.8 | 24.3 | – |
+| uniform 10⁵ | 16,731 | 16,639 | 22.3 | 19.7 | – |
 
-A sparse page costs 4 bytes per slot and a direct-map page 16 bytes per slot
-(`u32 -> u64`), whether or not the slot is used. Clustered runs of 64 keys
-fill 6% of a 1024-slot page; uniform keys fill one slot per page.
+In this run a sparse index page used 4 bytes per slot and a direct-map page
+used 16 bytes per slot (`u32 -> u64`). A single 64-key run fills 6% of a
+1,024-slot page. Widely scattered keys leave many pages with just a few live
+slots. The directory and any dense arrays also contribute to the total.
 
 ### Removal and Shrinking
 
-90% of the keys removed at random, then `shrink_to_fit`, in MB:
+The harness builds each container, randomly removes 90% of its entries, then
+calls `shrink_to_fit` where available. The three columns show live allocations
+in **MB** at those checkpoints. `BTreeMap` frees nodes during removal.
+The Hive row also includes the benchmark's vector of ids kept for removal.
 
 | Container | Pattern | n | Built | After removal | After shrink |
 |---|---|---:|---:|---:|---:|
 | PagedSparseMap | uniform | 10⁵ | 445.9 | 445.9 | 443.3 |
 | PagedDirectMapFlat | uniform | 10⁵ | 1,673.1 | 1,673.1 | 197.4 |
 | PagedDirectMapRadix | uniform | 10⁵ | 1,663.9 | 1,663.9 | 170.1 |
-| HashMap | uniform | 10⁵ | 2.2 | 2.2 | 0.3 |
-| BTreeMap | uniform | 10⁵ | 2.0 | 0.2 | 0.2 |
+| [`HashMap`][hash-map] | uniform | 10⁵ | 2.2 | 2.2 | 0.3 |
+| [`BTreeMap`][btree-map] | uniform | 10⁵ | 2.0 | 0.2 | 0.2 |
 | PagedSparseMap | dense | 10⁷ | 241.5 | 241.5 | 52.1 |
 | PagedDirectMapFlat | dense | 10⁷ | 160.1 | 160.1 | 160.1 |
 | PagedDirectMapRadix | dense | 10⁷ | 160.1 | 160.1 | 160.1 |
-| HashMap | dense | 10⁷ | 285.2 | 285.2 | 35.7 |
-| BTreeMap | dense | 10⁷ | 262.9 | 22.7 | 22.7 |
+| [`HashMap`][hash-map] | dense | 10⁷ | 285.2 | 285.2 | 35.7 |
+| [`BTreeMap`][btree-map] | dense | 10⁷ | 262.9 | 22.7 | 22.7 |
 | PagedSparseMap | clustered | 10⁷ | 875.3 | 875.3 | 685.6 |
 | PagedDirectMapFlat | clustered | 10⁷ | 2,594.0 | 2,594.0 | 2,590.6 |
 | PagedDirectMapRadix | clustered | 10⁷ | 2,603.6 | 2,603.6 | 2,592.8 |
-| HashMap | clustered | 10⁷ | 285.2 | 285.2 | 35.7 |
-| BTreeMap | clustered | 10⁷ | 257.7 | 22.7 | 22.7 |
+| [`HashMap`][hash-map] | clustered | 10⁷ | 285.2 | 285.2 | 35.7 |
+| [`BTreeMap`][btree-map] | clustered | 10⁷ | 257.7 | 22.7 | 22.7 |
 | Hive | sequential | 10⁷ | 240.7 | 240.8 | 240.5 |
 
-Random removal leaves nearly every page partly occupied, so `shrink_to_fit`
-frees few pages. The sparse map shrinks its dense arrays; the direct map
-frees only empty pages.
+For uniform keys at 10⁵ entries, the flat direct map dropped from
+1,673.1 MB to 197.4 MB after shrinking. For dense 10⁷ keys, almost every
+page still contained survivors, and memory held at 160.1 MB. The sparse map
+can shrink its dense arrays even when index pages remain allocated.
 
 ## Page Size
 
-`page_sweep`, n = 10⁵, ns per key and bytes per key.
+The sweep changes the number of slots per page with `Flat` at 10⁵ keys.
+Timing is the median of seven samples divided by `n`. Bytes/key uses the
+live size after construction, also divided by `n`.
+
+### Sparse Map
 
 | Pattern | Measure | PAGE=64 | PAGE=256 | PAGE=1024 | PAGE=4096 | PAGE=16384 |
 |---|---|---:|---:|---:|---:|---:|
@@ -353,6 +384,8 @@ frees only empty pages.
 | uniform | hit ns/key | 27.5 | 28.9 | 28 | 25.6 | 24 |
 | uniform | iterate ns/key | 0.267 | 0.267 | 0.266 | 0.267 | 0.267 |
 | uniform | bytes/key | 5,810 | 2,425 | 4,459 | 16,488 | 42,988 |
+
+### Direct Map
 
 | Pattern | Measure | PAGE=64 | PAGE=256 | PAGE=1024 | PAGE=4096 | PAGE=16384 |
 |---|---|---:|---:|---:|---:|---:|
@@ -377,9 +410,17 @@ best across patterns. On dense keys the page size barely matters.
 
 ## Priority Queue
 
-ns per element
+The [Rust paged priority queue][paged-pq] and [the `priority-queue` crate][rust-pq]
+both support priority changes by key. [`BinaryHeap`][binary-heap] runs only
+the push and pop cases. Each value is **ns per input element**.
 
-| n, op | PagedPriorityQueue | PriorityQueue | BinaryHeap |
+| Workload | Timed work |
+|---|---|
+| `push` | Build by pushing `n` entries into an empty heap. |
+| `change_priority` | Change `n/2` priorities in a prebuilt heap. The table divides by `n`; multiply by two for ns per update. |
+| `pop_all` | Drain a prebuilt heap in priority order, stopping at empty. |
+
+| n, op | PagedPriorityQueue | [`priority-queue`][rust-pq] | [`BinaryHeap`][binary-heap] |
 |---|---:|---:|---:|
 | 10³ push | 18.1 | 64 | **7.74** |
 | 10⁵ push | 17.8 | 111 | **9.72** |
@@ -391,16 +432,20 @@ ns per element
 | 10⁵ pop_all | 161 | 319 | **155** |
 | 10⁷ pop_all | 632 | 2,329 | **564** |
 
-At 10⁵ and 10⁷, push and pop take 1.0 to 1.8 times as long as with
-`BinaryHeap`, which has no index. Against the indexed `priority-queue` crate,
-push is 6 to 13 times faster and
-`change_priority` (n/2 changes, time divided by n) 3.8 to 4.6 times faster.
+At 10⁵ entries, the paged heap took 17.8 ns/element to push versus
+111 for the indexed crate and 9.72 for `BinaryHeap`. Its priority changes
+took 18.4 ns per input element versus 85.4 for the indexed crate.
 
 ## Paged Vector and Deque
 
-ns per element
+Timings are **ns per input element**. The vector's `random_get` and the
+deque's `random_index` each look up `n` shuffled positions. One
+`queue_churn` step is a front pop followed by a back push, repeated `n`
+times on a full deque.
 
-| n, op | PagedVec | Vec |
+### Vector
+
+| n, op | PagedVec | [`Vec`][vec] |
 |---|---:|---:|
 | 10³ push | 2.85 | **2.29** |
 | 10⁵ push | 2.95 | **1.68** |
@@ -415,9 +460,9 @@ ns per element
 | 10⁵ sum | 0.512 | **0.266** |
 | 10⁷ sum | 1.05 | **0.9** |
 
-ns per element
+### Deque
 
-| n, op | PagedDeque | VecDeque |
+| n, op | PagedDeque | [`VecDeque`][vec-deque] |
 |---|---:|---:|
 | 10³ push_front | 4.96 | **3.84** |
 | 10⁵ push_front | 5.62 | **3.34** |
@@ -435,12 +480,13 @@ every element; at small sizes `VecDeque` is faster.
 
 ## Generational Ids
 
-`insert` builds n entries; `get` looks up all ids in random order;
-`remove_half_reinsert` removes half and inserts as many again.
+Timings are **ns per input element**. `insert` builds `n` entries, `get`
+looks up all ids in shuffled order, and `iterate` visits the live entries.
+`remove_half_reinsert` removes half the original entries and inserts as many
+again. See the [baseline descriptions](#comparison-implementations) for the
+different handle types.
 
-ns per element
-
-| n, op | Hive | IdAllocatorIdMap | SlotMap | DenseSlotMap | Slab | Arena |
+| n, op | Hive | IdAllocatorIdMap | [`SlotMap`][slot-map] | [`DenseSlotMap`][dense-slot-map] | [`Slab`][slab] | [`Arena`][arena] |
 |---|---:|---:|---:|---:|---:|---:|
 | 10³ insert | 9.3 | 19.3 | 7.73 | 12.9 | 7.76 | **6.37** |
 | 10⁵ insert | 15.6 | 18.1 | 8.27 | 12.3 | 7.97 | **7.93** |
@@ -464,11 +510,17 @@ so removal can move the last value; its cost is the extra index lookup.
 
 ### Rust
 
-`concurrent_scaling 2000000 7`: a random permutation of 2·10⁶ keys split
-into T chunks, one thread per chunk; median of 7 runs, throughput in
-millions of operations per second.
+The [Rust scaling harness][rust-scaling] uses 2 million shuffled keys as
+work items and splits them across workers. The table divides the count of
+work items by the median of seven wall times. One item is one key or id
+processed, or one increment in the shared-counter reference. Churn counts
+insertions or allocations, with removal or freeing included in the timer.
+A batch call counts each key it processes.
 
-| Workload | T=1 (M/s) | T=2 | T=4 | T=8 | speedup T=4 |
+**Throughput in millions of work items/s.** Each workload uses its own
+one-thread run as the speedup baseline.
+
+| Workload | 1 thread | 2 threads | 4 threads | 8 threads | 4-thread speedup |
 |---|---:|---:|---:|---:|---:|
 | sparse try_insert (fresh) | 9.4 | 4.4 | 3.5 | 3.3 | 0.38x |
 | sparse try_insert_many (fresh) | 19.1 | 37.3 | 72.7 | 119.2 | 3.81x |
@@ -493,12 +545,13 @@ single shared `fetch_add` counter, as a reference for cache-line contention.
 
 ### Python
 
-`benchmarks/python/concurrent_scaling.py --threads 1 2 4 8 --repeat 7`,
-2·10⁶ keys, typed `float64` maps, batch methods (which release the GIL).
-Throughput in millions of keys per second, including NumPy input and output
-copies.
+The [Python scaling harness][py-scaling] splits 2 million shuffled keys
+among workers using typed `float64` maps and batch calls. The median of
+seven elapsed wall times includes dispatch, NumPy copies and creation of
+the returned arrays. Speedup compares the same map and operation against
+one worker on the same Python build.
 
-Free-threaded CPython 3.14.10 (GIL disabled):
+#### Free-threaded CPython 3.14.10 (GIL disabled)
 
 | Class | Operation | Threads | Median (s) | Throughput (M keys/s) | Speedup |
 |---|---|---:|---:|---:|---:|
@@ -519,7 +572,7 @@ Free-threaded CPython 3.14.10 (GIL disabled):
 | ConcurrentSparseMapF64 | insert_many | 4 | 0.034273 | 58.36 | 4.03x |
 | ConcurrentSparseMapF64 | insert_many | 8 | 0.021569 | 92.73 | 6.41x |
 
-CPython 3.12.16 (GIL enabled):
+#### CPython 3.12.16 (GIL enabled)
 
 | Class | Operation | Threads | Median (s) | Throughput (M keys/s) | Speedup |
 |---|---|---:|---:|---:|---:|
@@ -545,17 +598,21 @@ Rust; the free-threaded build also runs the Python-side dispatch in parallel.
 
 ## Python Queues
 
-`benchmarks/python/queues.py --n 1000000 --threads 1 2 4 8 --repeat 5`,
-commit `0989af0`, pinned to 32 hardware threads (`taskset -c 64-95`).
-Medians in millions of items per second; higher is better. Python 3.12.16
-(GIL) and free-threaded 3.14.10 (no GIL). Run the script for the full table,
-including 1 and 2 thread pairs.
+The [queue harness][py-queues] uses 1 million input items and reports
+throughput from the median of five wall times. `3.12` is CPython 3.12.16
+with the GIL enabled. `3.14t` is CPython 3.14.10 with the GIL disabled.
+Throughput units differ across workloads.
 
-FIFO: push then pop every item. Multi-threaded rows use T producers and T
-consumers; `SimpleQueue` consumers block in `get()`, the others retry on
-empty. "batch" uses `push_many` / `pop_many` with 1024 items.
+### FIFO
 
-| Case | Python | `deque` | `SimpleQueue` | `ConcurrentQueue` | `ConcurrentQueue` batch |
+**Millions of items/s.** Each item counts once for a push followed by a
+pop. The single-thread case fills the queue then drains it. Multi-thread
+cases use equal numbers of producers and consumers working concurrently.
+`SimpleQueue` consumers block in `get()`. The other consumers retry an
+empty queue. The batch column uses `push_many` and `pop_many` in batches of
+up to 1,024 items.
+
+| Case | Python | [`deque`][py-deque] | [`SimpleQueue`][py-simple-queue] | `ConcurrentQueue` | `ConcurrentQueue` batch |
 |---|---|---:|---:|---:|---:|
 | 1 thread | 3.12 | **16.29** | 12.24 | 6.05 | 12.64 |
 | 1 thread | 3.14t | 8.90 | 7.30 | 5.20 | **11.75** |
@@ -564,32 +621,118 @@ empty. "batch" uses `push_many` / `pop_many` with 1024 items.
 | 8 + 8 threads | 3.12 | 3.89 | 4.55 | 2.19 | **6.08** |
 | 8 + 8 threads | 3.14t | 0.42 | 0.71 | 1.75 | **5.62** |
 
-Priority queues: `n` distinct keys with random `float` priorities, min
-order. **push+pop** pushes all then pops all. **update** also re-prioritises
-`n/2` random keys before popping; `heapq` skips stale entries (lazy
-invalidation), the paged queues update in place. **T threads** push their own
-keys, then all pop until empty; `heapq` runs under a `threading.Lock`.
-Throughput counts pushes, updates and pops.
+At 8 producers and 8 consumers on free-threaded CPython, the per-item
+`ConcurrentQueue` path processed 1.75 M items/s and the batch path processed
+5.62 M items/s. For single-threaded scalar calls, `deque` led on both builds.
 
-| Case | Python | `heapq` | `PriorityQueueF64` | `ConcurrentPriorityQueueF64.pop` | `.pop_exact` |
-|---|---|---:|---:|---:|---:|
-| push+pop | 3.12 | 0.21 | **0.70** | 0.64 | 0.22 |
-| push+pop | 3.14t | 0.23 | **0.89** | 0.83 | 0.24 |
-| update | 3.12 | 0.16 | **1.01** | 0.92 | |
-| update | 3.14t | 0.17 | **1.13** | 1.01 | |
-| 1 thread | 3.14t | 0.40 | | **1.50** | |
-| 4 threads | 3.14t | 0.17 | | **4.19** | |
-| 8 threads | 3.12 | 0.13 | | **0.89** | |
-| 8 threads | 3.14t | 0.15 | | **5.34** | |
+### Priority Queues
 
-- Single calls cross the Python–Rust boundary once per item, so
-  `ConcurrentQueue.push`/`pop` alone are slower than `deque` on one thread;
-  batches close the gap and lead once threads contend.
-- `deque` and `SimpleQueue` slow down sharply on 3.14t at 8 + 8 threads;
-  `ConcurrentQueue` keeps its throughput.
-- `heapq` compares `(priority, key)` tuples through generic object
-  comparison and touches scattered objects; the paged queues keep keys and
-  priorities in flat arrays.
-- `pop` is relaxed: it takes the best of up to two sampled shard tops, not
-  always the global best. `pop_exact` locks every shard and costs about as
-  much as `heapq`.
+All runs use distinct integer keys with random float priorities in min-queue
+mode. [`PriorityQueueF64`][paged-pq] and
+[`ConcurrentPriorityQueueF64`][concurrent-pq] update existing keys in place.
+The concurrent queue's `pop` uses relaxed ordering. Use the `pop_exact`
+column when comparing global-priority removal with `heapq` in the
+single-thread push-and-drain workload.
+
+#### Push and Drain
+
+**Millions of items/s.** A single thread pushes all items, then drains the
+queue. Each item counts once across both phases.
+
+| Python | [`heapq`][py-heapq] | `PriorityQueueF64` | Concurrent `pop` | Concurrent `pop_exact` |
+| --- | ---: | ---: | ---: | ---: |
+| 3.12 | 0.21 | 0.70 | 0.64 | 0.22 |
+| 3.14t | 0.23 | 0.89 | 0.83 | 0.24 |
+
+#### Update Existing Priorities
+
+**Millions of writes/s.** The numerator counts the initial `n` pushes and
+`n/2` priority changes. Elapsed time also includes draining the queue.
+`heapq` pushes a new tuple for each change and skips stale tuples during
+the drain using a dictionary of current priorities.
+
+| Python | [`heapq`][py-heapq] + lazy invalidation | `PriorityQueueF64` | Concurrent `pop` |
+| --- | ---: | ---: | ---: |
+| 3.12 | 0.16 | 1.01 | 0.92 |
+| 3.14t | 0.17 | 1.13 | 1.01 |
+
+#### Shared Queue Across Workers
+
+**Millions of calls/s.** Workers each push their share of the keys and wait
+at a barrier before draining the shared queue. Each successful push and
+pop counts separately. The lock-based `heapq` baseline uses one shared
+[`threading.Lock`][py-lock]. The paged queue uses relaxed `pop`. The
+one-worker row here uses the same lock-based harness and units as the
+multi-worker rows.
+
+| Workers | Python | [`heapq`][py-heapq] + lock | Concurrent `pop` |
+|---:|---|---:|---:|
+| 1 | 3.14t | 0.40 | 1.50 |
+| 4 | 3.14t | 0.17 | 4.19 |
+| 8 | 3.12 | 0.13 | 0.89 |
+| 8 | 3.14t | 0.15 | 5.34 |
+
+## Setup and Reproduction
+
+| Item | Configuration |
+|---|---|
+| Machine | 4 × Intel Xeon E7-8860 v4 at 2.20 GHz (72 cores, 144 hardware threads), 503 GB RAM, Linux 5.15, glibc 2.35 |
+| Rust results | [`b814a0e`][rust-revision], rustc 1.100.0, release mode, no `target-cpu` flags |
+| Rust timing | [Criterion 0.5.1][criterion] medians from one run. The largest cases use 10 samples and a 3-second measurement target. Different groups ran on separate physical cores. The scaling run used eight physical cores on one NUMA node and ran alone. |
+| Load | Other users idle (load average 0.0 at the start) |
+| Python queue results | Package built from [`0989af0`][py-revision]. The later commit [`267f4c3`][py-queues] contains the benchmark script. Runs were pinned to 32 hardware threads with `taskset -c 64-95`. |
+
+From the [repository][repo], run the [Rust harness][rust-harness] with the
+source revision above to reproduce the Rust setup:
+
+```sh
+cargo bench -p paged-collections-bench --bench sparse
+cargo run --release -p paged-collections-bench --bin memory
+cargo run --release -p paged-collections-bench --bin churn
+cargo run --release -p paged-collections-bench --bin page_sweep
+cargo run --release -p paged-collections-bench --bin concurrent_scaling -- 2000000 7
+```
+
+The other Criterion groups are `direct`, `ids`, `seq` and `pq`. The largest
+cases can require tens of GiB. To select a smaller case, pass a Criterion
+filter, for example `-- /1000/`.
+
+Run the Python scripts from the repository root with a release build of
+`paged-collections` installed in the chosen Python environment:
+
+```sh
+python benchmarks/python/concurrent_scaling.py --n 2000000 --threads 1 2 4 8 --repeat 7
+python benchmarks/python/queues.py --n 1000000 --threads 1 2 4 8 --repeat 5
+```
+
+[hash-map]: https://docs.rs/hashbrown/0.17.1/hashbrown/struct.HashMap.html
+[hash-set]: https://docs.rs/hashbrown/0.17.1/hashbrown/struct.HashSet.html
+[fx-hasher]: https://docs.rs/rustc-hash/2.1.3/rustc_hash/struct.FxHasher.html
+[btree-map]: https://doc.rust-lang.org/std/collections/struct.BTreeMap.html
+[btree-set]: https://doc.rust-lang.org/std/collections/struct.BTreeSet.html
+[vec]: https://doc.rust-lang.org/std/vec/struct.Vec.html
+[vec-deque]: https://doc.rust-lang.org/std/collections/struct.VecDeque.html
+[binary-heap]: https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html
+[rust-pq]: https://docs.rs/priority-queue/2.7.0/priority_queue/priority_queue/struct.PriorityQueue.html
+[slot-map]: https://docs.rs/slotmap/1.1.1/slotmap/struct.SlotMap.html
+[dense-slot-map]: https://docs.rs/slotmap/1.1.1/slotmap/struct.DenseSlotMap.html
+[slab]: https://docs.rs/slab/0.4.12/slab/struct.Slab.html
+[arena]: https://docs.rs/thunderdome/0.6.1/thunderdome/struct.Arena.html
+[py-deque]: https://docs.python.org/3/library/collections.html#collections.deque
+[py-simple-queue]: https://docs.python.org/3/library/queue.html#queue.SimpleQueue
+[py-heapq]: https://docs.python.org/3/library/heapq.html
+[py-lock]: https://docs.python.org/3/library/threading.html#threading.Lock
+[criterion]: https://docs.rs/criterion/0.5.1/criterion/
+[ids]: ids.md
+[sparse-map]: sparse-map.md
+[sparse-set]: sparse-set.md
+[direct-map]: direct-map.md
+[paged-pq]: priority-queue.md
+[concurrent-pq]: concurrent.md#concurrentpriorityqueue
+[repo]: https://github.com/inspiros/paged-collections
+[rust-revision]: https://github.com/inspiros/paged-collections/tree/b814a0e
+[rust-harness]: https://github.com/inspiros/paged-collections/tree/b814a0e/crates/bench
+[rust-scaling]: https://github.com/inspiros/paged-collections/blob/b814a0e/crates/bench/src/bin/concurrent_scaling.rs
+[py-revision]: https://github.com/inspiros/paged-collections/tree/0989af0
+[py-scaling]: https://github.com/inspiros/paged-collections/blob/c5e7a44/benchmarks/python/concurrent_scaling.py
+[py-queues]: https://github.com/inspiros/paged-collections/blob/267f4c3/benchmarks/python/queues.py
