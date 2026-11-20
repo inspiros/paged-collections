@@ -83,6 +83,21 @@ impl Drop for Payload {
 }
 
 #[test]
+fn borrowed_for_loops_yield_ids_and_values() {
+    let mut hive = ConcurrentHive::<_, 2>::new();
+    let first = hive.insert(1);
+    let second = hive.insert(2);
+    for (_, value) in &mut hive {
+        *value *= 10;
+    }
+    let mut entries = Vec::new();
+    for (id, value) in &hive {
+        entries.push((id, *value));
+    }
+    assert_eq!(entries, [(first, 10), (second, 20)]);
+}
+
+#[test]
 fn eight_threads_mix_inserts_guards_removes_takes_and_iteration() {
     const THREADS: usize = 8;
     let rounds = if cfg!(miri) { 12 } else { 10_000 };

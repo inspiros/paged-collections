@@ -2,7 +2,7 @@
 
 use crate::page::{Directory, Flat, Radix};
 
-pub(super) use sealed::SharedPages;
+pub(super) use sealed::{PageIter, PageIterMut, SharedPages};
 
 /// Chooses a concurrent page directory, using the plain directory markers.
 ///
@@ -23,10 +23,11 @@ pub trait SharedDirectory: Directory + sealed::Sealed {
 // The wrappers keep the public GAT from exposing crate-private spine types.
 mod sealed {
     use alloc::boxed::Box;
+    use alloc::vec::Vec;
 
     use super::super::index::{INDEX_CHUNKS, page_number};
-    use super::super::radix::RadixSpine;
-    use super::super::spine::Spine;
+    use super::super::radix::{self, RadixSpine};
+    use super::super::spine::{self, Spine};
 
     #[doc(hidden)]
     pub trait Sealed {}
@@ -40,13 +41,21 @@ mod sealed {
         #[doc(hidden)]
         fn get_or_insert_with(&self, page: usize, make: impl FnOnce() -> Box<P>) -> &P;
         #[doc(hidden)]
-        fn iter<'a>(&'a self) -> impl Iterator<Item = (usize, &'a P)>
-        where
-            P: 'a;
+        fn iter(&self) -> PageIter<'_, P>;
         #[doc(hidden)]
-        fn iter_mut<'a>(&'a mut self) -> impl Iterator<Item = (usize, &'a mut P)>
-        where
-            P: 'a;
+        fn iter_mut(&mut self) -> PageIterMut<'_, P>;
+        #[doc(hidden)]
+        fn remove(&mut self, page: usize);
+        #[doc(hidden)]
+        fn retain(&mut self, mut keep: impl FnMut(usize, &mut P) -> bool) {
+            let removed: Vec<_> = self
+                .iter_mut()
+                .filter_map(|(number, page)| (!keep(number, page)).then_some(number))
+                .collect();
+            for number in removed {
+                self.remove(number);
+            }
+        }
         #[doc(hidden)]
         fn clear(&mut self);
         #[doc(hidden)]
@@ -57,6 +66,44 @@ mod sealed {
     pub struct FlatPages<P>(Spine<P, INDEX_CHUNKS>);
     #[doc(hidden)]
     pub struct RadixPages<P>(RadixSpine<P>);
+
+    #[doc(hidden)]
+    pub struct PageIter<'a, P>(PageIterInner<'a, P>);
+
+    enum PageIterInner<'a, P> {
+        Flat(spine::Iter<'a, P, INDEX_CHUNKS>),
+        Radix(radix::SharedPages<'a, P>),
+    }
+
+    impl<'a, P> Iterator for PageIter<'a, P> {
+        type Item = (usize, &'a P);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            match &mut self.0 {
+                PageIterInner::Flat(iter) => iter.next(),
+                PageIterInner::Radix(iter) => iter.next(),
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub struct PageIterMut<'a, P>(PageIterMutInner<'a, P>);
+
+    enum PageIterMutInner<'a, P> {
+        Flat(spine::IterMut<'a, P>),
+        Radix(radix::ExclusivePages<'a, P>),
+    }
+
+    impl<'a, P> Iterator for PageIterMut<'a, P> {
+        type Item = (usize, &'a mut P);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            match &mut self.0 {
+                PageIterMutInner::Flat(iter) => iter.next(),
+                PageIterMutInner::Radix(iter) => iter.next(),
+            }
+        }
+    }
 
     impl<P> SharedPages<P> for FlatPages<P> {
         fn new() -> Self {
@@ -71,18 +118,16 @@ mod sealed {
             self.0.get_or_insert_with(page, make)
         }
 
-        fn iter<'a>(&'a self) -> impl Iterator<Item = (usize, &'a P)>
-        where
-            P: 'a,
-        {
-            self.0.iter()
+        fn iter(&self) -> PageIter<'_, P> {
+            PageIter(PageIterInner::Flat(self.0.iter()))
         }
 
-        fn iter_mut<'a>(&'a mut self) -> impl Iterator<Item = (usize, &'a mut P)>
-        where
-            P: 'a,
-        {
-            self.0.iter_mut()
+        fn iter_mut(&mut self) -> PageIterMut<'_, P> {
+            PageIterMut(PageIterMutInner::Flat(self.0.iter_mut()))
+        }
+
+        fn remove(&mut self, page: usize) {
+            drop(self.0.remove(page));
         }
 
         fn clear(&mut self) {
@@ -107,18 +152,16 @@ mod sealed {
             self.0.get_or_insert_with(page, make)
         }
 
-        fn iter<'a>(&'a self) -> impl Iterator<Item = (usize, &'a P)>
-        where
-            P: 'a,
-        {
-            self.0.iter()
+        fn iter(&self) -> PageIter<'_, P> {
+            PageIter(PageIterInner::Radix(self.0.iter()))
         }
 
-        fn iter_mut<'a>(&'a mut self) -> impl Iterator<Item = (usize, &'a mut P)>
-        where
-            P: 'a,
-        {
-            self.0.iter_mut()
+        fn iter_mut(&mut self) -> PageIterMut<'_, P> {
+            PageIterMut(PageIterMutInner::Radix(self.0.iter_mut()))
+        }
+
+        fn remove(&mut self, page: usize) {
+            self.0.remove(page);
         }
 
         fn clear(&mut self) {

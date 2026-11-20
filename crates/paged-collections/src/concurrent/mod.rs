@@ -280,18 +280,20 @@ mod sparse;
 mod spine;
 mod vec;
 
+pub use append::DenseIter;
 pub use append_hive::{AppendDrain, AppendIter, AppendIterMut, ConcurrentAppendHive};
-pub use atomic_map::{AtomicDirectMap, AtomicIdMap};
+pub use atomic_map::{AtomicDirectMap, AtomicDirectMapIter, AtomicIdMap, AtomicIdMapIter};
 pub use direct::{
-    ConcurrentDirectMap, DirectMapRef, DirectMapRefMut, Entry, OccupiedEntry, VacantEntry,
+    ConcurrentDirectMap, DirectMapIterMut, DirectMapRef, DirectMapRefMut, Entry, OccupiedEntry,
+    VacantEntry,
 };
 pub use directory::SharedDirectory;
 pub use hive::{ConcurrentHive, Drain, Iter, IterMut, Ref};
-pub use id_alloc::ConcurrentIdAllocator;
+pub use id_alloc::{ConcurrentIdAllocator, IdAllocIter};
 pub use priority_queue::ConcurrentPriorityQueue;
 pub use queue::ConcurrentQueue;
-pub use sparse::{ConcurrentSparseMap, ConcurrentSparseSet};
-pub use vec::ConcurrentPagedVec;
+pub use sparse::{ConcurrentSparseMap, ConcurrentSparseSet, SparseMapIter, SparseMapIterMut};
+pub use vec::{ConcurrentPagedVec, VecIterMut};
 
 #[cfg(all(test, loom))]
 mod loom_append;

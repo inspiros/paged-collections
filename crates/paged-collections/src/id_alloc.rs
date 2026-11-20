@@ -298,6 +298,7 @@ impl IdAllocator {
     ///
     /// Panics if all [`MAX_INDICES`] indices are live or retired. See
     /// [`try_alloc`](IdAllocator::try_alloc).
+    #[doc(alias = "allocate")]
     pub fn alloc(&mut self) -> Id {
         match self.try_alloc() {
             Some(id) => id,
@@ -307,6 +308,7 @@ impl IdAllocator {
 
     /// Like [`alloc`](IdAllocator::alloc), but `None` if all indices are
     /// live or retired.
+    #[doc(alias = "try_allocate")]
     pub fn try_alloc(&mut self) -> Option<Id> {
         if let Some(index) = self.free.pop() {
             let version = &mut self.versions[index as usize];
@@ -332,6 +334,7 @@ impl IdAllocator {
     }
 
     /// Whether `id` is live: issued by this allocator and not freed since.
+    #[doc(alias = "is_live")]
     #[inline]
     pub fn is_alive(&self, id: Id) -> bool {
         live_version(id.generation)

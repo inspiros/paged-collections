@@ -26,6 +26,94 @@ fn id(index: u32, generation: u32) -> Id {
     Id::new(index, NonZeroU32::new(generation).unwrap())
 }
 
+#[test]
+fn borrowed_for_loops_copy_entries_in_index_order() {
+    let direct: AtomicDirectMap<3, Radix> =
+        [(usize::MAX, 13), (2, 0), (1, 9)].into_iter().collect();
+    let mut entries = Vec::new();
+    for entry in &direct {
+        entries.push(entry);
+    }
+    assert_eq!(entries, [(1, 9), (2, 0), (usize::MAX, 13)]);
+
+    let ids: AtomicIdMap<3> = [(id(8, 1), 13), (id(2, 3), 0)].into_iter().collect();
+    let mut entries = Vec::new();
+    for entry in &ids {
+        entries.push(entry);
+    }
+    assert_eq!(entries, [(id(2, 3), 0), (id(8, 1), 13)]);
+}
+
+#[test]
+fn atomic_direct_shrink_releases_empty_pages_and_keeps_live_words() {
+    fn check<D: SharedDirectory>(last: usize) {
+        let mut map = AtomicDirectMap::<3, D>::new();
+        let mut model = BTreeMap::new();
+        for (key, value) in [(18, 1), (0, 2), (8, 0), (7, 4), (last, MAX_VALUE)] {
+            assert_eq!(map.insert(key, value), model.insert(key, value));
+        }
+        for key in [0, 7, 18] {
+            assert_eq!(map.remove(key), model.remove(&key));
+        }
+        let before = map.allocated_pages();
+        map.shrink_to_fit();
+        assert_eq!(map.allocated_pages(), before - 2);
+        assert_eq!(map.len(), model.len());
+        assert!(
+            map.iter()
+                .eq(model.iter().map(|(&key, &value)| (key, value)))
+        );
+
+        let shared = &map;
+        for key in [0, 18] {
+            assert_eq!(shared.insert(key, 6), model.insert(key, 6));
+        }
+        assert_eq!(shared.allocated_pages(), before);
+        assert_eq!(shared.len(), model.len());
+        assert!(shared.iter().eq(model));
+        map.clear();
+        map.shrink_to_fit();
+        assert_eq!(map.allocated_pages(), 0);
+        assert_eq!(map.insert(last, 7), None);
+    }
+    check::<Flat>(121);
+    check::<Radix>(usize::MAX);
+}
+
+#[test]
+fn atomic_id_shrink_releases_empty_pages_and_preserves_generations() {
+    let mut map = AtomicIdMap::<3>::new();
+    let mut model = BTreeMap::new();
+    for (key, value) in [
+        (id(8, 3), 0),
+        (id(7, 1), 4),
+        (id(0, 3), u32::MAX),
+        (id(18, 5), 6),
+    ] {
+        assert_eq!(map.insert(key, value), model.insert(key, value));
+    }
+    for key in [id(0, 3), id(7, 1), id(18, 5)] {
+        assert_eq!(map.remove(key), model.remove(&key));
+    }
+    map.shrink_to_fit();
+    assert_eq!(map.allocated_pages(), 1);
+    assert_eq!(map.len(), model.len());
+    assert!(
+        map.iter()
+            .eq(model.iter().map(|(&key, &value)| (key, value)))
+    );
+    assert_eq!(map.get(id(8, 2)), None);
+
+    let shared = &map;
+    for key in [id(0, 4), id(18, 6)] {
+        assert_eq!(shared.insert(key, 0), model.insert(key, 0));
+    }
+    assert_eq!(shared.allocated_pages(), 3);
+    assert_eq!(shared.len(), model.len());
+    assert!(shared.iter().eq(model));
+    assert_eq!(shared.get(id(18, 5)), None);
+}
+
 fn direct_value() -> impl Strategy<Value = u64> {
     prop_oneof![Just(0), Just(MAX_VALUE), 0u64..4, 0u64..u64::MAX]
 }
@@ -230,13 +318,16 @@ proptest! {
 #[test]
 fn send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
+    fn check_iterator<T: Send + Sync>(_: T) {}
     fn directories<D: SharedDirectory>() {
         assert_send_sync::<AtomicDirectMap<3, D>>();
+        check_iterator(AtomicDirectMap::<3, D>::new().iter());
     }
     directories::<Flat>();
     directories::<Radix>();
     assert_send_sync::<AtomicDirectMap>();
     assert_send_sync::<AtomicIdMap>();
+    check_iterator(AtomicIdMap::<3>::new().iter());
 }
 
 #[test]

@@ -13,6 +13,8 @@ const DIGIT: u32 = 6;
 const DIGIT: u32 = 2;
 const FANOUT: usize = 1 << DIGIT;
 const MASK: usize = FANOUT - 1;
+// One root slot plus at most one branch per digit, including a partial digit.
+const WALK_LEVELS: usize = usize::BITS.div_ceil(DIGIT) as usize + 1;
 
 pub(crate) struct RadixSpine<P> {
     root: AtomicPtr<()>,
@@ -210,7 +212,7 @@ impl<P> RadixSpine<P> {
 
     /// Installed pages in ascending order, weakly consistent across pages.
     /// May miss concurrent installs; every page is yielded at most once.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &P)> {
+    pub(crate) fn iter(&self) -> SharedPages<'_, P> {
         SharedPages {
             inner: Walk::new(&self.root, Ordering::Acquire),
             marker: PhantomData,
@@ -218,11 +220,57 @@ impl<P> RadixSpine<P> {
     }
 
     /// Installed pages in ascending order, with exclusive access to each.
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut P)> {
+    pub(crate) fn iter_mut(&mut self) -> ExclusivePages<'_, P> {
         ExclusivePages {
             inner: Walk::new(&self.root, Ordering::Relaxed),
             marker: PhantomData,
         }
+    }
+
+    /// Drops the installed page and collapses branches with only one child.
+    pub(crate) fn remove(&mut self, number: usize) {
+        // Drop the leaf after relinking the tree, in case its destructor panics.
+        drop(Self::unlink_leaf(&mut self.root, number));
+    }
+
+    fn unlink_leaf(slot: &mut AtomicPtr<()>, number: usize) -> Option<Box<Leaf<P>>> {
+        // The caller has exclusive directory access for this whole traversal.
+        let raw = slot.load(Ordering::Relaxed);
+        if raw.is_null() {
+            return None;
+        }
+        if is_leaf(raw) {
+            let leaf = leaf_ptr::<P>(raw);
+            // SAFETY: the tag identifies a live leaf owned by this slot.
+            if unsafe { (*leaf).number } != number {
+                return None;
+            }
+            slot.store(ptr::null_mut(), Ordering::Relaxed);
+            // SAFETY: the store detached the leaf, transferring its sole ownership.
+            return Some(unsafe { Box::from_raw(leaf) });
+        }
+
+        // SAFETY: this exclusively borrowed link owns the installed branch.
+        // Recursing on a child cannot free this branch.
+        let branch = unsafe { &mut *raw.cast::<Branch>() };
+        if prefix(number, branch.shift) != branch.prefix {
+            return None;
+        }
+        let child = digit(number, branch.shift);
+        let removed = Self::unlink_leaf(&mut branch.children[child], number)?;
+        let mut children = branch
+            .children
+            .iter()
+            .map(|child| child.load(Ordering::Relaxed))
+            .filter(|child| !child.is_null());
+        let first = children.next().expect("branch had at least two children");
+        if children.next().is_none() {
+            slot.store(first, Ordering::Relaxed);
+            // SAFETY: the branch is detached and its only live child is now
+            // linked from the parent. Dropping the branch drops no children.
+            drop(unsafe { Box::from_raw(raw.cast::<Branch>()) });
+        }
+        Some(removed)
     }
 
     /// Frees every node and page. The root is detached first, and a cleanup
@@ -266,14 +314,20 @@ impl<P> Drop for UnpublishedLeaf<P> {
 /// then its old child once. Parent slots have disjoint ordered ranges, so
 /// neither case can duplicate a leaf or put it out of ascending order.
 struct Walk<'a> {
-    levels: Vec<slice::Iter<'a, AtomicPtr<()>>>,
+    levels: [slice::Iter<'a, AtomicPtr<()>>; WALK_LEVELS],
+    depth: usize,
     ordering: Ordering,
 }
 
 impl<'a> Walk<'a> {
     fn new(root: &'a AtomicPtr<()>, ordering: Ordering) -> Self {
-        let levels = alloc::vec![slice::from_ref(root).iter()];
-        Self { levels, ordering }
+        let mut levels = core::array::from_fn(|_| slice::Iter::default());
+        levels[0] = slice::from_ref(root).iter();
+        Self {
+            levels,
+            depth: 1,
+            ordering,
+        }
     }
 }
 
@@ -281,10 +335,10 @@ impl Iterator for Walk<'_> {
     type Item = *mut ();
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let level = self.levels.last_mut()?;
+        while self.depth > 0 {
+            let level = &mut self.levels[self.depth - 1];
             let Some(slot) = level.next() else {
-                self.levels.pop();
+                self.depth -= 1;
                 continue;
             };
             // Acquire observes node/page publication for shared iteration;
@@ -299,12 +353,15 @@ impl Iterator for Walk<'_> {
             // SAFETY: the owning iterator borrows the directory, preventing
             // reclamation of this installed Branch and its initialized slots.
             let branch = unsafe { &*raw.cast::<Branch>() };
-            self.levels.push(branch.children.iter());
+            self.levels[self.depth] = branch.children.iter();
+            self.depth += 1;
         }
+        None
     }
 }
 
-struct SharedPages<'a, P> {
+/// Shared traversal over installed radix pages.
+pub(crate) struct SharedPages<'a, P> {
     inner: Walk<'a>,
     // Match the auto traits of a shared directory borrow, like Spine::iter.
     marker: PhantomData<&'a RadixSpine<P>>,
@@ -323,7 +380,7 @@ impl<'a, P> Iterator for SharedPages<'a, P> {
 }
 
 /// Carries `&mut P`'s auto traits for RadixSpine::iter_mut, like Spine's adapter.
-struct ExclusivePages<'a, P> {
+pub(crate) struct ExclusivePages<'a, P> {
     inner: Walk<'a>,
     marker: PhantomData<&'a mut P>,
 }
@@ -572,6 +629,16 @@ mod tests {
             spine.iter().map(|(_, page)| *page).collect::<Vec<_>>(),
             [1, 2, 3, 4, 5]
         );
+        for number in [1, 64, 0, usize::MAX] {
+            spine.remove(number);
+            assert!(spine.get(number).is_none());
+            spine.check();
+        }
+        spine.remove(1);
+        let surviving = spine.get(1 << (usize::BITS - 1)).unwrap();
+        assert_eq!(ptr::from_ref(surviving), addresses[3]);
+        assert_eq!(*surviving, 4);
+        assert_eq!(*spine.get_or_insert_with(64, || Box::new(7)), 7);
         spine.check();
         spine.clear();
         spine.check();

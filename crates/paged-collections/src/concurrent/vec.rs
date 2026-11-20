@@ -1,10 +1,10 @@
 //! A stable-address vector with shared appends and exclusive editing.
 
 use core::fmt;
-use core::iter::FusedIterator;
+use core::iter::{Flatten, FusedIterator};
 use core::ops::{Index, IndexMut};
 
-use super::append::AppendLog;
+use super::append::{AppendLog, DenseIter, PagesMut};
 use crate::page::DEFAULT_PAGE;
 use crate::paged_vec::PagedVec;
 
@@ -18,7 +18,8 @@ use crate::paged_vec::PagedVec;
 /// `len() == reserved_len()`.
 ///
 /// Removing, moving or mutating elements requires exclusive access. Pages
-/// stay allocated for reuse until destruction. Uses `core` and `alloc` only.
+/// stay allocated for reuse until [`shrink_to_fit`](Self::shrink_to_fit) or
+/// destruction. Uses `core` and `alloc` only.
 /// `Send` requires `T: Send`; `Sync` requires `T: Send + Sync`.
 pub struct ConcurrentPagedVec<T, const PAGE: usize = DEFAULT_PAGE> {
     log: AppendLog<T, PAGE>,
@@ -95,7 +96,7 @@ impl<T, const PAGE: usize> ConcurrentPagedVec<T, PAGE> {
     }
 
     /// Iterates over a snapshot of the committed prefix in index order.
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + ExactSizeIterator + FusedIterator {
+    pub fn iter(&self) -> DenseIter<'_, T, PAGE> {
         self.log.iter()
     }
 
@@ -113,8 +114,8 @@ impl<T, const PAGE: usize> ConcurrentPagedVec<T, PAGE> {
     }
 
     /// Iterates mutably over all elements, in index order.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.log.iter_mut()
+    pub fn iter_mut(&mut self) -> VecIterMut<'_, T> {
+        VecIterMut::new(&mut self.log)
     }
 
     /// Nonempty mutable page slices, in index order.
@@ -163,6 +164,13 @@ impl<T, const PAGE: usize> ConcurrentPagedVec<T, PAGE> {
         self.log.clear();
     }
 
+    /// Frees pages wholly beyond the end of the vector, keeping directory chunks.
+    /// Existing elements keep their addresses. Shared appends can allocate the
+    /// released pages again.
+    pub fn shrink_to_fit(&mut self) {
+        self.log.shrink_to_fit();
+    }
+
     /// Clones the committed prefix into a plain [`PagedVec`] in O(prefix length).
     /// Like [`len`](Self::len) and [`iter`](Self::iter), this can omit
     /// completed pushes beyond an earlier unpublished reservation. The
@@ -178,6 +186,56 @@ impl<T, const PAGE: usize> ConcurrentPagedVec<T, PAGE> {
     /// Element addresses can change; no cloning is required.
     pub fn into_inner(self) -> PagedVec<T, PAGE> {
         self.log.into_inner()
+    }
+}
+
+impl<'a, T, const PAGE: usize> IntoIterator for &'a ConcurrentPagedVec<T, PAGE> {
+    type Item = &'a T;
+    type IntoIter = DenseIter<'a, T, PAGE>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, T, const PAGE: usize> IntoIterator for &'a mut ConcurrentPagedVec<T, PAGE> {
+    type Item = &'a mut T;
+    type IntoIter = VecIterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+/// Mutably iterates over the elements of a [`ConcurrentPagedVec`] in index order.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct VecIterMut<'a, T> {
+    inner: Flatten<PagesMut<'a, T>>,
+}
+
+impl<'a, T> VecIterMut<'a, T> {
+    pub(super) fn new<const PAGE: usize>(log: &'a mut AppendLog<T, PAGE>) -> Self {
+        Self {
+            inner: log.pages_mut().flatten(),
+        }
+    }
+}
+
+impl<'a, T> Iterator for VecIterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<T> fmt::Debug for VecIterMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VecIterMut").finish_non_exhaustive()
     }
 }
 

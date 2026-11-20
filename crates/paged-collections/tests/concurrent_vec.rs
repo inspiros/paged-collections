@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use paged_collections::concurrent::ConcurrentPagedVec;
+use paged_collections::concurrent::{ConcurrentPagedVec, VecIterMut};
 use paged_collections::paged_vec::PagedVec;
 use proptest::prelude::*;
 
@@ -22,6 +22,7 @@ const _: fn() = || {
     fn send<T: Send>() {}
     fn sync<T: Sync>() {}
     send::<ConcurrentPagedVec<Cell<u8>, 2>>();
+    send::<VecIterMut<'static, Cell<u8>>>();
     sync::<ConcurrentPagedVec<u8, 2>>();
     trait AmbiguousSend<A> {
         fn check() {}
@@ -29,6 +30,7 @@ const _: fn() = || {
     impl<T> AmbiguousSend<()> for T {}
     impl<T: Send> AmbiguousSend<u8> for T {}
     let _ = <ConcurrentPagedVec<Rc<u8>, 2> as AmbiguousSend<_>>::check;
+    let _ = <VecIterMut<'static, Rc<u8>> as AmbiguousSend<_>>::check;
     trait AmbiguousSync<A> {
         fn check() {}
     }
@@ -106,6 +108,48 @@ fn snapshots_and_existing_addresses_survive_appends() {
     // slot mutably; its page remains allocated and vector is still borrowed.
     unsafe { &*address }.set(99);
     assert_eq!(vector[0].get(), 99);
+}
+
+#[test]
+fn borrowed_for_loops_visit_elements_in_index_order() {
+    let mut vector: ConcurrentPagedVec<_, 2> = [1, 2, 3, 4, 5].into_iter().collect();
+    for value in &mut vector {
+        *value *= 2;
+    }
+    let mut values = Vec::new();
+    for &value in &vector {
+        values.push(value);
+    }
+    assert_eq!(values, [2, 4, 6, 8, 10]);
+}
+
+#[test]
+fn shrink_keeps_live_values_in_place_and_supports_shared_appends() {
+    for len in [0, 6, 7] {
+        let mut model: Vec<_> = (0..14).map(|i| i.to_string()).collect();
+        let mut vector: ConcurrentPagedVec<_, 3> = model.iter().cloned().collect();
+        vector.truncate(len);
+        model.truncate(len);
+        let live: Vec<_> = vector.iter().map(std::ptr::from_ref).collect();
+
+        vector.shrink_to_fit();
+        vector.shrink_to_fit();
+        assert_eq!(
+            vector.iter().map(std::ptr::from_ref).collect::<Vec<_>>(),
+            live
+        );
+        assert_eq!(vector.len(), model.len());
+        assert_eq!(vector.reserved_len(), model.len());
+        assert!(vector.iter().eq(&model));
+
+        let shared = &vector;
+        for i in len..16 {
+            let value = format!("new {i}");
+            assert_eq!(shared.push(value.clone()), model.len());
+            model.push(value);
+        }
+        assert!(shared.iter().eq(&model));
+    }
 }
 
 #[test]

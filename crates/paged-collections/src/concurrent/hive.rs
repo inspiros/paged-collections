@@ -887,6 +887,24 @@ impl<T: Clone, const PAGE: usize> Clone for ConcurrentHive<T, PAGE> {
     }
 }
 
+impl<'a, T, const PAGE: usize> IntoIterator for &'a ConcurrentHive<T, PAGE> {
+    type Item = (Id, Ref<'a, T, PAGE>);
+    type IntoIter = Iter<'a, T, PAGE>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, T, const PAGE: usize> IntoIterator for &'a mut ConcurrentHive<T, PAGE> {
+    type Item = (Id, &'a mut T);
+    type IntoIter = IterMut<'a, T, PAGE>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
 impl<T, const PAGE: usize> Default for ConcurrentHive<T, PAGE> {
     fn default() -> Self {
         Self::new()

@@ -10,10 +10,11 @@ use core::fmt;
 use core::mem;
 use core::num::NonZeroU32;
 use core::ops::{Bound, RangeBounds};
+use core::slice;
 
 use super::atomic::{AtomicU64, Ordering};
 use super::count::StripedLen;
-use super::directory::{SharedDirectory, SharedPages};
+use super::directory::{PageIter, SharedDirectory, SharedPages};
 use crate::direct_map::PagedDirectMap;
 use crate::id_alloc::Id;
 use crate::page::{DEFAULT_PAGE, Flat};
@@ -153,29 +154,23 @@ impl<const PAGE: usize, D: SharedDirectory> Words<PAGE, D> {
         }
     }
 
-    fn range(&self, start: usize, end: usize) -> impl Iterator<Item = (usize, u64)> {
-        self.pages
-            .iter()
-            .skip_while(move |(number, _)| *number < start / PAGE)
-            .take_while(move |(number, _)| start <= end && *number <= end / PAGE)
-            .flat_map(move |(number, page)| {
-                let first = if number == start / PAGE {
-                    start % PAGE
-                } else {
-                    0
-                };
-                let last = if number == end / PAGE {
-                    end % PAGE + 1
-                } else {
-                    PAGE
-                };
-                // The end bound also prevents overflow in the final page
-                // when PAGE does not divide the usize index space evenly.
-                (first..last).filter_map(move |offset| {
-                    let word = page.slots[offset].load(Ordering::Acquire);
-                    (word != 0).then_some((number * PAGE + offset, word))
-                })
-            })
+    fn range(&self, start: usize, end: usize) -> WordsIter<'_, PAGE> {
+        WordsIter {
+            pages: self.pages.iter(),
+            slots: slice::Iter::default().enumerate(),
+            base: 0,
+            start,
+            end,
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.pages.retain(|_, page| {
+            // Exclusive access rules out slot changes during the scan.
+            page.slots
+                .iter()
+                .any(|slot| slot.load(Ordering::Relaxed) != 0)
+        });
     }
 
     fn clear(&mut self) {
@@ -190,6 +185,52 @@ impl<const PAGE: usize, D: SharedDirectory> Words<PAGE, D> {
     fn reset(&mut self) {
         self.pages.clear();
         self.len.reset();
+    }
+}
+
+struct WordsIter<'a, const PAGE: usize> {
+    pages: PageIter<'a, Page>,
+    slots: core::iter::Enumerate<slice::Iter<'a, AtomicU64>>,
+    base: usize,
+    start: usize,
+    end: usize,
+}
+
+impl<const PAGE: usize> Iterator for WordsIter<'_, PAGE> {
+    type Item = (usize, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.start <= self.end {
+            for (offset, slot) in self.slots.by_ref() {
+                let word = slot.load(Ordering::Acquire);
+                if word != 0 {
+                    return Some((self.base + offset, word));
+                }
+            }
+            let (number, page) = self.pages.next()?;
+            if number < self.start / PAGE {
+                continue;
+            }
+            if number > self.end / PAGE {
+                self.start = 1;
+                self.end = 0;
+                return None;
+            }
+            let first = if number == self.start / PAGE {
+                self.start % PAGE
+            } else {
+                0
+            };
+            // The end bound prevents overflow in a partial final page.
+            let last = if number == self.end / PAGE {
+                self.end % PAGE + 1
+            } else {
+                PAGE
+            };
+            self.base = number * PAGE + first;
+            self.slots = page.slots[first..last].iter().enumerate();
+        }
+        None
     }
 }
 
@@ -233,8 +274,8 @@ fn decode_direct(word: u64) -> Option<u64> {
 /// Slot loads use acquire ordering, successful read-modify-write operations
 /// use acquire-release, and failed compare-exchanges use acquire. Values may
 /// publish other data indexed by them. Slot operations are lock-free; page
-/// installation can allocate. Pages remain until [`reset`](Self::reset) or
-/// destruction. The default [`Flat`] directory has O(1) page lookups and
+/// installation can allocate. Pages remain until
+/// [`shrink_to_fit`](Self::shrink_to_fit), [`reset`](Self::reset) or destruction. The default [`Flat`] directory has O(1) page lookups and
 /// memory following the highest page; its finite range rejects out-of-range
 /// inserts with a panic and makes lookups/removals return absent.
 /// [`Radix`](crate::page::Radix) accepts any `usize` index, uses directory memory
@@ -382,8 +423,10 @@ impl<const PAGE: usize, D: SharedDirectory> AtomicDirectMap<PAGE, D> {
 
     /// Iterates in ascending slot order, loading each slot once with acquire
     /// ordering. Weakly consistent under mutation; not a snapshot.
-    pub fn iter(&self) -> impl Iterator<Item = (usize, u64)> {
-        self.range(..)
+    pub fn iter(&self) -> AtomicDirectMapIter<'_, PAGE> {
+        AtomicDirectMapIter {
+            inner: self.words.range(0, usize::MAX),
+        }
     }
 
     /// Iterates over a key range in ascending order, loading each visited slot
@@ -394,6 +437,12 @@ impl<const PAGE: usize, D: SharedDirectory> AtomicDirectMap<PAGE, D> {
         self.words
             .range(start, end)
             .map(|(key, word)| (key, word - 1))
+    }
+
+    /// Frees pages that contain no entries. Flat directory chunks stay allocated.
+    /// Shared insertions can allocate those pages again.
+    pub fn shrink_to_fit(&mut self) {
+        self.words.shrink_to_fit();
     }
 
     /// Empties the map, retaining pages for reuse. Requires exclusive access.
@@ -458,7 +507,7 @@ fn id_update(id: Id, old: u64, new: Option<u32>) -> u64 {
 /// use acquire-release, and failed compare-exchanges use acquire. Values may
 /// publish other data indexed by them. Slot operations are lock-free; page
 /// installation can allocate. The finite, Flat-like spine retains pages until
-/// [`reset`](Self::reset) or destruction. Out-of-range lookups and removals
+/// [`shrink_to_fit`](Self::shrink_to_fit), [`reset`](Self::reset) or destruction. Out-of-range lookups and removals
 /// return absent; inserting outside the spine range panics. `PAGE` must be
 /// nonzero and its atomic slot storage must fit in `isize::MAX` bytes.
 ///
@@ -622,8 +671,10 @@ impl<const PAGE: usize> AtomicIdMap<PAGE> {
 
     /// Iterates in ascending index order, loading each slot once with acquire
     /// ordering. Weakly consistent under mutation; not a snapshot.
-    pub fn iter(&self) -> impl Iterator<Item = (Id, u32)> {
-        self.range(..)
+    pub fn iter(&self) -> AtomicIdMapIter<'_, PAGE> {
+        AtomicIdMapIter {
+            inner: self.words.range(0, usize::MAX),
+        }
     }
 
     /// Iterates over an index range in ascending order, independent of
@@ -640,6 +691,12 @@ impl<const PAGE: usize> AtomicIdMap<PAGE> {
             .filter_map(|(index, word)| decode_id(index as u32, word))
     }
 
+    /// Frees pages that contain no entries, keeping directory chunks.
+    /// Shared insertions can allocate those pages again.
+    pub fn shrink_to_fit(&mut self) {
+        self.words.shrink_to_fit();
+    }
+
     /// Empties the map, retaining pages for reuse. Requires exclusive access.
     pub fn clear(&mut self) {
         self.words.clear();
@@ -648,6 +705,66 @@ impl<const PAGE: usize> AtomicIdMap<PAGE> {
     /// Frees all pages and directory chunks, leaving an empty map.
     pub fn reset(&mut self) {
         self.words.reset();
+    }
+}
+
+impl<'a, const PAGE: usize, D: SharedDirectory> IntoIterator for &'a AtomicDirectMap<PAGE, D> {
+    type Item = (usize, u64);
+    type IntoIter = AtomicDirectMapIter<'a, PAGE>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, const PAGE: usize> IntoIterator for &'a AtomicIdMap<PAGE> {
+    type Item = (Id, u32);
+    type IntoIter = AtomicIdMapIter<'a, PAGE>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Weakly consistent iterator over entries of an [`AtomicDirectMap`] in key order.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct AtomicDirectMapIter<'a, const PAGE: usize = DEFAULT_PAGE> {
+    inner: WordsIter<'a, PAGE>,
+}
+
+impl<const PAGE: usize> Iterator for AtomicDirectMapIter<'_, PAGE> {
+    type Item = (usize, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(key, word)| (key, word - 1))
+    }
+}
+
+impl<const PAGE: usize> fmt::Debug for AtomicDirectMapIter<'_, PAGE> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AtomicDirectMapIter")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Weakly consistent iterator over entries of an [`AtomicIdMap`] in index order.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct AtomicIdMapIter<'a, const PAGE: usize = DEFAULT_PAGE> {
+    inner: WordsIter<'a, PAGE>,
+}
+
+impl<const PAGE: usize> Iterator for AtomicIdMapIter<'_, PAGE> {
+    type Item = (Id, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .find_map(|(index, word)| decode_id(index as u32, word))
+    }
+}
+
+impl<const PAGE: usize> fmt::Debug for AtomicIdMapIter<'_, PAGE> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AtomicIdMapIter").finish_non_exhaustive()
     }
 }
 

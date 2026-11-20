@@ -6,12 +6,15 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::fmt;
 use core::iter::FusedIterator;
 use core::mem::MaybeUninit;
-use core::ptr;
+use core::ops::Range;
+use core::{ptr, slice};
 
 use super::atomic::{AtomicU64, AtomicUsize, Ordering, UnsafeCell};
-use super::spine::Spine;
+use super::spine::{self, Spine};
+use crate::page::DEFAULT_PAGE;
 use crate::paged_vec::PagedVec;
 
 // Enough directory levels for usize positions on either target and with
@@ -314,11 +317,8 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
         }))
     }
 
-    pub(crate) fn iter(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = &T> + ExactSizeIterator + FusedIterator {
-        let len = self.len();
-        (0..len).map(move |pos| self.get(pos).expect("committed slot is ready"))
+    pub(crate) fn iter(&self) -> DenseIter<'_, T, PAGE> {
+        DenseIter::new(self)
     }
 
     #[cfg(not(loom))]
@@ -359,41 +359,15 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
         }))
     }
 
-    #[cfg(not(loom))]
-    pub(crate) fn pages_mut(&mut self) -> impl Iterator<Item = &mut [T]> {
+    pub(crate) fn pages_mut(&mut self) -> PagesMut<'_, T> {
         let len = self.len();
-        self.pages.iter_mut().filter_map(move |(p, page)| {
-            let used = PAGE.min(len.saturating_sub(p * PAGE));
-            if used == 0 {
-                return None;
-            }
-            // SAFETY: quiescence initializes the prefix; each page is yielded
-            // once under exclusive access. Transparent production cells give
-            // the array T's layout; no unwritten tail is in the slice.
-            Some(unsafe {
-                core::slice::from_raw_parts_mut(page.slots.as_mut_ptr().cast::<T>(), used)
-            })
-        })
-    }
-
-    #[cfg(loom)]
-    pub(crate) fn pages_mut(&mut self) -> impl Iterator<Item = &mut [T]> {
-        let len = self.len();
-        self.pages.iter_mut().flat_map(move |(p, page)| {
-            let used = PAGE.min(len.saturating_sub(p * PAGE));
-            page.slots.iter_mut().take(used).map(|slot| {
-                slot.with_mut(|cell| {
-                    // SAFETY: exclusive iteration yields each initialized
-                    // prefix slot once. Singleton slices retain loom tracking
-                    // without assuming its cell metadata has T's layout.
-                    core::slice::from_mut(unsafe { &mut *cell.cast::<T>() })
-                })
-            })
-        })
-    }
-
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.pages_mut().flatten()
+        PagesMut {
+            pages: self.pages.iter_mut(),
+            len,
+            capacity: PAGE,
+            #[cfg(loom)]
+            slots: slice::IterMut::default(),
+        }
     }
 
     pub(crate) fn pop(&mut self) -> Option<T> {
@@ -432,6 +406,20 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
         self.truncate(0);
     }
 
+    pub(super) fn shrink_to_fit(&mut self) {
+        let first_unused = self.len().div_ceil(PAGE);
+        let removed: Vec<_> = self
+            .pages
+            .iter()
+            .map(|(number, _)| number)
+            .skip_while(|&number| number < first_unused)
+            .collect();
+        for number in removed {
+            // Exclusive access means every initialized slot is in the prefix.
+            drop(self.pages.remove(number));
+        }
+    }
+
     pub(crate) fn into_inner(mut self) -> PagedVec<T, PAGE> {
         let mut result = PagedVec::with_capacity(self.len());
         while let Some(value) = self.pop() {
@@ -450,6 +438,114 @@ impl<T, const PAGE: usize> AppendLog<T, PAGE> {
     pub(super) fn finish_for_test(&self, pos: usize, value: T) {
         let page = self.pages.get(pos / PAGE).expect("test claimed this slot");
         self.publish(pos, page, value);
+    }
+}
+
+/// Iterates over the committed prefix of a [`ConcurrentPagedVec`](super::ConcurrentPagedVec) or
+/// [`ConcurrentSparseSet`](super::ConcurrentSparseSet) in dense order.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct DenseIter<'a, T, const PAGE: usize = DEFAULT_PAGE> {
+    log: &'a AppendLog<T, PAGE>,
+    indices: Range<usize>,
+}
+
+impl<'a, T, const PAGE: usize> DenseIter<'a, T, PAGE> {
+    fn new(log: &'a AppendLog<T, PAGE>) -> Self {
+        Self {
+            log,
+            indices: 0..log.len(),
+        }
+    }
+}
+
+impl<'a, T, const PAGE: usize> Iterator for DenseIter<'a, T, PAGE> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.nth(0)
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let index = self.indices.nth(n)?;
+        Some(self.log.get(index).expect("committed slot is ready"))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.indices.size_hint()
+    }
+}
+
+impl<T, const PAGE: usize> DoubleEndedIterator for DenseIter<'_, T, PAGE> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.nth_back(0)
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        let index = self.indices.nth_back(n)?;
+        Some(self.log.get(index).expect("committed slot is ready"))
+    }
+}
+
+impl<T, const PAGE: usize> ExactSizeIterator for DenseIter<'_, T, PAGE> {}
+impl<T, const PAGE: usize> FusedIterator for DenseIter<'_, T, PAGE> {}
+
+impl<T, const PAGE: usize> fmt::Debug for DenseIter<'_, T, PAGE> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DenseIter")
+            .field("indices", &self.indices)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exclusive traversal of initialized page slices. Loom yields singleton
+/// slices because its simulated cells contain tracking metadata.
+pub(crate) struct PagesMut<'a, T> {
+    pages: spine::IterMut<'a, Page<T>>,
+    len: usize,
+    capacity: usize,
+    #[cfg(loom)]
+    slots: slice::IterMut<'a, UnsafeCell<MaybeUninit<T>>>,
+}
+
+impl<'a, T> Iterator for PagesMut<'a, T> {
+    type Item = &'a mut [T];
+
+    #[cfg(not(loom))]
+    fn next(&mut self) -> Option<Self::Item> {
+        for (number, page) in self.pages.by_ref() {
+            let used = self
+                .capacity
+                .min(self.len.saturating_sub(number * self.capacity));
+            if used == 0 {
+                continue;
+            }
+            // SAFETY: quiescence initializes the prefix; each page is yielded
+            // once under exclusive access. Transparent production cells give
+            // the array T's layout; no unwritten tail is in the slice.
+            return Some(unsafe {
+                slice::from_raw_parts_mut(page.slots.as_mut_ptr().cast::<T>(), used)
+            });
+        }
+        None
+    }
+
+    #[cfg(loom)]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(slot) = self.slots.next() {
+                return Some(slot.with_mut(|cell| {
+                    // SAFETY: exclusive iteration yields each initialized
+                    // prefix slot once. Singleton slices use the shim without
+                    // assuming its cell metadata has T's layout.
+                    slice::from_mut(unsafe { &mut *cell.cast::<T>() })
+                }));
+            }
+            let (number, page) = self.pages.next()?;
+            let used = self
+                .capacity
+                .min(self.len.saturating_sub(number * self.capacity));
+            self.slots = page.slots[..used].iter_mut();
+        }
     }
 }
 
@@ -472,5 +568,31 @@ impl<T, const PAGE: usize> Drop for AppendLog<T, PAGE> {
         let rest = Rest(self);
         rest.0.clear();
         core::mem::forget(rest);
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::AppendLog;
+
+    #[test]
+    fn shrink_removes_only_pages_outside_the_prefix() {
+        let mut log = AppendLog::<usize, 3>::new();
+        for index in 0..9 {
+            assert_eq!(log.push(index, usize::MAX), Ok(index));
+        }
+        log.truncate(4);
+        log.shrink_to_fit();
+        assert_eq!(log.pages.iter().count(), 2);
+        assert!(log.pages.get(2).is_none());
+        let shared = &log;
+        for index in 4..9 {
+            assert_eq!(shared.push(index, usize::MAX), Ok(index));
+        }
+        assert!(shared.pages.get(2).is_some());
+        assert!(shared.iter().copied().eq(0..9));
+        log.clear();
+        log.shrink_to_fit();
+        assert_eq!(log.pages.iter().count(), 0);
     }
 }

@@ -1,12 +1,14 @@
 //! A direct-address map with one reader-writer lock per page.
 
 use alloc::boxed::Box;
+use alloc::vec::{IntoIter, Vec};
 use core::fmt;
 use core::mem;
 use core::ops::{Bound, Deref, DerefMut, RangeBounds};
+use core::slice;
 
 use super::count::StripedLen;
-use super::directory::{SharedDirectory, SharedPages};
+use super::directory::{PageIterMut, SharedDirectory, SharedPages};
 use super::lock::{ReadGuard, RwLock, WriteGuard};
 use crate::direct_map::PagedDirectMap;
 use crate::key::DirectKey;
@@ -57,8 +59,9 @@ impl<K: DirectKey, V> PageData<K, V> {
 /// [`DirectKey::Tag`], as in [`PagedDirectMap`], and keys are rebuilt from
 /// their slot index. Neighbouring keys on the same page contend;
 /// operations on different pages lock independently. Pages remain allocated
-/// until [`reset`](Self::reset) or destruction. The default [`Flat`] directory
-/// has O(1) page lookups and memory following the highest page. Its finite
+/// until [`shrink_to_fit`](Self::shrink_to_fit), [`reset`](Self::reset) or
+/// destruction. The default [`Flat`] directory has O(1) page lookups and
+/// memory following the highest page. Its finite
 /// range makes out-of-range insertions panic; lookups and removals return
 /// absent. [`Radix`](crate::page::Radix) accepts any `usize` index, uses directory
 /// memory proportional to installed pages, and looks up pages in O(depth).
@@ -504,19 +507,13 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
     }
 
     /// Iterates exclusively in ascending slot order without acquiring page locks.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut V)> {
-        self.pages.iter_mut().flat_map(|(number, page)| {
-            let base = number * PAGE;
-            page.data
-                .get_mut()
-                .slots
-                .iter_mut()
-                .enumerate()
-                .filter_map(move |(offset, slot)| {
-                    let (tag, value) = slot.as_mut()?;
-                    Some((K::from_parts(base + offset, *tag), value))
-                })
-        })
+    pub fn iter_mut(&mut self) -> DirectMapIterMut<'_, K, V, PAGE> {
+        DirectMapIterMut {
+            pages: self.pages.iter_mut(),
+            slots: slice::IterMut::default().enumerate(),
+            base: 0,
+            key: core::marker::PhantomData,
+        }
     }
 
     /// Removes entries without locking, retaining pages for reuse.
@@ -531,11 +528,84 @@ impl<K: DirectKey, V, const PAGE: usize, D: SharedDirectory> ConcurrentDirectMap
         }
     }
 
+    /// Removes all entries and returns owned pairs in ascending key-index order.
+    /// Keeps allocated pages for reuse.
+    pub fn drain(&mut self) -> IntoIter<(K, V)> {
+        let mut entries = Vec::with_capacity(self.len());
+        for (number, page) in self.pages.iter_mut() {
+            let data = page.data.get_mut();
+            let base = number * PAGE;
+            for offset in 0..data.slots.len() {
+                if let Some((tag, _)) = &data.slots[offset] {
+                    // Rebuild the key before removing its slot: custom key
+                    // implementations can panic.
+                    let key = K::from_parts(base + offset, *tag);
+                    let (_, value) = data.remove(offset, &self.len).expect("slot is occupied");
+                    entries.push((key, value));
+                }
+            }
+        }
+        entries.into_iter()
+    }
+
+    /// Frees pages that contain no entries. Flat directory chunks stay allocated.
+    /// Shared insertions can allocate those pages again.
+    pub fn shrink_to_fit(&mut self) {
+        self.pages
+            .retain(|_, page| page.data.get_mut().occupied != 0);
+    }
+
     /// Detaches and frees all pages. The map is empty even if a destructor panics.
     pub fn reset(&mut self) {
         let pages = mem::replace(&mut self.pages, D::Pages::<Page<K, V>>::new());
         self.len.reset();
         drop(pages);
+    }
+}
+
+impl<'a, K: DirectKey + 'a, V: 'a, const PAGE: usize, D: SharedDirectory> IntoIterator
+    for &'a mut ConcurrentDirectMap<K, V, PAGE, D>
+{
+    type Item = (K, &'a mut V);
+    type IntoIter = DirectMapIterMut<'a, K, V, PAGE>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+/// Iterates over a [`ConcurrentDirectMap`] in ascending key-index order,
+/// allowing each value to be mutated.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct DirectMapIterMut<'a, K: DirectKey, V, const PAGE: usize = DEFAULT_PAGE> {
+    pages: PageIterMut<'a, Page<K, V>>,
+    slots: core::iter::Enumerate<slice::IterMut<'a, Slot<K, V>>>,
+    base: usize,
+    // Yielded keys are rebuilt from tags on the iterating thread, so the
+    // iterator is Send/Sync only when K is, like the map borrow.
+    key: core::marker::PhantomData<&'a mut K>,
+}
+
+impl<'a, K: DirectKey, V, const PAGE: usize> Iterator for DirectMapIterMut<'a, K, V, PAGE> {
+    type Item = (K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            for (offset, slot) in self.slots.by_ref() {
+                if let Some((tag, value)) = slot {
+                    return Some((K::from_parts(self.base + offset, *tag), value));
+                }
+            }
+            let (number, page) = self.pages.next()?;
+            self.base = number * PAGE;
+            self.slots = page.data.get_mut().slots.iter_mut().enumerate();
+        }
+    }
+}
+
+impl<K: DirectKey, V, const PAGE: usize> fmt::Debug for DirectMapIterMut<'_, K, V, PAGE> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectMapIterMut").finish_non_exhaustive()
     }
 }
 

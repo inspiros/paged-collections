@@ -140,6 +140,11 @@ proptest! {
             prop_assert_eq!(concurrent.len(), plain.len());
             prop_assert_eq!(concurrent.is_empty(), plain.is_empty());
             prop_assert_eq!(concurrent.index_bound() as usize, plain.index_bound());
+            prop_assert_eq!(concurrent.iter().collect::<Vec<_>>(), plain.iter().collect::<Vec<_>>());
+            prop_assert_eq!(concurrent.iter().rev().collect::<Vec<_>>(), plain.iter().rev().collect::<Vec<_>>());
+            for index in 0..=concurrent.index_bound() {
+                prop_assert_eq!(concurrent.occupant(index), plain.occupant(index));
+            }
             for &id in &issued {
                 prop_assert_eq!(concurrent.is_live(id), plain.is_alive(id));
             }
@@ -162,7 +167,9 @@ fn conversion_preserves_last_generation_retirement_and_free_order() {
     let mut concurrent = ConcurrentIdAllocator::<2>::from(initial);
     let last = Id::new(0, NonZeroU32::new(MAX_GENERATION).unwrap());
     assert!(concurrent.is_live(last));
+    assert_eq!(concurrent.occupant(last.index()), Some(last));
     assert_eq!(concurrent.free(last), plain.free(last));
+    assert_eq!(concurrent.occupant(last.index()), None);
     let reused_last = concurrent.allocate();
     assert_eq!(reused_last, plain.alloc());
     assert_eq!(reused_last.index(), 1);
@@ -189,6 +196,40 @@ fn empty_default_and_debug() {
     assert!(ids.is_empty());
     assert!(format!("{ids:?}").contains("ConcurrentIdAllocator"));
     assert_eq!(ids.into_inner(), IdAllocator::new());
+}
+
+#[test]
+fn iteration_alongside_allocate_and_free_only_yields_issued_ids() {
+    use std::sync::Barrier;
+
+    let ids = ConcurrentIdAllocator::<4>::new();
+    let seed = ids.allocate();
+    let start = Barrier::new(2);
+    let rounds = if cfg!(miri) { 8 } else { 1_000 };
+    thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let mut issued = BTreeSet::new();
+            start.wait();
+            for _ in 0..rounds {
+                let id = ids.allocate();
+                issued.insert(id);
+                thread::yield_now();
+                assert!(ids.free(id));
+            }
+            issued
+        });
+        let mut seen = BTreeSet::new();
+        start.wait();
+        for _ in 0..rounds {
+            for id in &ids {
+                seen.insert(id);
+            }
+            thread::yield_now();
+        }
+        let mut issued = writer.join().unwrap();
+        issued.insert(seed);
+        assert!(seen.is_subset(&issued));
+    });
 }
 
 #[test]

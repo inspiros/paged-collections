@@ -2,7 +2,8 @@
 
 use alloc::boxed::Box;
 use core::marker::PhantomData;
-use core::ptr;
+use core::ops::Range;
+use core::{ptr, slice};
 
 use super::atomic::{AtomicPtr, Ordering};
 
@@ -131,55 +132,22 @@ impl<P, const CHUNKS: usize> Spine<P, CHUNKS> {
     }
 
     /// Installed pages in ascending order, weakly consistent across pages.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &P)> {
-        self.chunks.iter().enumerate().flat_map(move |(k, cell)| {
-            // Acquire observes publication; chunks remain installed while shared.
-            let len = if cell.load(Ordering::Acquire).is_null() {
-                0
-            } else {
-                BASE << k
-            };
-            (0..len).filter_map(move |offset| {
-                let number = (BASE << k) - BASE + offset;
-                self.get(number).map(|page| (number, page))
-            })
-        })
-    }
-
-    /// Installed pages in ascending order, with exclusive access to each.
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut P)> {
-        // The adapter below only stores atomic pointers, which are `Send`
-        // and `Sync` whatever `P` is. The marker ties the iterator's auto
-        // traits to `&mut P`, which it hands out.
-        ExclusivePages {
-            inner: self.iter_mut_raw(),
-            marker: PhantomData,
+    pub(crate) fn iter(&self) -> Iter<'_, P, CHUNKS> {
+        Iter {
+            spine: self,
+            next_chunk: 0,
+            pages: 0..0,
         }
     }
 
-    fn iter_mut_raw(&mut self) -> impl Iterator<Item = (usize, &mut P)> {
-        self.chunks.iter_mut().enumerate().flat_map(|(k, cell)| {
-            // Relaxed suffices: exclusive access rules out publication races.
-            let chunk = cell.load(Ordering::Relaxed);
-            let len = if chunk.is_null() { 0 } else { BASE << k };
-            let cells = if len == 0 {
-                &mut [][..]
-            } else {
-                // SAFETY: this installed allocation contains len cells; &mut
-                // self excludes every other reference into its pages or cells.
-                unsafe { core::slice::from_raw_parts_mut(chunk, len) }
-            };
-            cells
-                .iter_mut()
-                .enumerate()
-                .filter_map(move |(offset, cell)| {
-                    // Relaxed suffices under the directory's exclusive borrow.
-                    let page = cell.load(Ordering::Relaxed);
-                    // SAFETY: installed pages are distinct owned Boxes; exclusive
-                    // iteration visits each cell once and prevents shared access.
-                    unsafe { page.as_mut() }.map(|page| ((BASE << k) - BASE + offset, page))
-                })
-        })
+    /// Installed pages in ascending order, with exclusive access to each.
+    pub(crate) fn iter_mut(&mut self) -> IterMut<'_, P> {
+        IterMut {
+            chunks: self.chunks.iter_mut().enumerate(),
+            cells: slice::IterMut::default().enumerate(),
+            base: 0,
+            marker: PhantomData,
+        }
     }
 
     /// Takes page `page` out of the directory under exclusive access. Its
@@ -266,17 +234,71 @@ impl<P> Drop for Reclaim<'_, P> {
     }
 }
 
-/// Carries `&mut P`'s auto traits for [`Spine::iter_mut`].
-struct ExclusivePages<'a, P, I> {
-    inner: I,
+/// Shared traversal over installed spine pages.
+pub(crate) struct Iter<'a, P, const CHUNKS: usize> {
+    spine: &'a Spine<P, CHUNKS>,
+    next_chunk: usize,
+    pages: Range<usize>,
+}
+
+impl<'a, P, const CHUNKS: usize> Iterator for Iter<'a, P, CHUNKS> {
+    type Item = (usize, &'a P);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(page) = self
+                .pages
+                .find_map(|number| self.spine.get(number).map(|page| (number, page)))
+            {
+                return Some(page);
+            }
+            let k = self.next_chunk;
+            let cell = self.spine.chunks.get(k)?;
+            self.next_chunk += 1;
+            // Acquire observes publication; chunks remain installed while shared.
+            if !cell.load(Ordering::Acquire).is_null() {
+                let len = BASE << k;
+                let base = len - BASE;
+                self.pages = base..base + len;
+            }
+        }
+    }
+}
+
+/// Exclusive traversal over installed spine pages.
+pub(crate) struct IterMut<'a, P> {
+    chunks: core::iter::Enumerate<slice::IterMut<'a, AtomicPtr<AtomicPtr<P>>>>,
+    cells: core::iter::Enumerate<slice::IterMut<'a, AtomicPtr<P>>>,
+    base: usize,
     marker: PhantomData<&'a mut P>,
 }
 
-impl<'a, P: 'a, I: Iterator<Item = (usize, &'a mut P)>> Iterator for ExclusivePages<'a, P, I> {
+impl<'a, P> Iterator for IterMut<'a, P> {
     type Item = (usize, &'a mut P);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        loop {
+            for (offset, cell) in self.cells.by_ref() {
+                // Relaxed suffices under the directory's exclusive borrow.
+                let page = cell.load(Ordering::Relaxed);
+                // SAFETY: installed pages are distinct owned Boxes. Exclusive
+                // iteration visits each cell once and prevents shared access.
+                if let Some(page) = unsafe { page.as_mut() } {
+                    return Some((self.base + offset, page));
+                }
+            }
+            let (k, cell) = self.chunks.next()?;
+            let chunk = cell.load(Ordering::Relaxed);
+            if !chunk.is_null() {
+                let len = BASE << k;
+                self.base = len - BASE;
+                // SAFETY: this installed allocation contains len cells. The
+                // exclusive directory borrow and one visit per chunk make
+                // this the only slice borrowing these cells.
+                let cells = unsafe { slice::from_raw_parts_mut(chunk, len) };
+                self.cells = cells.iter_mut().enumerate();
+            }
+        }
     }
 }
 

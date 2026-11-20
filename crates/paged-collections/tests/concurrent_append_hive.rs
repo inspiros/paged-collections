@@ -62,6 +62,21 @@ fn id(index: u32, generation: u32) -> Id {
 }
 
 #[test]
+fn borrowed_for_loops_yield_ids_and_values() {
+    let mut hive = ConcurrentAppendHive::<_, 2>::new();
+    let first = hive.insert(1);
+    let second = hive.insert(2);
+    for (_, value) in &mut hive {
+        *value *= 10;
+    }
+    let mut entries = Vec::new();
+    for (id, value) in &hive {
+        entries.push((id, *value));
+    }
+    assert_eq!(entries, [(first, 10), (second, 20)]);
+}
+
+#[test]
 fn eight_inserters_publish_to_a_concurrent_reader() {
     const THREADS: usize = 8;
     let rounds = if cfg!(miri) { 12 } else { 1000 };

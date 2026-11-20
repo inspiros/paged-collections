@@ -231,6 +231,86 @@ fn id(index: u32, generation: u32) -> Id {
 }
 
 #[test]
+fn extend_and_collect_keep_first_occupants() {
+    let first = id(5, 1);
+    let next = id(5, 2);
+    let other = id(1, 1);
+    let mut set: ConcurrentSparseSet<Id, 2> = [first, next].into_iter().collect();
+    set.extend([next, other, first]);
+    assert_eq!(set.iter().copied().collect::<Vec<_>>(), [first, other]);
+
+    let mut map: ConcurrentSparseMap<Id, _, 2> =
+        [(first, 1), (next, 2), (first, 3)].into_iter().collect();
+    map.extend([(next, 4), (other, 5), (other, 6)]);
+    assert_eq!(map.get(&first), Some(&1));
+    assert_eq!(map.get(&next), None);
+    assert_eq!(map.get(&other), Some(&5));
+    assert_eq!(map.len(), 2);
+}
+
+#[test]
+fn drain_uses_dense_order_and_keeps_pages_for_reuse() {
+    let mut set: ConcurrentSparseSet<usize, 2> = [8, 1, 6, 4].into_iter().collect();
+    let mut map: ConcurrentSparseMap<usize, String, 2> = [8, 1, 6, 4]
+        .into_iter()
+        .map(|key| (key, key.to_string()))
+        .collect();
+    assert!(set.remove(1));
+    assert_eq!(map.remove(&1).as_deref(), Some("1"));
+    let set_pages: Vec<_> = set.pages().map(<[_]>::as_ptr).collect();
+
+    let drained_keys = set.drain();
+    let drained_entries = map.drain();
+    assert!(set.is_empty());
+    assert!(map.is_empty());
+    for key in [8, 4, 6] {
+        assert!(!set.contains(key));
+        assert!(!map.contains_key(&key));
+    }
+    assert_eq!(drained_keys.collect::<Vec<_>>(), [8, 4, 6]);
+    let entries: Vec<_> = drained_entries.collect();
+    assert_eq!(
+        entries,
+        [
+            (8, "8".to_owned()),
+            (4, "4".to_owned()),
+            (6, "6".to_owned())
+        ]
+    );
+    assert_eq!(set.drain().len(), 0);
+    assert_eq!(map.drain().len(), 0);
+
+    for (key, value) in entries {
+        assert!(set.insert(key));
+        assert!(map.try_insert(key, value).is_ok());
+    }
+    assert_eq!(
+        set.pages().map(<[_]>::as_ptr).collect::<Vec<_>>(),
+        set_pages
+    );
+}
+
+#[test]
+fn borrowed_for_loops_preserve_sparse_items_and_order() {
+    let set: ConcurrentSparseSet<usize, 2> = [9, 2, 4].into_iter().collect();
+    let mut map: ConcurrentSparseMap<usize, _, 2> =
+        [9, 2, 4].into_iter().map(|key| (key, key)).collect();
+    let mut keys = Vec::new();
+    for &key in &set {
+        keys.push(key);
+    }
+    assert_eq!(keys, [9, 2, 4]);
+    for (&key, value) in &mut map {
+        *value += key;
+    }
+    let mut entries = Vec::new();
+    for (&key, &value) in &map {
+        entries.push((key, value));
+    }
+    assert_eq!(entries, [(9, 18), (2, 4), (4, 8)]);
+}
+
+#[test]
 fn occupied_generations_are_refused_and_removal_reindexes_the_moved_entry() {
     let a = id(1, 1);
     let newer = id(1, 2);

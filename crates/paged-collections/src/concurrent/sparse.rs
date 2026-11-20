@@ -1,14 +1,15 @@
 //! Insert-only shared sparse collections; editing requires exclusive access.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
+use alloc::vec::{IntoIter, Vec};
 use core::fmt;
 use core::iter::FusedIterator;
 
-use super::append::AppendLog;
+use super::append::{AppendLog, DenseIter};
 use super::atomic::{AtomicU32, Ordering};
 use super::directory::{SharedDirectory, SharedPages};
 use super::index::retry;
+use super::vec::VecIterMut;
 use crate::key::Key;
 use crate::page::{DEFAULT_PAGE, Flat};
 use crate::sparse_map::PagedSparseMap;
@@ -359,7 +360,7 @@ impl<K: Key, const PAGE: usize, D: SharedDirectory> ConcurrentSparseSet<K, PAGE,
     }
 
     /// Iterates over a snapshot of the committed keys in dense order.
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &K> + ExactSizeIterator + FusedIterator {
+    pub fn iter(&self) -> DenseIter<'_, K, PAGE> {
         self.dense.iter()
     }
 
@@ -405,16 +406,31 @@ impl<K: Key, const PAGE: usize, D: SharedDirectory> ConcurrentSparseSet<K, PAGE,
     /// Removes every key and clears readiness, retaining allocated pages.
     /// Takes O(len) time.
     pub fn clear(&mut self) {
-        while let Some(last) = self.dense.len().checked_sub(1) {
-            let key = *self.dense.get(last).expect("last key exists");
-            let slot = self
-                .index
-                .slot(key.index())
-                .expect("present key has a slot");
-            let _ = self.dense.pop();
-            // Relaxed: exclusive access; no lookup can observe the change.
-            slot.store(0, Ordering::Relaxed);
+        while self.pop_key().is_some() {}
+    }
+
+    /// Removes all keys and returns them in dense order. Keeps allocated pages.
+    /// Takes O(len) time and temporary storage.
+    pub fn drain(&mut self) -> IntoIter<K> {
+        let mut keys = Vec::with_capacity(self.len());
+        while let Some(key) = self.pop_key() {
+            keys.push(key);
         }
+        keys.reverse();
+        keys.into_iter()
+    }
+
+    fn pop_key(&mut self) -> Option<K> {
+        let last = self.dense.len().checked_sub(1)?;
+        let key = *self.dense.get(last).expect("last key exists");
+        let slot = self
+            .index
+            .slot(key.index())
+            .expect("present key has a slot");
+        let key = self.dense.pop();
+        // Relaxed: exclusive access; no lookup can observe the change.
+        slot.store(0, Ordering::Relaxed);
+        key
     }
 
     /// Copies the committed prefix into a plain set in O(prefix length).
@@ -428,6 +444,17 @@ impl<K: Key, const PAGE: usize, D: SharedDirectory> ConcurrentSparseSet<K, PAGE,
     /// Moves keys into the plain set with the same directory in dense order, in O(len).
     pub fn into_inner(self) -> PagedSparseSet<K, PAGE, D> {
         self.dense.into_inner().into_iter().collect()
+    }
+}
+
+impl<'a, K: Key, const PAGE: usize, D: SharedDirectory> IntoIterator
+    for &'a ConcurrentSparseSet<K, PAGE, D>
+{
+    type Item = &'a K;
+    type IntoIter = DenseIter<'a, K, PAGE>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -457,11 +484,18 @@ impl<K: Key, const PAGE: usize, D: SharedDirectory> FromIterator<K>
     for ConcurrentSparseSet<K, PAGE, D>
 {
     fn from_iter<I: IntoIterator<Item = K>>(iter: I) -> Self {
-        let result = Self::new();
-        for key in iter {
-            result.insert(key);
-        }
+        let mut result = Self::new();
+        result.extend(iter);
         result
+    }
+}
+
+/// Inserts keys in input order, keeping the first occupant of each slot.
+impl<K: Key, const PAGE: usize, D: SharedDirectory> Extend<K> for ConcurrentSparseSet<K, PAGE, D> {
+    fn extend<I: IntoIterator<Item = K>>(&mut self, iter: I) {
+        for key in iter {
+            self.insert(key);
+        }
     }
 }
 
@@ -646,10 +680,10 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentSparseMap<K, V,
     }
 
     /// Iterates over a snapshot of committed `(&key, &value)` pairs.
-    pub fn iter(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (&K, &V)> + ExactSizeIterator + FusedIterator {
-        self.dense.iter().map(|(key, value)| (key, value))
+    pub fn iter(&self) -> SparseMapIter<'_, K, V, PAGE> {
+        SparseMapIter {
+            inner: self.dense.iter(),
+        }
     }
 
     /// Mutable access to a matching key's value under exclusive access.
@@ -689,25 +723,43 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentSparseMap<K, V,
 
     /// Iterates over `(&key, &mut value)` pairs under exclusive access.
     /// Keys cannot be changed, preserving the sparse index.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
-        self.dense.iter_mut().map(|(key, value)| (&*key, value))
+    pub fn iter_mut(&mut self) -> SparseMapIterMut<'_, K, V> {
+        SparseMapIterMut {
+            inner: VecIterMut::new(&mut self.dense),
+        }
     }
 
     /// Drops every entry and clears readiness, retaining pages. Takes O(len).
     /// If a destructor panics, that entry is gone; remaining entries keep
     /// their sparse positions and may still be used.
     pub fn clear(&mut self) {
-        while let Some(last) = self.dense.len().checked_sub(1) {
-            let key = self.dense.get(last).expect("last entry exists").0;
-            let slot = self
-                .index
-                .slot(key.index())
-                .expect("present key has a slot");
-            let entry = self.dense.pop();
-            // Relaxed: exclusive access; clear the slot before user drop code.
-            slot.store(0, Ordering::Relaxed);
+        while let Some(entry) = self.pop_entry() {
             drop(entry);
         }
+    }
+
+    /// Removes all entries and returns them as `(key, value)` pairs in dense order.
+    /// Keeps allocated pages. Takes O(len) time and temporary storage.
+    pub fn drain(&mut self) -> IntoIter<(K, V)> {
+        let mut entries = Vec::with_capacity(self.len());
+        while let Some(entry) = self.pop_entry() {
+            entries.push(entry);
+        }
+        entries.reverse();
+        entries.into_iter()
+    }
+
+    fn pop_entry(&mut self) -> Option<(K, V)> {
+        let last = self.dense.len().checked_sub(1)?;
+        let key = self.dense.get(last).expect("last entry exists").0;
+        let slot = self
+            .index
+            .slot(key.index())
+            .expect("present key has a slot");
+        let entry = self.dense.pop();
+        // Relaxed: exclusive access; clear the slot before user drop code.
+        slot.store(0, Ordering::Relaxed);
+        entry
     }
 
     /// Clones the committed prefix into a plain map in O(prefix length).
@@ -727,6 +779,96 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentSparseMap<K, V,
     /// Values move without cloning; their addresses can change.
     pub fn into_inner(self) -> PagedSparseMap<K, V, PAGE, D> {
         self.dense.into_inner().into_iter().collect()
+    }
+}
+
+impl<'a, K: Key, V, const PAGE: usize, D: SharedDirectory> IntoIterator
+    for &'a ConcurrentSparseMap<K, V, PAGE, D>
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = SparseMapIter<'a, K, V, PAGE>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, K: Key, V, const PAGE: usize, D: SharedDirectory> IntoIterator
+    for &'a mut ConcurrentSparseMap<K, V, PAGE, D>
+{
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = SparseMapIterMut<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+/// Iterates over the committed entries of a [`ConcurrentSparseMap`] in dense order.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct SparseMapIter<'a, K, V, const PAGE: usize = DEFAULT_PAGE> {
+    inner: DenseIter<'a, (K, V), PAGE>,
+}
+
+impl<'a, K, V, const PAGE: usize> Iterator for SparseMapIter<'a, K, V, PAGE> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.nth(0)
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n).map(|(key, value)| (key, value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V, const PAGE: usize> DoubleEndedIterator for SparseMapIter<'_, K, V, PAGE> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.nth_back(0)
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n).map(|(key, value)| (key, value))
+    }
+}
+
+impl<K, V, const PAGE: usize> ExactSizeIterator for SparseMapIter<'_, K, V, PAGE> {}
+impl<K, V, const PAGE: usize> FusedIterator for SparseMapIter<'_, K, V, PAGE> {}
+
+impl<K, V, const PAGE: usize> fmt::Debug for SparseMapIter<'_, K, V, PAGE> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SparseMapIter")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+/// Iterates over the entries of a [`ConcurrentSparseMap`] in dense order,
+/// allowing each value to be mutated.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct SparseMapIterMut<'a, K, V> {
+    inner: VecIterMut<'a, (K, V)>,
+}
+
+impl<'a, K, V> Iterator for SparseMapIterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(key, value)| (&*key, value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V> fmt::Debug for SparseMapIterMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SparseMapIterMut").finish_non_exhaustive()
     }
 }
 
@@ -760,11 +902,29 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> From<PagedSparseMap<K, V,
     for ConcurrentSparseMap<K, V, PAGE, D>
 {
     fn from(inner: PagedSparseMap<K, V, PAGE, D>) -> Self {
-        let result = Self::new();
-        for (key, value) in inner {
-            let _ = result.try_insert(key, value);
-        }
+        inner.into_iter().collect()
+    }
+}
+
+/// Collects entries in input order, keeping the first occupant of each slot.
+impl<K: Key, V, const PAGE: usize, D: SharedDirectory> FromIterator<(K, V)>
+    for ConcurrentSparseMap<K, V, PAGE, D>
+{
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let mut result = Self::new();
+        result.extend(iter);
         result
+    }
+}
+
+/// Inserts entries in input order, keeping the first occupant of each slot.
+impl<K: Key, V, const PAGE: usize, D: SharedDirectory> Extend<(K, V)>
+    for ConcurrentSparseMap<K, V, PAGE, D>
+{
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        for (key, value) in iter {
+            let _ = self.try_insert(key, value);
+        }
     }
 }
 

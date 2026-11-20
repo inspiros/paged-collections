@@ -55,6 +55,82 @@ fn contents<K: DirectKey, V: Clone, const PAGE: usize, D: SharedDirectory>(
     entries
 }
 
+#[test]
+fn exclusive_iteration_and_drain_follow_key_index_order() {
+    fn check<D: SharedDirectory>() {
+        let mut map = ConcurrentDirectMap::<usize, _, 3, D>::new();
+        for key in [18, 0, 8, 7] {
+            map.insert(key, key);
+        }
+        let pages = map.allocated_pages();
+        let mut seen = Vec::new();
+        for (key, value) in &mut map {
+            seen.push(key);
+            *value += 1;
+        }
+        assert_eq!(seen, [0, 7, 8, 18]);
+
+        let entries = map.drain();
+        assert!(map.is_empty());
+        assert_eq!(map.allocated_pages(), pages);
+        assert!(map.iter_mut().next().is_none());
+        assert_eq!(
+            entries.collect::<Vec<_>>(),
+            [(0, 1), (7, 8), (8, 9), (18, 19)]
+        );
+        assert_eq!(map.drain().len(), 0);
+        assert_eq!(map.insert(7, 42), None);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.allocated_pages(), pages);
+    }
+    check::<Flat>();
+    check::<Radix>();
+}
+
+#[test]
+fn shrink_releases_empty_pages_and_keeps_live_values_in_place() {
+    fn check<D: SharedDirectory>(last: usize) {
+        let mut map = ConcurrentDirectMap::<usize, _, 3, D>::new();
+        let mut model = BTreeMap::new();
+        for (key, value) in [(18, 1), (0, 2), (8, 3), (7, 4), (last, 5)] {
+            assert_eq!(map.insert(key, value), model.insert(key, value));
+        }
+        for key in [0, 7, 18] {
+            assert_eq!(map.remove(key), model.remove(&key));
+        }
+        let before = map.allocated_pages();
+        let live = map.with(8, std::ptr::from_ref).unwrap();
+        map.shrink_to_fit();
+        map.shrink_to_fit();
+        assert_eq!(map.allocated_pages(), before - 2);
+        assert_eq!(map.len(), model.len());
+        assert_eq!(map.with(8, std::ptr::from_ref), Some(live));
+        assert!(
+            contents(&map)
+                .into_iter()
+                .eq(model.iter().map(|(&key, &v)| (key, v)))
+        );
+
+        let shared = &map;
+        for key in [0, 18] {
+            assert_eq!(shared.insert(key, 6), model.insert(key, 6));
+        }
+        assert_eq!(shared.allocated_pages(), before);
+        assert_eq!(shared.len(), model.len());
+        assert_eq!(
+            contents(shared).into_iter().collect::<BTreeMap<_, _>>(),
+            model
+        );
+        map.clear();
+        map.shrink_to_fit();
+        assert_eq!(map.allocated_pages(), 0);
+        assert_eq!(map.insert(last, 7), None);
+        assert_eq!(map.allocated_pages(), 1);
+    }
+    check::<Flat>(121);
+    check::<Radix>(usize::MAX);
+}
+
 fn sequential_model_for<D: SharedDirectory>(
     ops: Vec<(u8, usize, u8, i16)>,
 ) -> Result<(), TestCaseError> {
@@ -590,7 +666,9 @@ fn auto_traits_need_only_shared_directory() {
     fn check<D: SharedDirectory>() {
         fn send<T: Send>() {}
         fn sync<T: Sync>() {}
+        fn check_iterator<T: Send>(_: T) {}
         send::<ConcurrentDirectMap<usize, std::cell::Cell<u8>, 2, D>>();
+        check_iterator(ConcurrentDirectMap::<usize, std::cell::Cell<u8>, 2, D>::new().iter_mut());
         sync::<ConcurrentDirectMap<usize, u8, 2, D>>();
         trait AmbiguousSend<A> {
             fn check() {}

@@ -3,6 +3,8 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
+use core::iter::FusedIterator;
+use core::ops::Range;
 
 use super::atomic::{AtomicU32, Ordering};
 use super::count::StripedLen;
@@ -85,6 +87,7 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
     /// # Panics
     ///
     /// Panics when all [`MAX_INDICES`] indices are live or retired.
+    #[doc(alias = "alloc")]
     pub fn allocate(&self) -> Id {
         self.try_allocate().unwrap_or_else(|| {
             panic!("ConcurrentIdAllocator: all {MAX_INDICES} indices are live or retired")
@@ -93,6 +96,7 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
 
     /// Like [`allocate`](Self::allocate), returning `None` on exhaustion.
     /// A concurrent free may make room immediately after the stack is checked.
+    #[doc(alias = "try_alloc")]
     pub fn try_allocate(&self) -> Option<Id> {
         loop {
             let (index, reused) = self.free.next_index(
@@ -161,6 +165,7 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
     }
 
     /// Whether this generation is live at the instant its version is read.
+    #[doc(alias = "is_alive")]
     pub fn is_live(&self, id: Id) -> bool {
         let Some(live) = live_version(id.generation()) else {
             return false;
@@ -169,6 +174,26 @@ impl<const PAGE: usize> ConcurrentIdAllocator<PAGE> {
         // version never returns to an earlier live value in this history.
         self.slot(id.index())
             .is_some_and(|slot| slot.version.load(Ordering::Acquire) == live)
+    }
+
+    /// Returns the live id at `index` when the slot's version is read.
+    /// A concurrent free can invalidate the returned id immediately.
+    pub fn occupant(&self, index: u32) -> Option<Id> {
+        // Acquire observes publication of this generation or its invalidation.
+        let version = self.slot(index)?.version.load(Ordering::Acquire);
+        (version % 2 == 1).then(|| Id::new(index, generation_of(version)))
+    }
+
+    /// Scans for live ids in index order, up to the index bound read at creation.
+    ///
+    /// This iterator takes no snapshot. Each slot is read once. Allocations
+    /// and frees during the scan may or may not be reflected, and a returned
+    /// id may already have been freed.
+    pub fn iter(&self) -> IdAllocIter<'_, PAGE> {
+        IdAllocIter {
+            allocator: self,
+            indices: 0..self.index_bound(),
+        }
     }
 
     /// Number of live ids; approximate while other threads allocate or free.
@@ -361,6 +386,54 @@ impl<const PAGE: usize> fmt::Debug for ConcurrentIdAllocator<PAGE> {
         f.debug_struct("ConcurrentIdAllocator")
             .field("len", &self.len())
             .field("index_bound", &self.index_bound())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, const PAGE: usize> IntoIterator for &'a ConcurrentIdAllocator<PAGE> {
+    type Item = Id;
+    type IntoIter = IdAllocIter<'a, PAGE>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Weakly consistent iterator over live ids of a [`ConcurrentIdAllocator`].
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct IdAllocIter<'a, const PAGE: usize = DEFAULT_PAGE> {
+    allocator: &'a ConcurrentIdAllocator<PAGE>,
+    indices: Range<u32>,
+}
+
+impl<const PAGE: usize> Iterator for IdAllocIter<'_, PAGE> {
+    type Item = Id;
+
+    fn next(&mut self) -> Option<Id> {
+        self.indices
+            .find_map(|index| self.allocator.occupant(index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.indices.len()))
+    }
+}
+
+impl<const PAGE: usize> DoubleEndedIterator for IdAllocIter<'_, PAGE> {
+    fn next_back(&mut self) -> Option<Id> {
+        self.indices
+            .by_ref()
+            .rev()
+            .find_map(|index| self.allocator.occupant(index))
+    }
+}
+
+impl<const PAGE: usize> FusedIterator for IdAllocIter<'_, PAGE> {}
+
+impl<const PAGE: usize> fmt::Debug for IdAllocIter<'_, PAGE> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IdAllocIter")
+            .field("indices", &self.indices)
             .finish_non_exhaustive()
     }
 }
