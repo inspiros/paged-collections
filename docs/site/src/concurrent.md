@@ -30,7 +30,7 @@ need `&mut self`.
 | `ConcurrentPagedVec<T>` | push | removal, editing, `shrink_to_fit`, conversion | `&T` |
 | `ConcurrentQueue<T>` (Python `ConcurrentQueue`) | push, pop | clear, drain, `shrink_to_fit` | owned value from `pop` |
 | `ConcurrentPriorityQueue<K, P>` (Python `ConcurrentPriorityQueue`, `ConcurrentPriorityQueueF64`) | push, change priority, remove, pop | clear, drain, `shrink_to_fit` | cloned priority or closure |
-| `ConcurrentSparseSet<K>`, `ConcurrentSparseMap<K, V>` | insert | removal, clear, drain, conversion | `&K`, `&V` |
+| `ConcurrentSparseSet<K>`, `ConcurrentSparseMap<K, V>` | insert | removal, clear, drain, `shrink_to_fit`, conversion | `&K`, `&V` |
 | `ConcurrentDirectMap<K, V>` | insert, replace, remove, entry (per-page `RwLock`) | `drain`, `shrink_to_fit`, `reset`, `into_inner` | closures (`with`), clones (`get_cloned`), entry guards |
 | `AtomicDirectMap` (`usize -> u64`) | lock-free insert, update, remove | `shrink_to_fit` | copied `u64` |
 | `AtomicIdMap` (`Id -> u32`) | lock-free insert, update, remove | `shrink_to_fit` | copied `u32` |
@@ -49,6 +49,8 @@ Notes per type:
   hole-free prefix that can lag while an earlier push is in flight.
   `shrink_to_fit` frees pages wholly beyond the vector's length.
 - **Sparse set and map**: entries cannot be removed or changed while shared.
+  `shrink_to_fit` frees index pages with no entry and dense pages beyond the
+  last entry; stored entries keep their addresses.
   Inserts of the same slot wait for its writer; other slots proceed
   independently. An occupied slot refuses other generations. Each
   `try_insert` reserves a dense position from one shared counter; under

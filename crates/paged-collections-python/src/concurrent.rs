@@ -208,6 +208,11 @@ impl ConcurrentSparseSet {
         self.set.clear();
     }
 
+    /// Free pages with no keys. Requires exclusive access; conflicts raise RuntimeError.
+    fn shrink_to_fit(&mut self) {
+        self.set.shrink_to_fit();
+    }
+
     fn __repr__(&self) -> String {
         let keys = crate::truncated(self.set.iter().map(Key::to_string));
         format!("ConcurrentSparseSet([{keys}])")
@@ -228,7 +233,7 @@ macro_rules! concurrent_map {
             $semantics,
             "\n\nKeys are uint32; values and snapshots are copied, with no guards or views. ",
             "Batch methods release the GIL; single-key calls do not. ",
-            "clear and sparse remove/remove_many require exclusive access: conflicts ",
+            "clear, shrink_to_fit and sparse remove/remove_many require exclusive access: conflicts ",
             "with shared calls raise RuntimeError (Already borrowed). ",
             "Uses the default Rust page size and Flat directory. ",
             "Pickling and copy() take one weakly consistent snapshot. ",
@@ -399,6 +404,12 @@ macro_rules! sparse_map {
 
             fn try_insert(&self, key: &Bound<'_, PyAny>, value: $t) -> PyResult<bool> {
                 Ok(self.map.try_insert(insert_key(key)?, value).is_ok())
+            }
+
+            /// Free pages with no entries. Requires exclusive access; conflicts
+            /// raise RuntimeError.
+            fn shrink_to_fit(&mut self) {
+                self.map.shrink_to_fit();
             }
 
             fn get_or_insert(&self, key: &Bound<'_, PyAny>, value: $t) -> PyResult<$t> {

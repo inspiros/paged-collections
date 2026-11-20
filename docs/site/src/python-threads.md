@@ -10,12 +10,12 @@ classes support shared access from threads.
 |---|---|---|
 | Shared inserts | set: `insert`, `insert_many`; maps: `try_insert`, `get_or_insert`, `insert_many` | `m[k] = v`, `insert`, `try_insert`, `get_or_insert`, `setdefault`, `set_many` |
 | Shared removal | no | `del m[k]`, `remove`, `remove_many` |
-| Exclusive (conflicts raise) | `remove`, `remove_many`, `clear` | `clear`, `shrink_to_fit` |
+| Exclusive (conflicts raise) | `remove`, `remove_many`, `clear`, `shrink_to_fit` | `clear`, `shrink_to_fit` |
 
 On a direct map, assignment, `insert` and `set_many` replace a stored value.
 `get_or_insert(key, value)` and `setdefault(key, value)` atomically insert if
-the key is absent and return the stored value. `shrink_to_fit()` frees pages
-with no live entries. Concurrent sparse map insertions keep existing values.
+the key is absent and return the stored value. `shrink_to_fit()` (on every
+concurrent set and map) frees pages with no live entries. Concurrent sparse map insertions keep existing values.
 
 - Default page size and `Flat` directory only; the constructors take no
   `page_size=`.

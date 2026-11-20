@@ -88,6 +88,17 @@ impl<const PAGE: usize, D: SharedDirectory> Index<PAGE, D> {
         &page.slots[index % PAGE]
     }
 
+    /// Drops index pages with no occupied slot. Exclusive access means no
+    /// insertion holds a reservation, so every slot is empty or a position.
+    fn shrink_to_fit(&mut self) {
+        self.pages.retain(|_, page| {
+            page.slots
+                .iter()
+                // Relaxed: exclusive access excludes concurrent slot writers.
+                .any(|slot| slot.load(Ordering::Relaxed) != 0)
+        });
+    }
+
     fn position(&self, index: usize) -> Option<usize> {
         // Acquire observes the dense entry written before position publication.
         match self.slot(index)?.load(Ordering::Acquire) {
@@ -407,6 +418,28 @@ impl<K: Key, const PAGE: usize, D: SharedDirectory> ConcurrentSparseSet<K, PAGE,
     /// Takes O(len) time.
     pub fn clear(&mut self) {
         while self.pop_key().is_some() {}
+    }
+
+    /// Frees index pages with no key and dense pages beyond the last key,
+    /// keeping directory chunks. Stored keys keep their addresses and
+    /// positions. Shared inserts can allocate the released pages again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use paged_collections::concurrent::ConcurrentSparseSet;
+    ///
+    /// let mut set: ConcurrentSparseSet<usize, 4> = (0..64).collect();
+    /// for key in 2..64 {
+    ///     set.remove(key);
+    /// }
+    /// set.shrink_to_fit();
+    /// assert_eq!(set.pages().count(), 1);
+    /// assert!(set.insert(40));
+    /// ```
+    pub fn shrink_to_fit(&mut self) {
+        self.index.shrink_to_fit();
+        self.dense.shrink_to_fit();
     }
 
     /// Removes all keys and returns them in dense order. Keeps allocated pages.
@@ -736,6 +769,14 @@ impl<K: Key, V, const PAGE: usize, D: SharedDirectory> ConcurrentSparseMap<K, V,
         while let Some(entry) = self.pop_entry() {
             drop(entry);
         }
+    }
+
+    /// Frees index pages with no entry and dense pages beyond the last entry,
+    /// keeping directory chunks. Stored entries keep their addresses and
+    /// positions. Shared inserts can allocate the released pages again.
+    pub fn shrink_to_fit(&mut self) {
+        self.index.shrink_to_fit();
+        self.dense.shrink_to_fit();
     }
 
     /// Removes all entries and returns them as `(key, value)` pairs in dense order.

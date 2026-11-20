@@ -290,6 +290,62 @@ fn drain_uses_dense_order_and_keeps_pages_for_reuse() {
     );
 }
 
+fn shrink_case<D: SharedDirectory>(keys: &[usize], keep: usize) {
+    let mut set: ConcurrentSparseSet<usize, 2, D> = keys.iter().copied().collect();
+    let mut map: ConcurrentSparseMap<usize, String, 2, D> =
+        keys.iter().map(|&k| (k, k.to_string())).collect();
+    for &key in &keys[keep..] {
+        assert!(set.remove(key));
+        assert_eq!(map.remove(&key), Some(key.to_string()));
+    }
+    let set_live: Vec<_> = set.iter().map(std::ptr::from_ref).collect();
+    let map_live: Vec<_> = map.iter().map(|(_, v)| std::ptr::from_ref(v)).collect();
+    set.shrink_to_fit();
+    map.shrink_to_fit();
+    set.shrink_to_fit();
+    map.shrink_to_fit();
+    assert_eq!(
+        set.iter().map(std::ptr::from_ref).collect::<Vec<_>>(),
+        set_live
+    );
+    assert_eq!(
+        map.iter()
+            .map(|(_, v)| std::ptr::from_ref(v))
+            .collect::<Vec<_>>(),
+        map_live
+    );
+    assert_eq!(set.pages().count(), keep.div_ceil(2));
+    for (i, &key) in keys.iter().enumerate() {
+        assert_eq!(set.contains(key), i < keep);
+        assert_eq!(map.get(&key).is_some(), i < keep);
+    }
+    // Shared inserts reinstall released index and dense pages.
+    let shared_set = &set;
+    let shared_map = &map;
+    for &key in &keys[keep..] {
+        assert!(shared_set.insert(key));
+        assert!(shared_map.try_insert(key, key.to_string()).is_ok());
+    }
+    for &key in keys {
+        assert!(set.contains(key));
+        assert_eq!(map.get(&key), Some(&key.to_string()));
+    }
+    assert_eq!(set.len(), keys.len());
+    assert_eq!(map.len(), keys.len());
+}
+
+#[test]
+fn shrink_releases_empty_pages_and_shared_inserts_reinstall_them() {
+    let keys: Vec<usize> = (0..40).map(|i| i * 3).collect();
+    for keep in [0, 1, 5, 40] {
+        shrink_case::<Flat>(&keys, keep);
+    }
+    let wide = [0, 1, 7, 1 << 20, usize::MAX - 1, usize::MAX, 1 << 40, 5];
+    for keep in [0, 2, 8] {
+        shrink_case::<Radix>(&wide, keep);
+    }
+}
+
 #[test]
 fn borrowed_for_loops_preserve_sparse_items_and_order() {
     let set: ConcurrentSparseSet<usize, 2> = [9, 2, 4].into_iter().collect();
@@ -516,6 +572,11 @@ fn set_model<D: SharedDirectory, K: Key + std::fmt::Debug>(
                 prop_assert_eq!(moved.as_slice(), plain.as_slice());
                 set = ConcurrentSparseSet::from(moved);
             }
+            5 => {
+                let live: Vec<_> = set.iter().map(std::ptr::from_ref).collect();
+                set.shrink_to_fit();
+                prop_assert_eq!(set.iter().map(std::ptr::from_ref).collect::<Vec<_>>(), live);
+            }
             _ => {
                 prop_assert_eq!(set.position(key), plain.position(key));
             }
@@ -596,6 +657,16 @@ fn map_model<D: SharedDirectory, K: Key + std::fmt::Debug>(
                 };
                 prop_assert_eq!(map.get_or_insert_with(key, || value).copied(), expected);
             }
+            7 => {
+                let live: Vec<_> = map.iter().map(|(_, v)| std::ptr::from_ref(v)).collect();
+                map.shrink_to_fit();
+                prop_assert_eq!(
+                    map.iter()
+                        .map(|(_, v)| std::ptr::from_ref(v))
+                        .collect::<Vec<_>>(),
+                    live
+                );
+            }
             _ => {
                 prop_assert_eq!(map.get(&key), plain.get(key));
             }
@@ -621,28 +692,28 @@ proptest! {
 
     #[test]
     fn set_matches_plain_set_with_generations_and_conversions(
-        actions in prop::collection::vec((0u8..6, 0u32..24, 1u32..4), 0..if cfg!(miri) { 20 } else { 200 })
+        actions in prop::collection::vec((0u8..7, 0u32..24, 1u32..4), 0..if cfg!(miri) { 20 } else { 200 })
     ) {
         set_model::<Flat, Id>(actions.into_iter().map(|(a, i, g)| (a, i as usize, g)).collect(), |i, g| id(i as u32, g))?;
     }
 
     #[test]
     fn map_matches_plain_insert_only_semantics_with_exclusive_edits(
-        actions in prop::collection::vec((0u8..8, 0u32..24, 1u32..4, any::<i16>()), 0..if cfg!(miri) { 20 } else { 200 })
+        actions in prop::collection::vec((0u8..9, 0u32..24, 1u32..4, any::<i16>()), 0..if cfg!(miri) { 20 } else { 200 })
     ) {
         map_model::<Flat, Id>(actions.into_iter().map(|(a, i, g, v)| (a, i as usize, g, v)).collect(), |i, g| id(i as u32, g))?;
     }
 
     #[test]
     fn radix_set_matches_plain_set(
-        actions in prop::collection::vec((0u8..6, wide_index(), 1u32..4), 0..if cfg!(miri) { 20 } else { 200 })
+        actions in prop::collection::vec((0u8..7, wide_index(), 1u32..4), 0..if cfg!(miri) { 20 } else { 200 })
     ) {
         set_model::<Radix, WideKey>(actions, |index, generation| WideKey { index, generation })?;
     }
 
     #[test]
     fn radix_map_matches_plain_map(
-        actions in prop::collection::vec((0u8..8, wide_index(), 1u32..4, any::<i16>()), 0..if cfg!(miri) { 20 } else { 200 })
+        actions in prop::collection::vec((0u8..9, wide_index(), 1u32..4, any::<i16>()), 0..if cfg!(miri) { 20 } else { 200 })
     ) {
         map_model::<Radix, WideKey>(actions, |index, generation| WideKey { index, generation })?;
     }

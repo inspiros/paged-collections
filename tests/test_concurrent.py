@@ -141,6 +141,32 @@ def test_direct_shrink_to_fit_requires_exclusive_access():
     assert m.items() == [(1, 10), (4096, 30)]
 
 
+def test_sparse_shrink_to_fit_keeps_entries_and_allows_reinsertion():
+    s = pc.ConcurrentSparseSet(range(0, 50_000, 7))
+    m = pc.ConcurrentSparseMapF64(range(0, 50_000, 7), [1.0] * len(range(0, 50_000, 7)))
+    s.remove_many(range(7, 50_000, 7))
+    m.remove_many(range(7, 50_000, 7))
+    s.shrink_to_fit()
+    m.shrink_to_fit()
+    assert list(s) == [0]
+    assert m.items() == [(0, 1.0)]
+    assert s.insert_many(range(0, 50_000, 7)) == len(range(7, 50_000, 7))
+    assert m.insert_many(range(0, 50_000, 7), [2.0] * len(range(0, 50_000, 7))) == len(range(7, 50_000, 7))
+    assert len(s) == len(m) == len(range(0, 50_000, 7))
+    assert m[0] == 1.0 and m[49_994] == 2.0
+
+
+def test_sparse_shrink_to_fit_requires_exclusive_access():
+    m = pc.ConcurrentSparseMapI64([1, 4096], [10, 20])
+
+    def keys():
+        with pytest.raises(RuntimeError, match="^Already borrowed$"):
+            m.shrink_to_fit()
+        yield 1
+
+    assert m.contains_many(keys()).tolist() == [True]
+
+
 def test_set_semantics_and_snapshots():
     s, oracle = pc.ConcurrentSparseSet(), set()
     rng = random.Random(101)
