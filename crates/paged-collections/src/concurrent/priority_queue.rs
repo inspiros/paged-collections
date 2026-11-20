@@ -392,8 +392,14 @@ impl<K: Key, P: Ord, const PAGE: usize, D: Directory> ConcurrentPriorityQueue<K,
         }
 
         let start = self.random_index(self.shards());
-        self.shard_indices_from(start)
-            .find_map(|index| self.shards[index].0.update(PagedPriorityQueue::pop))
+        let found = self
+            .shard_indices_from(start)
+            .find_map(|index| self.shards[index].0.update(PagedPriorityQueue::pop));
+        #[cfg(all(test, loom))]
+        if found.is_some() {
+            SCAN_FOUND.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        found
     }
 
     /// Removes the global maximum, or returns `None` if empty.
@@ -650,6 +656,11 @@ mod serde_impl {
         }
     }
 }
+
+/// Set when `pop` finds an entry only in its fallback scan (a plain atomic
+/// outside the loom model): the scan model asserts it is reached.
+#[cfg(all(test, loom))]
+static SCAN_FOUND: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[cfg(all(test, loom))]
 #[path = "loom_priority_queue.rs"]

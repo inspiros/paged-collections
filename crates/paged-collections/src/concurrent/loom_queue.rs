@@ -9,7 +9,9 @@ use loom::thread;
 use std::sync::atomic::{AtomicBool, Ordering as CoverageOrdering};
 
 use super::super::free_stack::set_loom_shard;
-use super::{BOUNDARY_WAITED, ConcurrentQueue, Ordering, PopStep, REUSED_BLOCK, SHIFT};
+use super::{
+    BOUNDARY_WAITED, ConcurrentQueue, INSTALL_LOST, Ordering, PopStep, REUSED_BLOCK, SHIFT,
+};
 
 fn model(f: impl Fn() + Send + Sync + 'static) {
     model_with_branches(10_000, f);
@@ -262,4 +264,34 @@ fn a_block_retired_by_one_thread_is_reused_by_another() {
     // Other models reuse blocks too, so this flag alone does not prove the
     // concurrent case; the model's value is the race check on the reuse.
     assert!(REUSED_BLOCK.load(CoverageOrdering::Relaxed));
+}
+
+#[test]
+fn losing_the_first_install_pools_the_block_for_reuse() {
+    INSTALL_LOST.store(false, CoverageOrdering::Relaxed);
+    model(|| {
+        // An empty queue has no block: both first pushes try to install one.
+        let queue = Arc::new(ConcurrentQueue::<usize, 2>::new());
+        let other = Arc::clone(&queue);
+        let rival = thread::spawn(move || other.push(1));
+        queue.push(0);
+        rival.join().unwrap();
+        // The CAS loser pools its block instead of installing it.
+        let installed = queue.allocated_pages();
+        assert!(installed == 1 || installed == 2);
+
+        // Filling the page needs a successor. A lost block sits in the
+        // rival's free-stack shard, so this thread may allocate a fresh one
+        // rather than steal it; either way no block may be linked twice.
+        queue.push(2);
+        queue.push(3);
+        assert!(queue.allocated_pages() <= installed + 1);
+        let mut first = [queue.pop().unwrap(), queue.pop().unwrap()];
+        first.sort_unstable();
+        assert_eq!(first, [0, 1]);
+        assert_eq!(queue.pop(), Some(2));
+        assert_eq!(queue.pop(), Some(3));
+        assert_eq!(queue.pop(), None);
+    });
+    assert!(INSTALL_LOST.load(CoverageOrdering::Relaxed));
 }

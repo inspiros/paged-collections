@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use paged_collections::concurrent::ConcurrentQueue;
@@ -277,6 +277,11 @@ fn multiple_producers_and_consumers() {
         let queue = ConcurrentQueue::<_, PAGE>::new();
         let start = Barrier::new(producers + consumers);
         let done = AtomicBool::new(false);
+        // completed[p] is one past the highest sequence of producer p that a
+        // finished pop returned. A pop that starts after another pop finished
+        // must return a later value of that producer, whichever consumer ran
+        // it: this catches FIFO reversals across consumers.
+        let completed: Vec<_> = (0..producers).map(|_| AtomicUsize::new(0)).collect();
 
         let observed = thread::scope(|scope| {
             let writers: Vec<_> = (0..producers)
@@ -295,9 +300,21 @@ fn multiple_producers_and_consumers() {
                     scope.spawn(|| {
                         start.wait();
                         let mut values = Vec::new();
+                        let mut floor = vec![0; producers];
                         loop {
                             let finished = done.load(Ordering::Acquire);
+                            for (low, done) in floor.iter_mut().zip(&completed) {
+                                *low = done.load(Ordering::Acquire);
+                            }
                             if let Some(value) = queue.pop() {
+                                let (id, sequence) = value;
+                                assert!(
+                                    sequence >= floor[id],
+                                    "pop returned {value:?} after a finished pop of \
+                                     producer {id} sequence {}",
+                                    floor[id] - 1
+                                );
+                                completed[id].fetch_max(sequence + 1, Ordering::AcqRel);
                                 values.push(value);
                             } else if finished {
                                 return values;
@@ -334,6 +351,38 @@ fn multiple_producers_and_consumers() {
 
     check::<1>();
     check::<4>();
+}
+
+#[test]
+fn store_buffering_cannot_hide_a_finished_push() {
+    // Litmus test for the SeqCst tail CAS in `push` and the SeqCst fence
+    // before the tail load in `pop`. Loom weakens SeqCst read-modify-writes,
+    // so this ordering is only checked on real hardware. On x86 the locked
+    // CAS is a full barrier anyway, so this mainly guards weaker targets.
+    let rounds = if cfg!(miri) { 20 } else { 20_000 };
+    let mut queue = ConcurrentQueue::<u8, 4>::new();
+    let flag = AtomicBool::new(false);
+    let start = Barrier::new(2);
+    for _ in 0..rounds {
+        let (saw_flag, popped) = thread::scope(|scope| {
+            let pusher = scope.spawn(|| {
+                start.wait();
+                queue.push(1);
+                flag.load(Ordering::SeqCst)
+            });
+            start.wait();
+            flag.store(true, Ordering::SeqCst);
+            let popped = queue.pop();
+            let saw_flag = pusher.join().unwrap();
+            (saw_flag, popped)
+        });
+        assert!(
+            saw_flag || popped.is_some(),
+            "the pusher missed the flag and the pop missed the push"
+        );
+        queue.clear();
+        flag.store(false, Ordering::Relaxed);
+    }
 }
 
 #[test]

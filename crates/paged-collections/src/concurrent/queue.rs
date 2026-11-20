@@ -379,6 +379,8 @@ impl<T, const PAGE: usize> ConcurrentQueue<T, PAGE> {
                     self.head.0.block.store(new, Ordering::Release);
                     block = new;
                 } else {
+                    #[cfg(all(test, loom))]
+                    INSTALL_LOST.store(true, core::sync::atomic::Ordering::Relaxed);
                     self.pool_block(first);
                     tail = self.tail.0.index.load(Ordering::Acquire);
                     block = self.tail.0.block.load(Ordering::Acquire);
@@ -804,6 +806,11 @@ static BOUNDARY_WAITED: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// model): the cross-thread reuse model asserts it is reached.
 #[cfg(all(test, loom))]
 static REUSED_BLOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Set when a push loses the first-block install CAS (a plain atomic
+/// outside the loom model): the install race model asserts it is reached.
+#[cfg(all(test, loom))]
+static INSTALL_LOST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[cfg(all(test, loom))]
 enum PopStep<T, const PAGE: usize> {
