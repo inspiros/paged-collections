@@ -4,7 +4,7 @@ members = ["crates/paged-collections", "crates/paged-collections-python", "crate
 default-members = ["crates/paged-collections"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -14,7 +14,7 @@ keywords = ["sparse-set", "paged", "collections", "ecs", "data-structures"]
 categories = ["data-structures", "no-std"]
 
 [workspace.dependencies]
-paged-collections = { path = "crates/paged-collections", version = "0.1.0" }
+paged-collections = { path = "crates/paged-collections", version = "0.2.0" }
 # abi3 covers GIL builds from 3.10; abi3t covers free-threaded builds from
 # 3.15. Free-threaded 3.13 and 3.14 have no stable ABI and get
 # version-specific builds.

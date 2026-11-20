@@ -16,7 +16,7 @@ Minimum supported Rust version: 1.85 (edition 2024).
 
 ```toml
 [dependencies]
-paged-collections = { version = "0.1", default-features = false, features = ["concurrent"] }
+paged-collections = { version = "0.2", default-features = false, features = ["concurrent"] }
 ```
 
 `Hive`, `IdAllocator` and the concurrent module exist only on 32- and 64-bit
