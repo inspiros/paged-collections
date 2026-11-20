@@ -58,6 +58,7 @@ cargo run --release -p paged-collections-bench --bin churn
 cargo run --release -p paged-collections-bench --bin page_sweep
 cargo run --release -p paged-collections-bench --bin concurrent_scaling -- 2000000 7
 python benchmarks/python/concurrent_scaling.py --threads 1 2 4 8 --repeat 7
+python benchmarks/python/queues.py --threads 1 2 4 8 --repeat 5
 ```
 
 The largest cases need tens of GiB of memory; pass a Criterion filter
@@ -541,3 +542,54 @@ CPython 3.12.16 (GIL enabled):
 
 With the GIL, batch calls still overlap because they release it while in
 Rust; the free-threaded build also runs the Python-side dispatch in parallel.
+
+## Python Queues
+
+`benchmarks/python/queues.py --n 1000000 --threads 1 2 4 8 --repeat 5`,
+commit `0989af0`, pinned to 32 hardware threads (`taskset -c 64-95`).
+Medians in millions of items per second; higher is better. Python 3.12.16
+(GIL) and free-threaded 3.14.10 (no GIL). Run the script for the full table,
+including 1 and 2 thread pairs.
+
+FIFO: push then pop every item. Multi-threaded rows use T producers and T
+consumers; `SimpleQueue` consumers block in `get()`, the others retry on
+empty. "batch" uses `push_many` / `pop_many` with 1024 items.
+
+| Case | Python | `deque` | `SimpleQueue` | `ConcurrentQueue` | `ConcurrentQueue` batch |
+|---|---|---:|---:|---:|---:|
+| 1 thread | 3.12 | **16.29** | 12.24 | 6.05 | 12.64 |
+| 1 thread | 3.14t | 8.90 | 7.30 | 5.20 | **11.75** |
+| 4 + 4 threads | 3.12 | 3.49 | 4.49 | 1.81 | **6.23** |
+| 4 + 4 threads | 3.14t | 3.49 | 3.32 | 2.89 | **5.58** |
+| 8 + 8 threads | 3.12 | 3.89 | 4.55 | 2.19 | **6.08** |
+| 8 + 8 threads | 3.14t | 0.42 | 0.71 | 1.75 | **5.62** |
+
+Priority queues: `n` distinct keys with random `float` priorities, min
+order. **push+pop** pushes all then pops all. **update** also re-prioritises
+`n/2` random keys before popping; `heapq` skips stale entries (lazy
+invalidation), the paged queues update in place. **T threads** push their own
+keys, then all pop until empty; `heapq` runs under a `threading.Lock`.
+Throughput counts pushes, updates and pops.
+
+| Case | Python | `heapq` | `PriorityQueueF64` | `ConcurrentPriorityQueueF64.pop` | `.pop_exact` |
+|---|---|---:|---:|---:|---:|
+| push+pop | 3.12 | 0.21 | **0.70** | 0.64 | 0.22 |
+| push+pop | 3.14t | 0.23 | **0.89** | 0.83 | 0.24 |
+| update | 3.12 | 0.16 | **1.01** | 0.92 | |
+| update | 3.14t | 0.17 | **1.13** | 1.01 | |
+| 1 thread | 3.14t | 0.40 | | **1.50** | |
+| 4 threads | 3.14t | 0.17 | | **4.19** | |
+| 8 threads | 3.12 | 0.13 | | **0.89** | |
+| 8 threads | 3.14t | 0.15 | | **5.34** | |
+
+- Single calls cross the Python–Rust boundary once per item, so
+  `ConcurrentQueue.push`/`pop` alone are slower than `deque` on one thread;
+  batches close the gap and lead once threads contend.
+- `deque` and `SimpleQueue` slow down sharply on 3.14t at 8 + 8 threads;
+  `ConcurrentQueue` keeps its throughput.
+- `heapq` compares `(priority, key)` tuples through generic object
+  comparison and touches scattered objects; the paged queues keep keys and
+  priorities in flat arrays.
+- `pop` is relaxed: it takes the best of up to two sampled shard tops, not
+  always the global best. `pop_exact` locks every shard and costs about as
+  much as `heapq`.

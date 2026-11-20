@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/paged-collections)](https://crates.io/crates/paged-collections)
 [![crates.io downloads](https://img.shields.io/crates/d/paged-collections)](https://crates.io/crates/paged-collections)
 [![PyPI](https://img.shields.io/pypi/v/paged-collections)](https://pypi.org/project/paged-collections/)
-[![PyPI monthly downloads](https://img.shields.io/pypi/dm/paged-collections)](https://pypi.org/project/paged-collections/)
+[![PyPI downloads](https://static.pepy.tech/badge/paged-collections)](https://pepy.tech/project/paged-collections)
 [![Documentation](https://img.shields.io/badge/docs-website-475d7a?logo=mdbook&logoColor=white)](https://inspiros.github.io/paged-collections/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
@@ -88,22 +88,39 @@ del values                 # resizing raises BufferError while a view is alive
 | `PagedSparseMap<K, V>` | `SparseMap`, `SparseMapF64`, ... | index | Sparse set with a dense value array |
 | `PagedDirectMap<K, V>` | `DirectMap`, `DirectMapF64`, ... | index | Values in place; key order and range queries |
 | `PagedPriorityQueue<K, P>` | `PriorityQueue`, `PriorityQueueF64` | index | Indexed heap: priority changes and removal by key |
-| `ConcurrentPriorityQueue<K, P>` | `ConcurrentPriorityQueue`, `ConcurrentPriorityQueueF64` | index | Sharded indexed max-priority queue; relaxed `pop`, exact `pop_exact` |
 | `PagedVec<T>` | `PagedList`, `PagedListF64`, ... | storage | Growable vector with stable addresses |
 | `PagedDeque<T>` | `PagedDeque` | storage | Double-ended queue with stable addresses |
-| `ConcurrentQueue<T>` | `ConcurrentQueue` | storage | Shared FIFO queue; waits at page boundaries |
 | `Hive<T>` | `Hive` | storage | Unordered slots with generational ids |
 | `IdAllocator` | `IdAllocator`, `IdMap` | none | Generational ids for use as keys |
 
 The `rayon` feature enables parallel iteration through `rayon::prelude`.
 
-The `concurrent` feature adds thread-safe variants: `ConcurrentHive`,
-`ConcurrentAppendHive`, `ConcurrentPagedVec`, `ConcurrentSparseSet`/`Map`,
-`ConcurrentDirectMap`, `AtomicDirectMap`, `AtomicIdMap` and
-`ConcurrentIdAllocator`, `ConcurrentQueue` and `ConcurrentPriorityQueue`.
-Python binds the concurrent sparse set, primitive-valued concurrent maps,
-`ConcurrentQueue` for Python objects, and the numeric priority queues
-`ConcurrentPriorityQueue` and `ConcurrentPriorityQueueF64`.
+### Concurrent containers
+
+The `concurrent` feature (`no_std` compatible) adds thread-safe containers.
+They grow through shared references (`&self`), and pages stay at fixed
+addresses until exclusive access (`&mut self`), so lookups need no epochs or
+hazard pointers. The Python classes can be shared between threads, including
+on free-threaded builds; their batch methods (`*_many`) release the GIL.
+
+| Rust | Python | Shared operations (`&self`) | Lookups |
+|---|---|---|---|
+| `ConcurrentSparseSet<K>` | `ConcurrentSparseSet` | insert | `&K` |
+| `ConcurrentSparseMap<K, V>` | `ConcurrentSparseMapF64`, ... | insert | `&V` |
+| `ConcurrentDirectMap<K, V>` | `ConcurrentDirectMapF64`, ... | insert, replace, remove, entry (per-page `RwLock`) | closure, clone or entry guard |
+| `AtomicDirectMap` (`usize -> u64`), `AtomicIdMap` (`Id -> u32`) | — | lock-free insert, update, remove | copied value |
+| `ConcurrentQueue<T>` | `ConcurrentQueue` | push, pop (FIFO) | owned value from `pop` |
+| `ConcurrentPriorityQueue<K, P>` | `ConcurrentPriorityQueue`, `ConcurrentPriorityQueueF64` | push, change priority, remove, relaxed `pop`, exact `pop_exact` | cloned priority |
+| `ConcurrentPagedVec<T>` | — | push | `&T` |
+| `ConcurrentHive<T>` | — | insert, remove, take | `Ref` guard |
+| `ConcurrentAppendHive<T>` | — | insert | `&T` |
+| `ConcurrentIdAllocator` | — | alloc, free | |
+
+Removal from the sparse set, sparse map and append-only containers, as well
+as `clear`, `shrink_to_fit` and conversion to the sequential types, needs
+`&mut self`; in Python, such a call raises `RuntimeError` if it conflicts
+with another thread. See
+[Concurrent containers](https://inspiros.github.io/paged-collections/concurrent.html).
 
 ## Documentation
 
