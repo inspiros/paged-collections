@@ -39,6 +39,42 @@ classes support shared access from threads.
 {{#include ../examples/python_threads.python.txt}}
 ```
 
+## ConcurrentQueue
+
+`ConcurrentQueue(iterable=None)` holds Python objects in FIFO order. Threads
+can share `push`, `push_many`, `pop` and `pop_many`. `pop` raises `IndexError`
+when empty, and `pop_many(n)` returns up to `n` items, stopping at the first
+empty pop. Length and truthiness are approximate during concurrent use and
+exact when no operation is in flight.
+
+`clear()` and `drain()` require exclusive access. If another call holds a
+borrow, they raise `RuntimeError("Already borrowed")`. The queue has no
+iteration, peek, copy or pickle support. Use `drain()` to move the items into
+a list in FIFO order before copying or pickling. Python's garbage collector
+cannot collect reference cycles through a queue.
+
+## Concurrent Priority Queues
+
+`ConcurrentPriorityQueue` stores int64 priorities and
+`ConcurrentPriorityQueueF64` stores float64 priorities, with NaN rejected.
+Both take integer keys in `0 <= key < 2**32`. Pass `min=True` to prefer the
+lowest priority and `shards=` to choose a positive shard count. The initial
+items can be a mapping or iterable of pairs. Later duplicate keys win.
+`concurrent_priority_queue(dtype, items, min, shards=...)` selects the class
+by dtype.
+
+`pop()` uses relaxed ordering. With multiple shards, the entry it returns
+can rank below the global best. `pop_exact()` removes the global best and
+`peek_exact()` reads it. Both exact operations lock all shards. Ties have
+unspecified order. All three methods raise `IndexError` when they find no entry.
+
+`items()`, `sorted()`, copying and pickling each read one snapshot. It is
+consistent within each shard and weakly consistent across shards. `sorted()`
+lists the best priorities first, and copies and pickles preserve `min` and
+`shards`. Length and truthiness are exact when no write is in flight.
+`clear()` requires exclusive access and raises `RuntimeError("Already borrowed")`
+if another call holds a borrow.
+
 ## Free-threaded CPython
 
 Wheels exist for free-threaded 3.14t and 3.15t+ (see

@@ -14,6 +14,7 @@ include!(concat!(env!("OUT_DIR"), "/page_sizes.rs"));
 
 mod bit_set;
 mod concurrent;
+mod concurrent_queues;
 mod convert;
 mod deque;
 mod direct_map;
@@ -409,6 +410,10 @@ mod _core {
         ConcurrentDirectMapU64, ConcurrentSparseMapBool, ConcurrentSparseMapF32,
         ConcurrentSparseMapF64, ConcurrentSparseMapI32, ConcurrentSparseMapI64,
         ConcurrentSparseMapU32, ConcurrentSparseMapU64, ConcurrentSparseSet,
+    };
+    #[pymodule_export]
+    use crate::concurrent_queues::{
+        ConcurrentPriorityQueue, ConcurrentPriorityQueueF64, ConcurrentQueue,
     };
     #[pymodule_export]
     use crate::deque::{PagedDeque, PagedDequeIterator};

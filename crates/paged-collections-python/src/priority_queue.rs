@@ -27,13 +27,13 @@ fn reserved_len(len: usize, additional: usize) -> Option<usize> {
 /// A number with the queue's direction: every priority in one queue has the
 /// same `min`, so the order is total and consistent.
 #[derive(Clone, Copy)]
-struct Prio<T> {
-    value: T,
-    min: bool,
+pub(crate) struct Prio<T> {
+    pub(crate) value: T,
+    pub(crate) min: bool,
 }
 
 /// A priority type: `int64` or non-NaN `float64`.
-trait Number: Copy + PartialOrd + 'static {
+pub(crate) trait Number: Copy + PartialOrd + 'static {
     fn check(self) -> PyResult<Self> {
         Ok(self)
     }
@@ -69,6 +69,41 @@ impl<T: Number> Ord for Prio<T> {
             .unwrap_or(Ordering::Equal);
         if self.min { ord.reverse() } else { ord }
     }
+}
+
+/// Validate a mapping or iterable of pairs in input order before writing.
+pub(crate) fn extract_pairs<'py, T>(items: Option<&Bound<'py, PyAny>>) -> PyResult<Vec<(u32, T)>>
+where
+    T: Number + for<'a> FromPyObject<'a, 'py, Error = PyErr>,
+{
+    let mut pairs = Vec::new();
+    if let Some(items) = items {
+        // As with dict(items), a keys attribute selects the mapping protocol,
+        // even on a dict subclass. For an exact dict, snapshot its items:
+        // conversion callbacks may resize it.
+        let mut push = |key: &Bound<'py, PyAny>, priority: &Bound<'py, PyAny>| -> PyResult<()> {
+            pairs.push((insert_key(key)?, priority.extract::<T>()?.check()?));
+            Ok(())
+        };
+        if let Ok(dict) = items.cast_exact::<PyDict>() {
+            for item in dict.items().iter() {
+                let (key, priority): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
+                push(&key, &priority)?;
+            }
+        } else if let Some(keys) = items.getattr_opt("keys")? {
+            for key in keys.call0()?.try_iter()? {
+                let key = key?;
+                let priority = items.get_item(&key)?;
+                push(&key, &priority)?;
+            }
+        } else {
+            for item in items.try_iter()? {
+                let (key, priority): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item?.extract()?;
+                push(&key, &priority)?;
+            }
+        }
+    }
+    Ok(pairs)
 }
 
 macro_rules! priority_queue {
@@ -123,31 +158,7 @@ macro_rules! priority_queue {
                 // Validate both keys and priorities without borrowing or
                 // modifying self. On failure the previous contents/direction
                 // survive; conversion callbacks retain their own side effects.
-                let mut pairs = Vec::new();
-                if let Some(items) = items {
-                    // As with dict(items), a keys attribute selects the
-                    // mapping protocol, including on dict subclasses. An
-                    // exact dict cannot override it, so read a snapshot of
-                    // its items: conversion callbacks may resize it.
-                    if let Ok(d) = items.cast_exact::<PyDict>() {
-                        for item in d.items().iter() {
-                            let (k, p): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
-                            pairs.push((insert_key(&k)?, p.extract::<$t>()?.check()?));
-                        }
-                    } else if let Some(keys) = items.getattr_opt("keys")? {
-                        for k in keys.call0()?.try_iter()? {
-                            let k = k?;
-                            let p = items.get_item(&k)?;
-                            pairs.push((insert_key(&k)?, p.extract::<$t>()?.check()?));
-                        }
-                    } else {
-                        for item in items.try_iter()? {
-                            let item = item?;
-                            let (k, p): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
-                            pairs.push((insert_key(&k)?, p.extract::<$t>()?.check()?));
-                        }
-                    }
-                }
+                let pairs = extract_pairs::<$t>(items)?;
                 let mut replacement = Self { queue: QueueInner::new(page_size)?, min };
                 for (k, p) in pairs {
                     replacement.push_number(k, p)?;

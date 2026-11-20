@@ -88,10 +88,10 @@ del values                 # resizing raises BufferError while a view is alive
 | `PagedSparseMap<K, V>` | `SparseMap`, `SparseMapF64`, ... | index | Sparse set with a dense value array |
 | `PagedDirectMap<K, V>` | `DirectMap`, `DirectMapF64`, ... | index | Values in place; key order and range queries |
 | `PagedPriorityQueue<K, P>` | `PriorityQueue`, `PriorityQueueF64` | index | Indexed heap: priority changes and removal by key |
-| `ConcurrentPriorityQueue<K, P>` | Rust only | index | Sharded indexed max-priority queue; relaxed `pop`, exact `pop_exact` |
+| `ConcurrentPriorityQueue<K, P>` | `ConcurrentPriorityQueue`, `ConcurrentPriorityQueueF64` | index | Sharded indexed max-priority queue; relaxed `pop`, exact `pop_exact` |
 | `PagedVec<T>` | `PagedList`, `PagedListF64`, ... | storage | Growable vector with stable addresses |
 | `PagedDeque<T>` | `PagedDeque` | storage | Double-ended queue with stable addresses |
-| `ConcurrentQueue<T>` | Rust only | storage | Shared FIFO queue; waits at page boundaries |
+| `ConcurrentQueue<T>` | `ConcurrentQueue` | storage | Shared FIFO queue; waits at page boundaries |
 | `Hive<T>` | `Hive` | storage | Unordered slots with generational ids |
 | `IdAllocator` | `IdAllocator`, `IdMap` | none | Generational ids for use as keys |
 
@@ -101,8 +101,9 @@ The `concurrent` feature adds thread-safe variants: `ConcurrentHive`,
 `ConcurrentAppendHive`, `ConcurrentPagedVec`, `ConcurrentSparseSet`/`Map`,
 `ConcurrentDirectMap`, `AtomicDirectMap`, `AtomicIdMap` and
 `ConcurrentIdAllocator`, `ConcurrentQueue` and `ConcurrentPriorityQueue`.
-`ConcurrentQueue` and `ConcurrentPriorityQueue` are Rust-only; Python binds
-the primitive-valued concurrent sets and maps.
+Python binds the concurrent sparse set, primitive-valued concurrent maps,
+`ConcurrentQueue` for Python objects, and the numeric priority queues
+`ConcurrentPriorityQueue` and `ConcurrentPriorityQueueF64`.
 
 ## Documentation
 

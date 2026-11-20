@@ -1,4 +1,4 @@
-"""Paged lists, hives, sets and maps, and generational id allocation, implemented in Rust.
+"""Paged lists, queues, hives, sets and maps, and generational id allocation in Rust.
 
 ``BitSet``, ``SparseSet``, ``SparseMap`` and ``DirectMap`` use integer keys in
 ``0 <= key < 2**32``. ``BitSet`` stores one bit per slot in each allocated
@@ -16,11 +16,15 @@ map generational ids to values. ``sparse_map(dtype)``, ``direct_map(dtype)``,
 unboxed and expose individual pages as NumPy views. ``paged_list(dtype)``
 picks the list class for a dtype. ``PagedDeque`` is a paged
 ``collections.deque`` of objects with an optional ``maxlen``.
+``ConcurrentQueue`` is a shared FIFO of arbitrary objects.
 
 ``PriorityQueue`` (int64 priorities) and ``PriorityQueueF64`` (float64) map
 integer keys to priorities; ``pop`` returns the greatest, or the least with
 ``min=True``. Pushing a present key changes its priority.
 ``priority_queue(dtype)`` picks the queue class for a dtype.
+``ConcurrentPriorityQueue`` (int64) and ``ConcurrentPriorityQueueF64``
+(float64) add shared updates, relaxed ``pop`` and global ``pop_exact``.
+``concurrent_priority_queue(dtype)`` picks the concurrent class for a dtype.
 
 Every ``dtype`` argument takes anything ``numpy.dtype`` accepts: a name such
 as ``"float64"``, a scalar type such as ``np.float64``, a ``np.dtype``, or a
@@ -40,7 +44,7 @@ most ``MAX_GENERATION`` (2**31). Use ``IdMap`` to key a map by these ids.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, SupportsIndex, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -60,6 +64,9 @@ from paged_collections._core import (
     ConcurrentDirectMapI64,
     ConcurrentDirectMapU32,
     ConcurrentDirectMapU64,
+    ConcurrentPriorityQueue,
+    ConcurrentPriorityQueueF64,
+    ConcurrentQueue,
     ConcurrentSparseMapBool,
     ConcurrentSparseMapF32,
     ConcurrentSparseMapF64,
@@ -194,6 +201,9 @@ _TYPED_CONCURRENT_DIRECT_MAPS = {
 }
 
 _TYPED_PRIORITY_QUEUES = {np.dtype(cls.dtype): cls for cls in (PriorityQueue, PriorityQueueF64)}
+_TYPED_CONCURRENT_PRIORITY_QUEUES = {
+    np.dtype(cls.dtype): cls for cls in (ConcurrentPriorityQueue, ConcurrentPriorityQueueF64)
+}
 
 
 def _typed_class(dtype: npt.DTypeLike, typed: dict, kind: str) -> Any:
@@ -315,6 +325,56 @@ def priority_queue(
     cls = _typed_class(dtype, _TYPED_PRIORITY_QUEUES, "priority queue")
     return cls(items, min, page_size=page_size)
 
+
+@overload
+def concurrent_priority_queue(
+    dtype: Literal["int64"] | None = None,
+    items: Any = None,
+    min: bool = False,
+    *,
+    shards: SupportsIndex | None = None,
+) -> ConcurrentPriorityQueue: ...
+
+
+@overload
+def concurrent_priority_queue(
+    dtype: Literal["float64"],
+    items: Any = None,
+    min: bool = False,
+    *,
+    shards: SupportsIndex | None = None,
+) -> ConcurrentPriorityQueueF64: ...
+
+
+@overload
+def concurrent_priority_queue(
+    dtype: npt.DTypeLike,
+    items: Any = None,
+    min: bool = False,
+    *,
+    shards: SupportsIndex | None = None,
+) -> ConcurrentPriorityQueue | ConcurrentPriorityQueueF64: ...
+
+
+def concurrent_priority_queue(
+    dtype: npt.DTypeLike = None,
+    items: Any = None,
+    min: bool = False,
+    *,
+    shards: SupportsIndex | None = None,
+) -> ConcurrentPriorityQueue | ConcurrentPriorityQueueF64:
+    """Create a shared priority queue whose priorities have ``dtype``.
+
+    ``None`` or int64 gives a ``ConcurrentPriorityQueue``; float64 gives a
+    ``ConcurrentPriorityQueueF64``. The constructor takes ``items``, ``min``
+    and the optional shard count.
+    """
+    if dtype is None:
+        dtype = "int64"
+    cls = _typed_class(dtype, _TYPED_CONCURRENT_PRIORITY_QUEUES, "concurrent priority queue")
+    return cls(items, min, shards=shards)
+
+
 __all__ = [
     "DEFAULT_BIT_PAGE_SIZE",
     "DEFAULT_PAGE_SIZE",
@@ -330,6 +390,9 @@ __all__ = [
     "ConcurrentDirectMapI64",
     "ConcurrentDirectMapU32",
     "ConcurrentDirectMapU64",
+    "ConcurrentPriorityQueue",
+    "ConcurrentPriorityQueueF64",
+    "ConcurrentQueue",
     "ConcurrentSparseMapBool",
     "ConcurrentSparseMapF32",
     "ConcurrentSparseMapF64",
@@ -378,6 +441,7 @@ __all__ = [
     "SparseSet",
     "__version__",
     "concurrent_direct_map",
+    "concurrent_priority_queue",
     "concurrent_sparse_map",
     "id_generation",
     "id_index",

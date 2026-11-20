@@ -57,6 +57,31 @@ def test_import_keeps_the_gil_disabled() -> None:
     assert not sys._is_gil_enabled()
 
 
+@pytest.mark.skipif(not FREE_THREADED, reason="GIL build")
+def test_shared_concurrent_queues_need_no_borrow_retries() -> None:
+    fifo = pc.ConcurrentQueue()
+    priority_queue = pc.ConcurrentPriorityQueue([(0, -1)], shards=4)
+    per_thread = 500
+
+    def worker(i):
+        popped, replaced = [], []
+        for value in range(i * per_thread, (i + 1) * per_thread):
+            fifo.push(value)
+            popped.append(fifo.pop())
+            replaced.append(priority_queue.push(0, value))
+        return popped, replaced
+
+    results = _run(worker)
+    assert sorted(value for popped, _ in results for value in popped) == list(
+        range(THREADS * per_thread)
+    )
+    last = priority_queue.pop_exact()[1]
+    assert sorted([last] + [old for _, replaced in results for old in replaced]) == list(
+        range(-1, THREADS * per_thread)
+    )
+    assert not fifo and not priority_queue
+
+
 def test_shared_sparse_set_keeps_every_reported_add() -> None:
     s = pc.SparseSet()
     per = 2000
