@@ -4,43 +4,18 @@ use crate::storage::DirectInner;
 use numpy::PyArray1;
 use paged_collections::direct_map::PagedDirectMap;
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
-use std::ops::Bound as SlotBound;
 
 use crate::convert::{
-    KEY_LIMIT, Key, KeyBatch, TypedValue, insert_key, lookup_key, next_slot_index, prev_slot_index,
-    query_index, value_batch,
+    KEY_LIMIT, Key, KeyBatch, TypedValue, insert_key, lookup_key, map_constructor_batch,
+    next_slot_index, object_value_batch, prev_slot_index, query_bounds, value_batch,
 };
 use crate::iter::ordered_key_iterator;
 use crate::repr_items;
 use crate::typed_map::optional_default;
-
-/// Half-open Python bounds as inclusive Rust slot bounds. The inclusive
-/// upper bound also represents the full u32 domain on a 32-bit target.
-fn query_bounds(
-    start: Option<&Bound<'_, PyAny>>,
-    stop: Option<&Bound<'_, PyAny>>,
-) -> PyResult<(SlotBound<usize>, SlotBound<usize>)> {
-    let start = match start {
-        Some(index) => query_index(index)?.unwrap_or(0),
-        None => 0,
-    };
-    let stop = match stop {
-        Some(index) => query_index(index)?.unwrap_or(0),
-        None => KEY_LIMIT,
-    };
-    if start >= stop {
-        Ok((SlotBound::Excluded(0), SlotBound::Excluded(0)))
-    } else {
-        Ok((
-            SlotBound::Included(start as usize),
-            SlotBound::Included((stop - 1) as usize),
-        ))
-    }
-}
 
 /// Write a fully validated batch. Duplicate keys keep their last value.
 fn write_batch<V, const PAGE: usize>(
@@ -99,21 +74,24 @@ impl DirectMap {
         keys: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
     ) -> PyResult<usize> {
-        let keys = KeyBatch::new(keys)?.to_insert_keys()?;
-        let values: Vec<Py<PyAny>> = values
-            .try_iter()?
-            .map(|value| value.map(Bound::unbind))
-            .collect::<PyResult<_>>()?;
-        if values.len() != keys.len() {
-            return Err(PyValueError::new_err(format!(
-                "got {} values for {} keys",
-                values.len(),
-                keys.len()
-            )));
-        }
+        let keys = KeyBatch::<Key>::new(keys)?.to_insert_keys()?;
+        let values = object_value_batch(values, keys.len())?;
+        Self::write_validated_batch(slf, keys, values, None)
+    }
+
+    fn write_validated_batch(
+        slf: &Bound<'_, Self>,
+        keys: Vec<Key>,
+        values: Vec<Py<PyAny>>,
+        page_size: Option<usize>,
+    ) -> PyResult<usize> {
         let mut removed = Vec::with_capacity(keys.len());
         let new = {
             let mut this = slf.try_borrow_mut()?;
+            if let Some(size) = page_size.filter(|&size| size != this.map.page_size()) {
+                this.map.set_page_size(size)?;
+                this.changed();
+            }
             let before = this.map.len();
             for (key, value) in keys.into_iter().zip(values) {
                 removed.extend(this.map.insert(key, value));
@@ -157,6 +135,8 @@ impl DirectMap {
         Self::empty()
     }
 
+    /// Build from parallel keys and values, or from one mapping or iterable of pairs.
+    /// Validate all entries before writing. Later duplicates win.
     #[pyo3(signature = (keys = None, values = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
     fn __init__(
         slf: &Bound<'_, Self>,
@@ -164,20 +144,13 @@ impl DirectMap {
         values: Option<&Bound<'_, PyAny>>,
         #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
     ) -> PyResult<()> {
-        {
-            let mut this = slf.try_borrow_mut()?;
-            if this.map.page_size() != page_size {
-                this.map.set_page_size(page_size)?;
-                this.changed();
-            }
-        }
-        match (keys, values) {
-            (None, None) => Ok(()),
-            (Some(keys), Some(values)) => Self::set_batch(slf, keys, values).map(drop),
-            _ => Err(PyTypeError::new_err(
-                "give both keys and values, or neither",
-            )),
-        }
+        let (keys, values) = map_constructor_batch::<Key, _>(
+            keys,
+            values,
+            |value| Ok(value.clone().unbind()),
+            object_value_batch,
+        )?;
+        Self::write_validated_batch(slf, keys, values, Some(page_size)).map(drop)
     }
 
     fn __len__(&self) -> usize {
@@ -699,9 +672,22 @@ macro_rules! typed_direct_map {
                 keys: &Bound<'_, PyAny>,
                 values: &Bound<'_, PyAny>,
             ) -> PyResult<usize> {
-                let keys = KeyBatch::new(keys)?.to_insert_keys()?;
+                let keys = KeyBatch::<Key>::new(keys)?.to_insert_keys()?;
                 let values = value_batch::<$t>(values, keys.len())?;
+                Self::write_validated_batch(slf, keys, values, None)
+            }
+
+            fn write_validated_batch(
+                slf: &Bound<'_, Self>,
+                keys: Vec<Key>,
+                values: Vec<$t>,
+                page_size: Option<usize>,
+            ) -> PyResult<usize> {
                 let mut this = slf.try_borrow_mut()?;
+                if let Some(size) = page_size.filter(|&size| size != this.map.page_size()) {
+                    this.map.set_page_size(size)?;
+                    this.changed();
+                }
                 let new = paged!(DirectInner, &mut this.map, map => write_batch(map, keys, values));
                 if new > 0 {
                     this.changed();
@@ -726,6 +712,8 @@ macro_rules! typed_direct_map {
                 Self::empty()
             }
 
+            /// Build from parallel keys and values, or from one mapping or iterable of pairs.
+            /// Validate all entries before writing. Later duplicates win.
             #[pyo3(signature = (keys = None, values = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
             fn __init__(
                 slf: &Bound<'_, Self>,
@@ -733,18 +721,10 @@ macro_rules! typed_direct_map {
                 values: Option<&Bound<'_, PyAny>>,
                 #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
             ) -> PyResult<()> {
-                {
-                    let mut this = slf.try_borrow_mut()?;
-                    if this.map.page_size() != page_size {
-                        this.map.set_page_size(page_size)?;
-                        this.changed();
-                    }
-                }
-                match (keys, values) {
-                    (None, None) => Ok(()),
-                    (Some(keys), Some(values)) => Self::set_batch(slf, keys, values).map(drop),
-                    _ => Err(PyTypeError::new_err("give both keys and values, or neither")),
-                }
+                let (keys, values) = map_constructor_batch::<Key, _>(
+                    keys, values, |value| value.extract::<$t>(), value_batch::<$t>,
+                )?;
+                Self::write_validated_batch(slf, keys, values, Some(page_size)).map(drop)
             }
 
             fn __len__(&self) -> usize {

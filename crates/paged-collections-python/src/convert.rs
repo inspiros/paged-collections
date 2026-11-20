@@ -15,8 +15,10 @@ use numpy::{
 use paged_collections::id_alloc::Id;
 use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyInt;
+use pyo3::types::{PyDict, PyInt, PyTuple};
 use std::fmt;
+use std::num::NonZeroU32;
+use std::ops::Bound as SlotBound;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU8, AtomicU32, AtomicU64};
 
@@ -51,6 +53,30 @@ pub(crate) fn prev_slot_index(index: &Bound<'_, PyAny>) -> PyResult<Option<usize
     Ok(query_index(index)?.map(|index| index.min(KEY_LIMIT - 1) as usize))
 }
 
+/// Half-open Python bounds as inclusive Rust slot bounds. The inclusive
+/// upper bound represents the full u32 domain on a 32-bit target too.
+pub(crate) fn query_bounds(
+    start: Option<&Bound<'_, PyAny>>,
+    stop: Option<&Bound<'_, PyAny>>,
+) -> PyResult<(SlotBound<Key>, SlotBound<Key>)> {
+    let start = match start {
+        Some(index) => query_index(index)?.unwrap_or(0),
+        None => 0,
+    };
+    let stop = match stop {
+        Some(index) => query_index(index)?.unwrap_or(0),
+        None => KEY_LIMIT,
+    };
+    if start >= stop {
+        Ok((SlotBound::Excluded(0), SlotBound::Excluded(0)))
+    } else {
+        Ok((
+            SlotBound::Included(start as Key),
+            SlotBound::Included((stop - 1) as Key),
+        ))
+    }
+}
+
 /// A key type a Python collection can use: `u32` (integer keys) or
 /// [`Id`] (generational ids from `IdAllocator`, as `to_bits` integers).
 pub(crate) trait PyKey: paged_collections::key::Key + Copy + Eq + Ord + 'static {
@@ -69,6 +95,9 @@ pub(crate) trait PyKey: paged_collections::key::Key + Copy + Eq + Ord + 'static 
     const LOOKUP_FALLBACK: bool = false;
 
     fn to_bits(self) -> Self::Bits;
+
+    /// Make a key for an index-only range bound.
+    fn from_slot(index: Key) -> Self;
 
     /// The key with these bits, if they are valid.
     fn from_bits(bits: Self::Bits) -> Option<Self>;
@@ -102,6 +131,10 @@ impl PyKey for u32 {
 
     fn to_bits(self) -> u32 {
         self
+    }
+
+    fn from_slot(index: Key) -> Self {
+        index
     }
 
     fn from_bits(bits: u32) -> Option<Self> {
@@ -140,6 +173,10 @@ impl PyKey for Id {
 
     fn to_bits(self) -> u64 {
         Id::to_bits(self)
+    }
+
+    fn from_slot(index: Key) -> Self {
+        Id::new(index, NonZeroU32::MIN)
     }
 
     fn from_bits(bits: u64) -> Option<Self> {
@@ -181,6 +218,91 @@ pub(crate) fn lookup_key(obj: &Bound<'_, PyAny>) -> Option<Key> {
 /// The key `obj` names, for an insertion into an integer-keyed collection.
 pub(crate) fn insert_key(obj: &Bound<'_, PyAny>) -> PyResult<Key> {
     Key::insert(obj)
+}
+
+/// Visit a mapping through keys and lookup, or read an iterable of pairs.
+pub(crate) fn visit_pairs<'py>(
+    items: &Bound<'py, PyAny>,
+    unpack: impl Fn(&Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
+    mut visit: impl FnMut(&Bound<'py, PyAny>, &Bound<'py, PyAny>) -> PyResult<()>,
+) -> PyResult<()> {
+    if let Ok(dict) = items.cast_exact::<PyDict>() {
+        // Conversion callbacks can resize the dict, so snapshot its items.
+        for item in dict.items().iter() {
+            let (key, value): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
+            visit(&key, &value)?;
+        }
+    } else if let Some(keys) = items.getattr_opt("keys")? {
+        for key in keys.call0()?.try_iter()? {
+            let key = key?;
+            let value = items.get_item(&key)?;
+            visit(&key, &value)?;
+        }
+    } else {
+        for item in items.try_iter()? {
+            let item = item?;
+            let (key, value) = unpack(&item)?;
+            visit(&key, &value)?;
+        }
+    }
+    Ok(())
+}
+
+fn unpack_pair<'py>(item: &Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    if item.cast::<PyTuple>().is_ok() {
+        return item.extract();
+    }
+    let elements = item.try_iter()?.take(3).collect::<PyResult<Vec<_>>>()?;
+    let Ok([key, value]) = <[Bound<'_, PyAny>; 2]>::try_from(elements) else {
+        return Err(PyValueError::new_err(
+            "expected a pair with exactly two elements",
+        ));
+    };
+    Ok((key, value))
+}
+
+/// Stage all inputs to a plain map constructor before changing the map.
+pub(crate) fn map_constructor_batch<'py, K: PyKey, V>(
+    keys: Option<&Bound<'py, PyAny>>,
+    values: Option<&Bound<'py, PyAny>>,
+    value: impl Fn(&Bound<'py, PyAny>) -> PyResult<V>,
+    batch: impl FnOnce(&Bound<'py, PyAny>, usize) -> PyResult<Vec<V>>,
+) -> PyResult<(Vec<K>, Vec<V>)> {
+    match (keys, values) {
+        (None, None) => Ok((Vec::new(), Vec::new())),
+        (Some(keys), Some(values)) => {
+            let keys = KeyBatch::<K>::new(keys)?.to_insert_keys()?;
+            let values = batch(values, keys.len())?;
+            Ok((keys, values))
+        }
+        (Some(items), None) => {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            visit_pairs(items, unpack_pair, |key, item| {
+                keys.push(K::insert(key)?);
+                values.push(value(item)?);
+                Ok(())
+            })?;
+            Ok((keys, values))
+        }
+        (None, Some(_)) => Err(PyTypeError::new_err(
+            "give both keys and values, or neither",
+        )),
+    }
+}
+
+pub(crate) fn object_value_batch(obj: &Bound<'_, PyAny>, n: usize) -> PyResult<Vec<Py<PyAny>>> {
+    let values: Vec<_> = obj
+        .try_iter()?
+        .map(|value| value.map(Bound::unbind))
+        .collect::<PyResult<_>>()?;
+    if values.len() != n {
+        return Err(PyValueError::new_err(format!(
+            "got {} values for {n} keys",
+            values.len()
+        )));
+    }
+    Ok(values)
 }
 
 /// `obj` as a base-class NumPy array, through `numpy.asarray`. Subclasses

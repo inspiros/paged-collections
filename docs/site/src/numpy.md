@@ -11,7 +11,9 @@ uint64 ids. Keys may be Python ints or objects with `__index__`.
   Python sequences or (for integer-keyed classes) object arrays. `IdMap*`
   batches reject object-dtype arrays.
 - Batch insertion (`add_many`, `set_many`) rejects out-of-range keys.
-- Float key arrays are rejected.
+- The concurrent maps' `contains_many` accepts an iterable or a
+  one-dimensional array and reports invalid elements, including floats, as
+  absent. Other batch lookup methods reject float key arrays.
 
 ## Batch Methods
 
@@ -24,8 +26,8 @@ uint64 ids. Keys may be Python ints or objects with `__index__`.
 | `discard_many(keys)` | keys | number removed |
 | `keys()`, `values()` | | arrays (copies); object maps return values as a list |
 
-Batch methods run in one call into Rust and avoid creating a Python object
-per element.
+Batch methods run in one call into Rust. Native numeric arrays can avoid
+creating a Python object per element.
 
 ## Typed Values
 

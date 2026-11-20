@@ -78,11 +78,16 @@ it after a single slot lookup. For example, use
 | `first_key_value()`, `last_key_value()` | `first_item()`, `last_item()` |
 | `pop_first()`, `pop_last()` | `pop_first()`, `pop_last()` |
 | `next_occupant`, `prev_occupant` | `next_occupant(index)`, `prev_occupant(index)` |
+| `range(a..b)` | `items_range(a, b)`, `keys_range(a, b)`, `values_range(a, b)` |
 | `contains_key(k)` | `k in m`, `contains_many(keys)` |
 | `key_slice()` | `keys()` (copy), `keys_view()` (zero-copy, read-only) |
 | `value_slice()`, `value_slice_mut()` | typed maps: `values()` (copy), `values_view()` (zero-copy; writeable except for `SparseMapBool`); `SparseMap.values()` returns a list |
 | `sort_keys`, `sort_by*` | `sort_keys()` |
 | `allocated_pages()` | `allocated_pages` |
+
+Python `SparseMap`, `IdMap` and their typed variants accept parallel keys and
+values, one mapping, or one iterable of `(key, value)` pairs. They validate
+all input before writing and keep the last value for duplicate keys.
 
 Ordered queries follow the sparse index. `first_item()` and `last_item()`
 return the `(key, value)` pairs with the smallest and largest slot indices.
@@ -96,6 +101,11 @@ matches. Both accept integers outside the slot domain. A negative index is
 before the first slot, and an index of `2**32` or higher is past the last slot.
 For `IdMap` and its typed variants, pass a slot index and receive a packed ID
 as the key in the returned pair.
+
+`items_range(start=None, stop=None)`, `keys_range` and `values_range` return
+copies in ascending slot order for the half-open interval `[start, stop)`.
+`None` leaves a bound open and integer bounds are clamped to the slot domain.
+For `IdMap`, the bounds are slot indices and the returned keys are packed IDs.
 
 Batch methods are described in [NumPy Interop](numpy.md).
 

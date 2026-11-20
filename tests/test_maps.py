@@ -1,5 +1,6 @@
 """Shared map contracts, numeric conversions, object ownership and model tests."""
 
+from collections.abc import MutableMapping
 import copy
 import gc
 import pickle
@@ -31,6 +32,7 @@ def _assert_values(mapping, actual, expected):
 
 def test_constructor_and_scalar_operations(map_cls):
     m = map_cls()
+    assert isinstance(m, MutableMapping)
     a, b, c = _values(map_cls, [1, 2, 3])
     assert not m
     assert len(m) == 0
@@ -66,6 +68,41 @@ def test_constructor_and_scalar_operations(map_cls):
 def test_constructor_requires_both_keys_and_values(map_cls, kwargs):
     with pytest.raises(TypeError):
         map_cls(**kwargs)
+
+
+def test_constructor_mapping_and_pairs_are_validated_before_writing(map_cls):
+    a, b = _values(map_cls, [1, 2])
+    expected = {9: b, 2: a}
+    assert dict(map_cls(expected)) == expected
+    m = map_cls(iter([(9, a), (2, a), [9, b]]))
+    assert m.items() == [(9, b), (2, a)]
+    with pytest.raises(OverflowError):
+        m.__init__(iter([(9, a), (-1, b)]), page_size=pc.PAGE_SIZES[-1])
+    assert dict(m) == expected and m.page_size == pc.DEFAULT_PAGE_SIZE
+    with pytest.raises((TypeError, ValueError)):
+        m.__init__([(9, a), (2, b, a)])
+    assert dict(m) == expected
+    if map_cls is not pc.SparseMap:
+        with pytest.raises(TypeError):
+            m.__init__([(9, a), (2, object())])
+        assert dict(m) == expected
+
+
+def test_range_snapshots_are_in_slot_order(map_cls):
+    a, b, c = _values(map_cls, [1, 2, 3])
+    m = map_cls([4096, 0, 9], [a, b, c])
+    assert m.items_range() == [(0, b), (9, c), (4096, a)]
+    assert m.items_range(-2**100, 9) == [(0, b)]
+    assert m.items_range(start=4096) == [(4096, a)]
+    assert m.items_range(10, 9) == m.items_range(stop=-1) == []
+    keys, values = m.keys_range(9, 4096), m.values_range(9, 4096)
+    m.clear()
+    assert keys.dtype == np.dtype(np.uint32)
+    assert keys.tolist() == [9]
+    _assert_values(m, values, [c])
+    for method in (m.keys_range, m.values_range, m.items_range):
+        with pytest.raises(TypeError):
+            method(start=1.5)
 
 
 @pytest.mark.parametrize(

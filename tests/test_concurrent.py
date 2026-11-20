@@ -1,5 +1,6 @@
 """Copied concurrent APIs, conversion contracts and shared-call threading."""
 
+from collections.abc import Mapping, MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import pickle
@@ -17,6 +18,7 @@ MAPS = tuple(
     getattr(pc, f"Concurrent{kind}Map{suffix}")
     for kind in ("Sparse", "Direct") for suffix in SUFFIXES
 )
+DIRECT_MAPS = tuple(cls for cls in MAPS if cls.__name__.startswith("ConcurrentDirect"))
 CLASSES = (pc.ConcurrentSparseSet, *MAPS)
 
 
@@ -53,6 +55,90 @@ def _assert_map(m, oracle):
     assert values.dtype == np.dtype(m.dtype)
     assert keys.tolist() == [k for k, _ in items]
     np.testing.assert_array_equal(values, [v for _, v in items])
+
+
+def test_map_key_snapshot_and_batch_membership(map_cls):
+    m = map_cls([4096, 1], _values(map_cls, [1, 2]))
+    assert isinstance(m, Mapping)
+    assert not isinstance(m, MutableMapping)
+    keys = m.keys().tolist()
+    iterator = iter(m)
+    probes = [1, 4096, 2, -1, 2**32, 2**100, 1.0, "1", None]
+    expected = [key in m for key in probes]
+    for batch in (probes, np.array(probes, dtype=object), iter(probes)):
+        result = m.contains_many(batch)
+        assert result.dtype == np.dtype(bool)
+        assert result.tolist() == expected
+    assert m.contains_many(np.array([1, -1, 4096], dtype=np.int64)).tolist() == [True, False, True]
+    assert m.contains_many(np.array([1.0])).tolist() == [False]
+    assert m.contains_many([]).tolist() == []
+    with pytest.raises(ValueError, match="one-dimensional"):
+        m.contains_many(np.array([[1]]))
+    m.clear()
+    assert list(iterator) == keys
+    assert list(m) == []
+
+
+@pytest.mark.parametrize("cls", DIRECT_MAPS, ids=lambda cls: cls.__name__)
+def test_direct_range_snapshots(cls):
+    a, b, c = _values(cls, [1, 2, 3])
+    m = cls([4096, 0, 9], [a, b, c])
+    assert m.items_range() == [(0, b), (9, c), (4096, a)]
+    assert m.items_range(stop=9) == [(0, b)]
+    assert m.items_range(start=4096, stop=2**100) == [(4096, a)]
+    assert m.items_range(10, 9) == m.items_range(stop=-1) == []
+    keys = m.keys_range(start=np.int64(9), stop=4096)
+    values = m.values_range(9, 4096)
+    assert keys.dtype == np.dtype(np.uint32)
+    assert values.dtype == np.dtype(cls.dtype)
+    m.clear()
+    assert keys.tolist() == [9] and values.tolist() == [c]
+    for method in (m.keys_range, m.values_range, m.items_range):
+        with pytest.raises(TypeError):
+            method(stop=1.5)
+
+
+@pytest.mark.parametrize("cls", DIRECT_MAPS, ids=lambda cls: cls.__name__)
+def test_direct_get_or_insert_and_setdefault(cls):
+    a, b = _values(cls, [1, 2])
+    m = cls()
+    assert m.get_or_insert(1, a) == a
+    assert m.get_or_insert(1, b) == a
+    assert m.setdefault(2, value=b) == b
+    assert m.setdefault(2, a) == b
+    for method in (m.get_or_insert, m.setdefault):
+        with pytest.raises(OverflowError):
+            method(-1, a)
+        with pytest.raises(TypeError):
+            method("1", a)
+    assert m.items() == [(1, a), (2, b)]
+
+    barrier = threading.Barrier(2)
+
+    def insert(method, value):
+        barrier.wait(timeout=30)
+        return method(3, value)
+
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(insert, m.get_or_insert, a)
+        second = pool.submit(insert, m.setdefault, b)
+        assert first.result(timeout=30) == second.result(timeout=30) == m[3]
+
+
+def test_direct_shrink_to_fit_requires_exclusive_access():
+    m = pc.ConcurrentDirectMapI64([1, 4096], [10, 20])
+    del m[4096]
+
+    def keys():
+        with pytest.raises(RuntimeError, match="^Already borrowed$"):
+            m.shrink_to_fit()
+        yield 1
+
+    assert m.contains_many(keys()).tolist() == [True]
+    m.shrink_to_fit()
+    assert m.items() == [(1, 10)]
+    assert m.get_or_insert(4096, 30) == 30
+    assert m.items() == [(1, 10), (4096, 30)]
 
 
 def test_set_semantics_and_snapshots():

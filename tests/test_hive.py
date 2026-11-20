@@ -173,6 +173,19 @@ def test_basics_reuse_batches_and_side_map():
     assert hive != {}
 
 
+def test_keys_is_a_snapshot_of_live_ids():
+    hive = Hive(["a", "b", "c"])
+    first, second, third = hive.ids().tolist()
+    del hive[second]
+    replacement = hive.insert("replacement")
+    keys = hive.keys()
+    assert keys.dtype == np.dtype(np.uint64)
+    np.testing.assert_array_equal(keys, hive.ids())
+    del hive[first]
+    assert keys.tolist() == [first, replacement, third]
+    assert hive.keys().tolist() == [replacement, third]
+
+
 @pytest.mark.parametrize("bad", [-2**200, -1, 0, 1, 2**32 - 1, 2**64, 2**200,
                                  None, "id", 1.0, [], object(), np.float64(2**32)])
 def test_garbage_scalar_ids(bad):

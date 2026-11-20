@@ -102,6 +102,10 @@ entries and shrinks the directory; `reset` frees all pages.
 | `next_occupant`, `prev_occupant` | `next_occupant(i)`, `prev_occupant(i)` |
 | `shrink_to_fit`, `reset` | `shrink_to_fit()` |
 
+Python `DirectMap` and its typed variants accept parallel keys and values,
+one mapping, or one iterable of `(key, value)` pairs. They validate all input
+before writing and keep the last value for duplicate keys.
+
 Python direct maps have no zero-copy views: values are in pages, not in one
 array.
 

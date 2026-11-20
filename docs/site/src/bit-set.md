@@ -65,8 +65,11 @@ assert_eq!(bits.pop_first(), Some(62));
   raises `KeyError` for absent keys.
 - `BitSet(keys=None, *, page_size=DEFAULT_BIT_PAGE_SIZE)` accepts an
   initial one-dimensional integer array or sequence.
-- `first()` and `last()` return the smallest and largest keys. `pop()`
-  removes and returns the smallest key. All three raise `KeyError` on an
+- `toggle(key)` flips membership and returns whether the key is now present.
+  It validates keys the same way as `add`.
+- `first()` and `last()` return the smallest and largest keys. `pop_first()`
+  and `pop_last()` remove and return the respective keys. `pop()` is the same
+  as `pop_first()`. These methods raise `KeyError` on an
   empty set. `next_occupant(index)` and `prev_occupant(index)` return the
   nearest key at or beyond the given key in the respective direction,
   or `None` if there is no match. The index must be a valid key.

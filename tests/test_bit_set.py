@@ -1,5 +1,6 @@
 """BitSet's ordered, set-algebra and NumPy contracts."""
 
+from collections.abc import MutableSet
 import copy
 import gc
 import operator
@@ -25,6 +26,7 @@ class TaggedBitSet(BitSet):
 def test_default_and_scalar_operations():
     assert DEFAULT_BIT_PAGE_SIZE == _core.DEFAULT_BIT_PAGE_SIZE == 512
     s = BitSet()
+    assert isinstance(s, MutableSet)
     assert s.page_size == DEFAULT_BIT_PAGE_SIZE
     assert repr(s) == "BitSet([])"
     for query in (s.first, s.last, s.pop):
@@ -61,7 +63,7 @@ def test_scalar_validation_matches_sparse_set(key):
     with pytest.raises((OverflowError, TypeError)) as expected:
         SparseSet().add(key)
     s = BitSet([1])
-    for operation in (s.add, s.next_occupant, s.prev_occupant):
+    for operation in (s.add, s.toggle, s.next_occupant, s.prev_occupant):
         with pytest.raises(type(expected.value)) as error:
             operation(key)
         assert str(error.value) == str(expected.value)
@@ -70,6 +72,24 @@ def test_scalar_validation_matches_sparse_set(key):
     with pytest.raises(KeyError):
         s.remove(key)
     assert list(s) == [1]
+
+
+def test_toggle_and_ordered_pops_invalidate_iterators():
+    s = BitSet([4, 2, MAX_KEY])
+    iterator = iter(s)
+    assert s.toggle(np.uint32(4)) is False
+    with pytest.raises(RuntimeError, match="BitSet changed during iteration"):
+        next(iterator)
+    assert s.toggle(4) is True
+    iterator = iter(s)
+    assert s.pop_last() == MAX_KEY
+    with pytest.raises(RuntimeError, match="BitSet changed during iteration"):
+        next(iterator)
+    assert s.pop_first() == 2
+    assert s.pop() == 4
+    for pop in (s.pop, s.pop_first, s.pop_last):
+        with pytest.raises(KeyError, match="pop from an empty BitSet"):
+            pop()
 
 
 @pytest.mark.parametrize("size", [
@@ -229,6 +249,8 @@ def test_mask_errors_and_special_cases():
 def test_pickle_copy_and_subclass():
     size = PAGE_SIZES[-1]
     s = TaggedBitSet(["tag"], [17, 0, MAX_KEY], page_size=size)
+    assert not hasattr(s, "__copy__")
+    assert not hasattr(s, "__deepcopy__")
     assert weakref.ref(s)() is s
     # Bind first: pytest's assertion rewriting would keep a temporary alive.
     dead = weakref.ref(BitSet())

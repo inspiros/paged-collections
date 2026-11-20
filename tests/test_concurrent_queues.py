@@ -77,7 +77,7 @@ def test_fifo_push_many_keeps_items_yielded_before_error():
     assert queue.drain() == [1]
 
 
-def test_fifo_clear_and_drain_require_exclusive_access():
+def test_fifo_clear_drain_and_shrink_require_exclusive_access():
     queue = pc.ConcurrentQueue()
     entered = threading.Event()
     resume = threading.Event()
@@ -91,13 +91,26 @@ def test_fifo_clear_and_drain_require_exclusive_access():
         writer = pool.submit(queue.push_many, items())
         try:
             assert entered.wait(timeout=30)
-            for call in (queue.clear, queue.drain):
+            for call in (queue.clear, queue.drain, queue.shrink_to_fit):
                 with pytest.raises(RuntimeError, match="^Already borrowed$"):
                     call()
         finally:
             resume.set()
         assert writer.result(timeout=30) == 1
     assert queue.drain() == [1]
+
+
+def test_fifo_shrink_preserves_order_and_reclaims_pages():
+    queue = pc.ConcurrentQueue(range(4096))
+    assert queue.allocated_pages > 0
+    assert queue.pop_many(4093) == list(range(4093))
+    queue.shrink_to_fit()
+    assert queue.allocated_pages > 0
+    assert queue.drain() == [4093, 4094, 4095]
+    queue.shrink_to_fit()
+    assert queue.allocated_pages == 0
+    with pytest.raises(IndexError):
+        queue.pop()
 
 
 @pytest.mark.parametrize("operation", [copy.copy, copy.deepcopy, pickle.dumps])
@@ -294,9 +307,74 @@ def test_priority_queue_f64_rejects_nan():
         queue.push(1, math.nan)
     with pytest.raises(ValueError, match="priority must not be NaN"):
         queue[3] = math.nan
+    for push in (queue.push_increase, queue.push_decrease):
+        with pytest.raises(ValueError, match="priority must not be NaN"):
+            push(1, math.nan)
     with pytest.raises(ValueError, match="priority must not be NaN"):
         pc.ConcurrentPriorityQueueF64([(1, 1.0), (2, math.nan)])
     assert queue.sorted() == [(2, math.inf), (1, -math.inf)]
+
+
+@pytest.mark.parametrize("is_min", [False, True])
+def test_conditional_push_uses_numeric_priority(priority_queue_cls, is_min):
+    queue = priority_queue_cls(min=is_min, shards=4)
+    assert queue.push_increase(1, 2)
+    assert queue.push_decrease(2, 4)
+    assert not queue.push_increase(1, 2)
+    assert not queue.push_increase(1, 1)
+    assert queue.push_increase(1, 5)
+    assert not queue.push_decrease(2, 4)
+    assert not queue.push_decrease(2, 5)
+    assert queue.push_decrease(2, 3)
+    for push in (queue.push_increase, queue.push_decrease):
+        with pytest.raises(OverflowError):
+            push(2**32, 1)
+        with pytest.raises(TypeError):
+            push("1", 1)
+    expected = [(2, 3), (1, 5)]
+    if not is_min:
+        expected.reverse()
+    assert [queue.pop_exact(), queue.pop_exact()] == expected
+
+
+def test_priority_drain_and_shrink_require_exclusive_access(priority_queue_cls):
+    queue = priority_queue_cls({4096: 10}, min=True, shards=2)
+
+    class Key:
+        def __index__(self):
+            for call in (queue.drain, queue.shrink_to_fit):
+                with pytest.raises(RuntimeError, match="^Already borrowed$"):
+                    call()
+            return 1
+
+    queue.push(Key(), -3)
+    queue.shrink_to_fit()
+    pages = queue.allocated_pages
+    assert pages > 0
+    assert dict(queue.drain()) == {4096: 10, 1: -3}
+    assert not queue
+    assert queue.allocated_pages == pages
+    assert queue.drain() == []
+    with pytest.raises(IndexError):
+        queue.pop_exact()
+    queue.shrink_to_fit()
+    assert queue.allocated_pages == 0
+    queue.push(2, 4)
+    assert queue.pop_exact() == (2, 4)
+
+
+@pytest.mark.parametrize("is_min", [False, True])
+def test_priority_repr_includes_config_and_truncates(priority_queue_cls, is_min):
+    queue = priority_queue_cls({7: 2}, min=is_min, shards=3)
+    priority = repr(float(2) if priority_queue_cls is pc.ConcurrentPriorityQueueF64 else 2)
+    name = priority_queue_cls.__name__
+    assert repr(queue) == f"{name}({{7: {priority}}}, min={is_min}, shards=3)"
+    assert "__repr__" in priority_queue_cls.__dict__
+    for key in range(25):
+        queue.push(key, key)
+    display = repr(queue)
+    assert display.endswith(f"...}}, min={is_min}, shards=3)")
+    assert display.count(": ") == 20
 
 
 def test_priority_queue_constructor_inputs(priority_queue_cls):

@@ -12,7 +12,7 @@ use paged_collections::priority_queue::PagedPriorityQueue;
 use paged_collections::sparse_map::PagedSparseMap;
 use paged_collections::sparse_set::PagedSparseSet;
 use std::collections::TryReserveError;
-use std::ops::{Index, IndexMut, RangeBounds};
+use std::ops::{Bound, Index, IndexMut, RangeBounds};
 
 paged_enum!(pub(crate) enum SetInner [K: PyKey] [K] = PagedSparseSet [K] []);
 paged_enum!(pub(crate) enum BitSetInner [] [] = PagedBitSet [Key] []; crate::DEFAULT_BIT_PAGE_SIZE);
@@ -48,6 +48,10 @@ impl BitSetInner {
         paged!(Self, self, inner => inner.insert(key))
     }
 
+    pub(crate) fn toggle(&mut self, key: Key) -> bool {
+        paged!(Self, self, inner => inner.toggle(key))
+    }
+
     pub(crate) fn remove(&mut self, key: Key) -> bool {
         paged!(Self, self, inner => inner.remove(key))
     }
@@ -66,6 +70,10 @@ impl BitSetInner {
 
     pub(crate) fn pop_first(&mut self) -> Option<Key> {
         paged!(Self, self, inner => inner.pop_first())
+    }
+
+    pub(crate) fn pop_last(&mut self) -> Option<Key> {
+        paged!(Self, self, inner => inner.pop_last())
     }
 
     pub(crate) fn next_occupant(&self, key: Key) -> Option<Key> {
@@ -275,6 +283,13 @@ impl<K: PyKey, V> MapInner<K, V> {
     pub(crate) fn iter(&self) -> paged_collections::sparse_map::Iter<'_, K, V> {
         paged!(Self, self, inner => inner.iter())
     }
+    pub(crate) fn slot_range(
+        &self,
+        (start, stop): (Bound<Key>, Bound<Key>),
+    ) -> impl Iterator<Item = (&K, &V)> {
+        let bounds = (start.map(K::from_slot), stop.map(K::from_slot));
+        paged_iter!(Self, self, inner => inner.range(bounds))
+    }
     pub(crate) fn sort_unstable_keys(&mut self) {
         paged!(Self, self, inner => inner.sort_unstable_keys())
     }
@@ -361,8 +376,12 @@ impl<V> DirectInner<V> {
     }
     pub(crate) fn slot_range(
         &self,
-        range: impl RangeBounds<usize>,
+        (start, stop): (Bound<Key>, Bound<Key>),
     ) -> impl DoubleEndedIterator<Item = (Key, &V)> {
+        let range = (
+            start.map(|index| index as usize),
+            stop.map(|index| index as usize),
+        );
         paged_iter!(Self, self, inner => inner.slot_range(range))
     }
 }
@@ -574,6 +593,12 @@ impl<T> HiveInner<T> {
 impl<P: Ord> QueueInner<P> {
     pub(crate) fn push(&mut self, key: Key, priority: P) -> Option<P> {
         paged!(Self, self, inner => inner.push(key, priority))
+    }
+    pub(crate) fn push_increase(&mut self, key: Key, priority: P) -> bool {
+        paged!(Self, self, inner => inner.push_increase(key, priority))
+    }
+    pub(crate) fn push_decrease(&mut self, key: Key, priority: P) -> bool {
+        paged!(Self, self, inner => inner.push_decrease(key, priority))
     }
     pub(crate) fn pop(&mut self) -> Option<(Key, P)> {
         paged!(Self, self, inner => inner.pop())

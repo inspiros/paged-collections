@@ -1,8 +1,10 @@
 """Generational-key contracts shared by object and typed IdMaps."""
 
+from collections.abc import MutableMapping
 import copy
 import operator
 import pickle
+from types import MappingProxyType
 
 import numpy as np
 import pytest
@@ -103,6 +105,36 @@ def test_dict_operations_and_dense_removal(id_map_cls):
 def test_constructor_requires_both_arrays(id_map_cls, kwargs):
     with pytest.raises(TypeError):
         id_map_cls(**kwargs)
+
+
+def test_constructor_mapping_and_pairs_resolve_generations(id_map_cls):
+    a, b = _values(id_map_cls, [1, 2])
+    old, current, other = _id(7), _id(7, 0xFFFFFFFF), _id(2)
+    expected = {current: b, other: a}
+    assert dict(id_map_cls(MappingProxyType(expected))) == expected
+    m = id_map_cls(iter([(old, a), (other, a), (current, b)]))
+    assert isinstance(m, MutableMapping)
+    assert dict(m) == expected and old not in m
+    with pytest.raises(ValueError, match="not a valid id"):
+        m.__init__([(current, a), (2, b)])
+    assert dict(m) == expected
+
+
+def test_range_snapshots_use_slot_indices(id_map_cls):
+    a, b, c = _values(id_map_cls, [1, 2, 3])
+    high_generation, last, middle = _id(2, 0xFFFFFFFF), _id(4096), _id(7, 8)
+    m = id_map_cls([last, middle, high_generation], [a, b, c])
+    assert m.items_range() == [(high_generation, c), (middle, b), (last, a)]
+    assert m.items_range(start=np.int64(2), stop=7) == [(high_generation, c)]
+    assert m.items_range(7, 7) == m.items_range(start=2**100) == []
+    keys, values = m.keys_range(7, 4096), m.values_range(7, 4096)
+    m.clear()
+    assert keys.dtype == np.dtype(np.uint64)
+    assert keys.tolist() == [middle]
+    _assert_values(m, values, [b])
+    for method in (m.keys_range, m.values_range, m.items_range):
+        with pytest.raises(TypeError):
+            method(stop="7")
 
 
 @pytest.mark.parametrize("generation", [1, 2, 4, 0xFFFFFFFF])

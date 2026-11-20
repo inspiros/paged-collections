@@ -98,10 +98,13 @@ See [Ids and Side Tables](ids.md).
 | `get(id)`, `get_mut(id)`, indexing | `h[id]`, `get(id, default)`, `get_many(ids)` |
 | `remove(id)` | `pop(id[, default])`, `del h[id]`, `discard(id)`, `discard_many(ids)` |
 | `contains(id)` | `id in h`, `contains_many(ids)` |
-| `ids()`, `values()`, `iter()` | `ids()`, `values()`, `items()`, `iter(h)` (ids) |
+| `ids()`, `values()`, `iter()` | `ids()` (also `keys()`), `values()`, `items()`, `iter(h)` (ids) |
 | `id_of(&v)` | |
 | `sorted_ids*` | `sorted_ids(key=, reverse=)` |
 | `sort*` | `sort(key=, reverse=)` |
 | `retain`, `shrink_to_fit`, `reserve` | same names |
+
+`h.keys()` and `h.ids()` each return a new uint64 array of live ids in slot
+order.
 
 API: [`Hive`](https://docs.rs/paged-collections/latest/paged_collections/hive/struct.Hive.html).

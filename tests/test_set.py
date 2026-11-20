@@ -1,5 +1,6 @@
 """SparseSet's scalar, batch, ordering and iterator contracts."""
 
+from collections.abc import MutableSet
 import copy
 import pickle
 import random
@@ -14,6 +15,7 @@ from paged_collections import KEY_LIMIT, BitSet, SparseSet
 def test_empty_and_scalar_operations():
     assert KEY_LIMIT == 2**32
     s = SparseSet()
+    assert isinstance(s, MutableSet)
     assert len(s) == 0
     assert not s
     assert list(s) == []

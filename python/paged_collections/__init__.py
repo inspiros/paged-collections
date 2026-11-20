@@ -44,6 +44,7 @@ most ``MAX_GENERATION`` (2**31). Use ``IdMap`` to key a map by these ids.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, MutableMapping, MutableSequence, MutableSet
 from typing import Any, Literal, SupportsIndex, overload
 
 import numpy as np
@@ -205,6 +206,21 @@ _TYPED_CONCURRENT_PRIORITY_QUEUES = {
     np.dtype(cls.dtype): cls for cls in (ConcurrentPriorityQueue, ConcurrentPriorityQueueF64)
 }
 
+for _cls in (
+    SparseMap, DirectMap, IdMap,
+    *_TYPED_MAPS.values(), *_TYPED_DIRECT_MAPS.values(), *_TYPED_ID_MAPS.values(),
+):
+    MutableMapping.register(_cls)
+
+for _cls in (SparseSet, BitSet):
+    MutableSet.register(_cls)
+
+for _cls in (PagedList, *_TYPED_LISTS.values()):
+    MutableSequence.register(_cls)
+
+for _cls in (*_TYPED_CONCURRENT_SPARSE_MAPS.values(), *_TYPED_CONCURRENT_DIRECT_MAPS.values()):
+    Mapping.register(_cls)
+
 
 def _typed_class(dtype: npt.DTypeLike, typed: dict, kind: str) -> Any:
     """Resolve a dtype for a family without an object-valued class."""
@@ -254,7 +270,8 @@ def sparse_map(dtype: npt.DTypeLike = None, keys: Any = None, values: Any = None
     ``dtype=None`` or ``object`` gives a ``SparseMap`` of arbitrary objects.
     Otherwise ``dtype`` is anything ``numpy.dtype`` accepts and must be one of
     float64, float32, int64, int32, uint64, uint32 or bool. ``keys`` and
-    ``values`` are passed to the constructor.
+    ``values`` are passed to the constructor. With ``values`` omitted, pass a
+    mapping or iterable of pairs as ``keys``.
     """
     cls = _map_class(dtype, SparseMap, _TYPED_MAPS, "sparse")
     if keys is None and values is None:
@@ -268,7 +285,8 @@ def id_map(dtype: npt.DTypeLike = None, keys: Any = None, values: Any = None, *,
     ``dtype=None`` or ``object`` gives an ``IdMap`` of arbitrary objects.
     Otherwise ``dtype`` is anything ``numpy.dtype`` accepts and must be one of
     float64, float32, int64, int32, uint64, uint32 or bool. ``keys`` and
-    ``values`` are passed to the constructor.
+    ``values`` are passed to the constructor. With ``values`` omitted, pass a
+    mapping or iterable of pairs as ``keys``.
     """
     cls = _map_class(dtype, IdMap, _TYPED_ID_MAPS, "id")
     if keys is None and values is None:
@@ -282,8 +300,9 @@ def direct_map(dtype: npt.DTypeLike = None, keys: Any = None, values: Any = None
     ``dtype=None`` or ``object`` gives a ``DirectMap`` of arbitrary objects.
     Otherwise ``dtype`` is anything ``numpy.dtype`` accepts and must be one of
     float64, float32, int64, int32, uint64, uint32 or bool. ``keys`` and
-    ``values`` are passed to the constructor. Entries are always in ascending
-    key order; array results are copies.
+    ``values`` are passed to the constructor. With ``values`` omitted, pass a
+    mapping or iterable of pairs as ``keys``. Entries are always in ascending
+    key order and array results are copies.
     """
     cls = _map_class(dtype, DirectMap, _TYPED_DIRECT_MAPS, "direct")
     if keys is None and values is None:

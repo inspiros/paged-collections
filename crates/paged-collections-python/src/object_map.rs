@@ -3,12 +3,15 @@
 
 use crate::storage::MapInner;
 use numpy::PyArray1;
-use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 
-use crate::convert::{Key, KeyBatch, PyKey, next_slot_index, prev_slot_index};
+use crate::convert::{
+    Key, KeyBatch, PyKey, map_constructor_batch, next_slot_index, object_value_batch,
+    prev_slot_index, query_bounds,
+};
 use crate::export::{Exports, read_only_view};
 use crate::iter::key_iterator;
 use crate::repr_items;
@@ -64,17 +67,16 @@ macro_rules! object_map {
                 values: &Bound<'_, PyAny>,
             ) -> PyResult<usize> {
                 let keys = KeyBatch::<$K>::new(keys)?.to_insert_keys()?;
-                let values: Vec<Py<PyAny>> = values
-                    .try_iter()?
-                    .map(|value| value.map(Bound::unbind))
-                    .collect::<PyResult<_>>()?;
-                if values.len() != keys.len() {
-                    return Err(PyValueError::new_err(format!(
-                        "got {} values for {} keys",
-                        values.len(),
-                        keys.len()
-                    )));
-                }
+                let values = object_value_batch(values, keys.len())?;
+                Self::write_validated_batch(slf, keys, values, None)
+            }
+
+            fn write_validated_batch(
+                slf: &Bound<'_, Self>,
+                keys: Vec<$K>,
+                values: Vec<Py<PyAny>>,
+                page_size: Option<usize>,
+            ) -> PyResult<usize> {
                 let py = slf.py();
                 // Keep input values alive too: duplicate keys may replace an
                 // earlier input value while the batch is being written.
@@ -83,6 +85,11 @@ macro_rules! object_map {
                 let new = {
                     let mut borrow = slf.try_borrow_mut()?;
                     let this = &mut *borrow;
+                    if let Some(size) = page_size.filter(|&size| size != this.map.page_size()) {
+                        this.exports.check($pyname)?;
+                        this.map.set_page_size(size)?;
+                        this.changed();
+                    }
                     if keys.iter().any(|&k| !this.map.contains_key(k)) {
                         this.exports.check($pyname)?;
                     }
@@ -137,6 +144,8 @@ macro_rules! object_map {
                 Self::empty()
             }
 
+            /// Build from parallel keys and values, or from one mapping or iterable of pairs.
+            /// Validate all entries before writing. Later duplicates win.
             #[pyo3(signature = (keys = None, values = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
             fn __init__(
                 slf: &Bound<'_, Self>,
@@ -144,21 +153,10 @@ macro_rules! object_map {
                 values: Option<&Bound<'_, PyAny>>,
                 #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
             ) -> PyResult<()> {
-                {
-                    let mut this = slf.try_borrow_mut()?;
-                    if this.map.page_size() != page_size {
-                        this.exports.check($pyname)?;
-                        this.map.set_page_size(page_size)?;
-                        this.changed();
-                    }
-                }
-                match (keys, values) {
-                    (None, None) => Ok(()),
-                    (Some(keys), Some(values)) => Self::set_batch(slf, keys, values).map(drop),
-                    _ => Err(PyTypeError::new_err(
-                        "give both keys and values, or neither",
-                    )),
-                }
+                let (keys, values) = map_constructor_batch::<$K, _>(
+                    keys, values, |value| Ok(value.clone().unbind()), object_value_batch,
+                )?;
+                Self::write_validated_batch(slf, keys, values, Some(page_size)).map(drop)
             }
 
             fn __len__(&self) -> usize {
@@ -385,6 +383,44 @@ macro_rules! object_map {
                 Ok(prev_slot_index(index)?
                     .and_then(|index| self.map.prev_occupant(index))
                     .map(|(key, value)| (key.to_bits(), value.clone_ref(py))))
+            }
+
+            /// Return entries with slot indices in ``[start, stop)``, in
+            /// ascending slot order. Bounds are optional and clamped to the slot domain.
+            #[pyo3(signature = (start = None, stop = None))]
+            fn items_range(
+                &self,
+                py: Python<'_>,
+                start: Option<&Bound<'_, PyAny>>,
+                stop: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<Vec<(<$K as PyKey>::Bits, Py<PyAny>)>> {
+                Ok(self.map.slot_range(query_bounds(start, stop)?)
+                    .map(|(key, value)| (key.to_bits(), value.clone_ref(py))).collect())
+            }
+
+            /// Return a new array of keys with slot indices in ``[start, stop)``.
+            #[pyo3(signature = (start = None, stop = None))]
+            fn keys_range<'py>(
+                &self,
+                py: Python<'py>,
+                start: Option<&Bound<'_, PyAny>>,
+                stop: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<Bound<'py, PyArray1<<$K as PyKey>::Bits>>> {
+                let keys = self.map.slot_range(query_bounds(start, stop)?)
+                    .map(|(key, _)| key.to_bits()).collect();
+                Ok(PyArray1::from_vec(py, keys))
+            }
+
+            /// Return copied values with slot indices in ``[start, stop)``, in slot order.
+            #[pyo3(signature = (start = None, stop = None))]
+            fn values_range<'py>(
+                &self,
+                py: Python<'py>,
+                start: Option<&Bound<'_, PyAny>>,
+                stop: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<Bound<'py, PyList>> {
+                PyList::new(py, self.map.slot_range(query_bounds(start, stop)?)
+                    .map(|(_, value)| value.bind(py)))
             }
 
             /// Return the value for ``key``, first inserting ``default`` if ``key``

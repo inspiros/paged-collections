@@ -1,18 +1,20 @@
 //! Primitive concurrent containers. Detached loops use owned inputs only;
 //! PyO3 keeps the receiver borrowed until the entire Python call returns.
 
-use numpy::PyArray1;
+use numpy::{PyArray1, PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
 use paged_collections::concurrent::{
     ConcurrentDirectMap as RustDirectMap, ConcurrentSparseMap as RustSparseMap,
     ConcurrentSparseSet as RustSparseSet,
 };
 use paged_collections::sparse_map::PagedSparseMap;
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{PyKeyError, PyTypeError};
+use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyIterator, PyList, PyTuple};
 
-use crate::convert::{Key, KeyBatch, TypedValue, insert_key, lookup_key, value_batch};
+use crate::convert::{
+    Key, KeyBatch, TypedValue, insert_key, lookup_key, query_bounds, value_batch,
+};
 
 /// Copy even native NumPy keys before detaching: no array borrow or Python
 /// object is accessed by a detached loop. Invalid lookup keys stay absent.
@@ -21,6 +23,24 @@ fn lookup_keys(keys: &Bound<'_, PyAny>) -> PyResult<Vec<Option<Key>>> {
     let mut keys = Vec::with_capacity(batch.len());
     batch.for_each(|key| keys.push(key));
     Ok(keys)
+}
+
+/// Preserve the original elements for scalar-style membership checks.
+fn membership_keys(keys: &Bound<'_, PyAny>) -> PyResult<Vec<Option<Key>>> {
+    if let Ok(array) = keys.cast::<PyUntypedArray>() {
+        if array.ndim() != 1 {
+            return Err(PyValueError::new_err(format!(
+                "keys must be one-dimensional, got {} dimensions",
+                array.ndim()
+            )));
+        }
+        if matches!(array.dtype().kind(), b'i' | b'u') {
+            return lookup_keys(keys);
+        }
+    }
+    keys.try_iter()?
+        .map(|key| key.map(|key| lookup_key(&key)))
+        .collect()
 }
 
 /// The common copied lookup/snapshot interface, hiding direct-map guards.
@@ -310,6 +330,28 @@ macro_rules! concurrent_map {
                 PyArray1::from_vec(py, keys)
             }
 
+            /// Iterate over a snapshot of keys, with the same order and consistency as ``keys()``.
+            fn __iter__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyIterator>> {
+                let keys: Vec<_> = py.detach(|| self.map.copied_items().into_iter().map(|(key, _)| key).collect());
+                PyList::new(py, keys)?.as_any().try_iter()
+            }
+
+            /// Return a boolean array of membership tests. Invalid keys are
+            /// absent, as in ``key in map``. Releases the GIL during lookup.
+            fn contains_many<'py>(
+                &self,
+                py: Python<'py>,
+                keys: &Bound<'_, PyAny>,
+            ) -> PyResult<Bound<'py, PyArray1<bool>>> {
+                let keys = membership_keys(keys)?;
+                let present = py.detach(|| {
+                    keys.into_iter()
+                        .map(|key| key.is_some_and(|key| self.map.copied_get(key).is_some()))
+                        .collect()
+                });
+                Ok(PyArray1::from_vec(py, present))
+            }
+
             fn values<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<$t>> {
                 let values = py.detach(|| self.map.copied_items().into_iter().map(|(_, value)| value).collect());
                 PyArray1::from_vec(py, values)
@@ -418,6 +460,65 @@ macro_rules! direct_map {
 
             fn try_insert(&self, key: &Bound<'_, PyAny>, value: $t) -> PyResult<bool> {
                 Ok(self.map.try_insert(insert_key(key)?, value).is_ok())
+            }
+
+            /// Atomically insert the value if the key is absent. Return the stored value.
+            fn get_or_insert(&self, key: &Bound<'_, PyAny>, value: $t) -> PyResult<$t> {
+                let key = insert_key(key)?;
+                Ok(*self.map.get_or_insert_with(key, || value))
+            }
+
+            /// Atomically insert the value if the key is absent and return
+            /// the stored value, as in ``get_or_insert()``.
+            fn setdefault(&self, key: &Bound<'_, PyAny>, value: $t) -> PyResult<$t> {
+                self.get_or_insert(key, value)
+            }
+
+            /// Return a weakly consistent snapshot of the entries in
+            /// ``[start, stop)``, in ascending key order. Bounds are optional
+            /// and clamped to the key domain.
+            #[pyo3(signature = (start = None, stop = None))]
+            fn items_range(
+                &self,
+                py: Python<'_>,
+                start: Option<&Bound<'_, PyAny>>,
+                stop: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<Vec<(Key, $t)>> {
+                let bounds = query_bounds(start, stop)?;
+                Ok(py.detach(|| {
+                    let mut items = Vec::new();
+                    self.map.range_for_each(bounds, |&key, &value| items.push((key, value)));
+                    items
+                }))
+            }
+
+            /// Return a new uint32 array of keys in ``[start, stop)``, in key order.
+            #[pyo3(signature = (start = None, stop = None))]
+            fn keys_range<'py>(
+                &self,
+                py: Python<'py>,
+                start: Option<&Bound<'_, PyAny>>,
+                stop: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<Bound<'py, PyArray1<Key>>> {
+                let keys = self.items_range(py, start, stop)?.into_iter().map(|(key, _)| key).collect();
+                Ok(PyArray1::from_vec(py, keys))
+            }
+
+            /// Return a new array of values in ``[start, stop)``, in key order.
+            #[pyo3(signature = (start = None, stop = None))]
+            fn values_range<'py>(
+                &self,
+                py: Python<'py>,
+                start: Option<&Bound<'_, PyAny>>,
+                stop: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<Bound<'py, PyArray1<$t>>> {
+                let values = self.items_range(py, start, stop)?.into_iter().map(|(_, value)| value).collect();
+                Ok(PyArray1::from_vec(py, values))
+            }
+
+            /// Free pages with no live entries. Requires exclusive access.
+            fn shrink_to_fit(&mut self) {
+                self.map.shrink_to_fit();
             }
 
             #[pyo3(signature = (key, default = None))]

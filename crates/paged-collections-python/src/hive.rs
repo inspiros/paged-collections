@@ -630,6 +630,11 @@ impl Hive {
         PyArray1::from_vec(py, self.hive.ids().map(Id::to_bits).collect())
     }
 
+    /// Return a uint64 array of live ids in slot order, as in ``ids()``.
+    fn keys<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u64>> {
+        self.ids(py)
+    }
+
     fn values(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
         self.hive.values().map(|v| v.clone_ref(py)).collect()
     }

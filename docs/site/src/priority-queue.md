@@ -70,7 +70,7 @@ mutability. Neither causes undefined behaviour.
 |---|---|
 | `push(k, p) -> Option<P>` | `push(k, p)`, `q[k] = p` |
 | `try_push` | |
-| `push_increase`, `push_decrease` | |
+| `push_increase`, `push_decrease` | `push_increase(k, p)`, `push_decrease(k, p)` |
 | `pop()`, `peek()` | `pop()`, `peek()` (raise `IndexError` when empty) |
 | `change_priority(&k, p)`, `change_priority_with` | `push(k, p)`, `q[k] = p` |
 | `priority(&k)` | `q[k]`, `get(k, default)` |
@@ -78,5 +78,11 @@ mutability. Neither causes undefined behaviour.
 | `into_sorted_vec`, `into_sorted_iter` | `sorted()` |
 | `keys`, `priorities`, `key_slice`, `priority_slice` | `keys()`, `items()` |
 | `reserve`, `try_reserve` | |
+
+Python `push_increase` and `push_decrease` insert an absent key or update its
+priority only when the new numeric value is strictly greater or strictly
+smaller, respectively. Both return whether the queue changed. With
+`min=True`, `pop()` selects the lowest priority and these methods keep their
+numeric meanings.
 
 API: [`PagedPriorityQueue`](https://docs.rs/paged-collections/latest/paged_collections/priority_queue/struct.PagedPriorityQueue.html).

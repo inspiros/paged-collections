@@ -10,7 +10,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
 use crate::convert::{
-    Key, KeyBatch, PyKey, TypedValue, next_slot_index, prev_slot_index, value_batch,
+    Key, KeyBatch, PyKey, TypedValue, map_constructor_batch, next_slot_index, prev_slot_index,
+    query_bounds, value_batch,
 };
 use crate::export::{Exports, ValueCell, cell_view, read_only_view};
 use crate::iter::key_iterator;
@@ -149,6 +150,20 @@ macro_rules! typed_map {
             ) -> PyResult<usize> {
                 let keys = KeyBatch::<$K>::new(keys)?.to_insert_keys()?;
                 let values = value_batch::<$t>(values, keys.len())?;
+                Self::write_validated_batch(self, keys, values, None)
+            }
+
+            fn write_validated_batch(
+                &mut self,
+                keys: Vec<$K>,
+                values: Vec<$t>,
+                page_size: Option<usize>,
+            ) -> PyResult<usize> {
+                if let Some(size) = page_size.filter(|&size| size != self.map.page_size()) {
+                    self.exports.check($pyname)?;
+                    self.map.set_page_size(size)?;
+                    self.changed();
+                }
                 let new = paged!(MapInner, &mut self.map, map => write_cells(map, &self.exports, $pyname, keys, values))?;
                 if new > 0 {
                     self.changed();
@@ -174,23 +189,19 @@ macro_rules! typed_map {
                 Self::empty()
             }
 
+            /// Build from parallel keys and values, or from one mapping or iterable of pairs.
+            /// Validate all entries before writing. Later duplicates win.
             #[pyo3(signature = (keys = None, values = None, *, page_size = crate::DEFAULT_PAGE_SIZE))]
             fn __init__(
-                &mut self,
+                slf: &Bound<'_, Self>,
                 keys: Option<&Bound<'_, PyAny>>,
                 values: Option<&Bound<'_, PyAny>>,
                 #[pyo3(from_py_with = crate::extract_page_size)] page_size: usize,
             ) -> PyResult<()> {
-                if self.map.page_size() != page_size {
-                    self.exports.check($pyname)?;
-                    self.map.set_page_size(page_size)?;
-                    self.changed();
-                }
-                match (keys, values) {
-                    (None, None) => Ok(()),
-                    (Some(keys), Some(values)) => self.set_batch(keys, values).map(drop),
-                    _ => Err(PyTypeError::new_err("give both keys and values, or neither")),
-                }
+                let (keys, values) = map_constructor_batch::<$K, _>(
+                    keys, values, |value| value.extract::<$t>(), value_batch::<$t>,
+                )?;
+                Self::write_validated_batch(&mut *slf.try_borrow_mut()?, keys, values, Some(page_size)).map(drop)
             }
 
             fn __len__(&self) -> usize {
@@ -350,6 +361,44 @@ macro_rules! typed_map {
                 Ok(prev_slot_index(index)?
                     .and_then(|index| self.map.prev_occupant(index))
                     .map(|(key, value)| (key.to_bits(), value.get())))
+            }
+
+            /// Return entries with slot indices in ``[start, stop)``, in
+            /// ascending slot order. Bounds are optional and clamped to the slot domain.
+            #[pyo3(signature = (start = None, stop = None))]
+            fn items_range(
+                &self,
+                start: Option<&Bound<'_, PyAny>>,
+                stop: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<Vec<(<$K as PyKey>::Bits, $t)>> {
+                Ok(self.map.slot_range(query_bounds(start, stop)?)
+                    .map(|(key, value)| (key.to_bits(), value.get())).collect())
+            }
+
+            /// Return a new array of keys with slot indices in ``[start, stop)``.
+            #[pyo3(signature = (start = None, stop = None))]
+            fn keys_range<'py>(
+                &self,
+                py: Python<'py>,
+                start: Option<&Bound<'_, PyAny>>,
+                stop: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<Bound<'py, PyArray1<<$K as PyKey>::Bits>>> {
+                let keys = self.map.slot_range(query_bounds(start, stop)?)
+                    .map(|(key, _)| key.to_bits()).collect();
+                Ok(PyArray1::from_vec(py, keys))
+            }
+
+            /// Return copied values with slot indices in ``[start, stop)``, in slot order.
+            #[pyo3(signature = (start = None, stop = None))]
+            fn values_range<'py>(
+                &self,
+                py: Python<'py>,
+                start: Option<&Bound<'_, PyAny>>,
+                stop: Option<&Bound<'_, PyAny>>,
+            ) -> PyResult<Bound<'py, PyArray1<$t>>> {
+                let values = self.map.slot_range(query_bounds(start, stop)?)
+                    .map(|(_, value)| value.get()).collect();
+                Ok(PyArray1::from_vec(py, values))
             }
 
             /// Return the value for ``key``, first inserting ``default`` if

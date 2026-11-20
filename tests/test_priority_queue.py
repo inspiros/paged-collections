@@ -409,6 +409,28 @@ def test_constructor_duplicate_updates(cls, is_min):
 
 
 @pytest.mark.parametrize("is_min", [False, True])
+def test_conditional_push_uses_numeric_priority(cls, is_min):
+    q = cls(min=is_min)
+    assert q.push_increase(1, 2)
+    assert not q.push_increase(1, 2)
+    assert not q.push_increase(1, 1)
+    assert q.push_increase(1, 5)
+    assert q.push_decrease(2, 4)
+    assert not q.push_decrease(2, 4)
+    assert not q.push_decrease(2, 5)
+    assert q.push_decrease(2, 3)
+    for push in (q.push_increase, q.push_decrease):
+        with pytest.raises(OverflowError):
+            push(-1, 1)
+        with pytest.raises(TypeError):
+            push("1", 1)
+    expected = [(2, 3), (1, 5)]
+    if not is_min:
+        expected.reverse()
+    assert [q.pop(), q.pop()] == expected
+
+
+@pytest.mark.parametrize("is_min", [False, True])
 def test_f64_nan_updates_init_and_signed_zero(is_min):
     q = pc.PriorityQueueF64([(1, -0.0), (2, 0.0), (3, math.inf), (4, -math.inf)], min=is_min)
     assert math.copysign(1, q[1]) == -1
@@ -417,6 +439,9 @@ def test_f64_nan_updates_init_and_signed_zero(is_min):
     before = dict(q.items())
     with pytest.raises(ValueError):
         q.push(1, math.nan)
+    for push in (q.push_increase, q.push_decrease):
+        with pytest.raises(ValueError, match="priority must not be NaN"):
+            push(1, math.nan)
     assert dict(q.items()) == before
     with pytest.raises(ValueError):
         q.__init__([(5, 1), (6, math.nan)], min=not is_min)

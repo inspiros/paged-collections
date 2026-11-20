@@ -1,5 +1,6 @@
 """Ordered direct-map contracts, conversions, ownership and model tests."""
 
+from collections.abc import MutableMapping
 import copy
 import gc
 import operator
@@ -53,6 +54,7 @@ def _assert_values(m, actual, expected):
 def test_dict_methods(direct_cls):
     a, b, c = _values(direct_cls, [1, 2, 3])
     m = direct_cls()
+    assert isinstance(m, MutableMapping)
     assert not m and len(m) == 0
     assert m.get(4) is None
     sentinel = object()
@@ -82,9 +84,37 @@ def test_dict_methods(direct_cls):
     assert direct_cls([7], [a]) != direct_cls([2, 7], [a, a])
     with pytest.raises(TypeError):
         hash(m)
-    for kwargs in ({"keys": [1]}, {"values": [a]}):
-        with pytest.raises(TypeError, match="give both keys and values"):
-            direct_cls(**kwargs)
+    with pytest.raises(TypeError):
+        direct_cls(keys=[1])
+    with pytest.raises(TypeError, match="give both keys and values"):
+        direct_cls(values=[a])
+
+
+def test_constructor_with_mapping_protocol_and_pairs(direct_cls):
+    a, b = _values(direct_cls, [1, 2])
+
+    class MappingInput:
+        def keys(self):
+            return iter([9, 2])
+
+        def __getitem__(self, key):
+            return {9: b, 2: a}[key]
+
+    expected = [(2, a), (9, b)]
+    assert direct_cls(MappingInput()).items() == expected
+    m = direct_cls(iter([(9, a), (2, a), (9, b)]))
+    assert m.items() == expected
+
+    def broken():
+        yield 9, a
+        raise LookupError("broken input")
+
+    with pytest.raises(LookupError, match="broken input"):
+        m.__init__(broken())
+    assert m.items() == expected
+    with pytest.raises(TypeError):
+        m.__init__([(9, a), ("2", b)])
+    assert m.items() == expected
 
 
 @pytest.mark.parametrize(

@@ -8,10 +8,14 @@ classes support shared access from threads.
 
 | | Sparse set and maps | Direct maps |
 |---|---|---|
-| Shared inserts | set: `insert`, `insert_many`; maps: `try_insert`, `get_or_insert`, `insert_many` | `m[k] = v`, `insert`, `try_insert`, `set_many` |
+| Shared inserts | set: `insert`, `insert_many`; maps: `try_insert`, `get_or_insert`, `insert_many` | `m[k] = v`, `insert`, `try_insert`, `get_or_insert`, `setdefault`, `set_many` |
 | Shared removal | no | `del m[k]`, `remove`, `remove_many` |
-| Exclusive (conflicts raise) | `remove`, `remove_many`, `clear` | `clear` |
-| Existing values on insert | kept (`try_insert` semantics) | replaced |
+| Exclusive (conflicts raise) | `remove`, `remove_many`, `clear` | `clear`, `shrink_to_fit` |
+
+On a direct map, assignment, `insert` and `set_many` replace a stored value.
+`get_or_insert(key, value)` and `setdefault(key, value)` atomically insert if
+the key is absent and return the stored value. `shrink_to_fit()` frees pages
+with no live entries. Concurrent sparse map insertions keep existing values.
 
 - Default page size and `Flat` directory only; the constructors take no
   `page_size=`.
@@ -19,11 +23,17 @@ classes support shared access from threads.
 - Batch methods (`*_many`) release the GIL; single-key calls do not.
 - Results are copies (arrays, lists); there are no guards or views.
 - A conflicting exclusive call raises `RuntimeError("Already borrowed")`.
-- Direct-map snapshots (`keys`, `values`, `items`) are in key order.
+- Iteration visits a snapshot of keys with the same order and consistency as
+  `keys()`. The maps' `contains_many(keys)` returns a boolean array, treating
+  invalid keys as absent just as `key in m` does.
+- Direct-map snapshots are in ascending key order. `items_range(start=None,
+  stop=None)`, `keys_range` and `values_range` cover the half-open interval
+  `[start, stop)`. Bounds are optional and clamped to the key domain. Like
+  `items()`, each call is consistent within a page and weakly consistent
+  across pages.
 - `len()` is exact only when no write is in flight.
-- Constructors take initial contents like the plain classes:
-  `ConcurrentSparseSet(keys)` and `ConcurrentSparseMapF64(keys, values)`,
-  from NumPy arrays or sequences, validated before any write. Later duplicate
+- `ConcurrentSparseSet(keys)` and `ConcurrentSparseMapF64(keys, values)`
+  accept NumPy arrays or sequences, validated before any write. Later duplicate
   keys win, even in the insert-only sparse maps.
 - `pickle`, `copy.copy`, `copy.deepcopy` and `copy()` take one snapshot,
   with the same consistency as `items()`: entries inserted or removed during
@@ -47,11 +57,13 @@ when empty, and `pop_many(n)` returns up to `n` items, stopping at the first
 empty pop. Length and truthiness are approximate during concurrent use and
 exact when no operation is in flight.
 
-`clear()` and `drain()` require exclusive access. If another call holds a
-borrow, they raise `RuntimeError("Already borrowed")`. The queue has no
-iteration, peek, copy or pickle support. Use `drain()` to move the items into
-a list in FIFO order before copying or pickling. Python's garbage collector
-cannot collect reference cycles through a queue.
+`clear()`, `drain()` and `shrink_to_fit()` require exclusive access. If another
+call holds a borrow, they raise `RuntimeError("Already borrowed")`.
+`allocated_pages` counts all allocated pages, including those pooled for reuse.
+`shrink_to_fit()` frees pages the current values do not need and preserves FIFO
+order. The queue has no iteration, peek, copy or pickle support. Use `drain()`
+to move the items into a list in FIFO order before copying or pickling. Python's
+garbage collector cannot collect reference cycles through a queue.
 
 ## Concurrent Priority Queues
 
@@ -63,17 +75,27 @@ items can be a mapping or iterable of pairs. Later duplicate keys win.
 `concurrent_priority_queue(dtype, items, min, shards=...)` selects the class
 by dtype.
 
+`push_increase(key, priority)` and `push_decrease(key, priority)` insert an
+absent key or update its priority only when the new numeric value is strictly
+greater or strictly smaller, respectively, in either queue direction. The
+methods return whether the queue changed.
+
 `pop()` uses relaxed ordering. With multiple shards, the entry it returns
 can rank below the global best. `pop_exact()` removes the global best and
 `peek_exact()` reads it. Both exact operations lock all shards. Ties have
 unspecified order. All three methods raise `IndexError` when they find no entry.
 
-`items()`, `sorted()`, copying and pickling each read one snapshot. It is
-consistent within each shard and weakly consistent across shards. `sorted()`
-lists the best priorities first, and copies and pickles preserve `min` and
+`items()`, `sorted()`, `repr()`, copying and pickling each read one snapshot.
+It is consistent within each shard and weakly consistent across shards.
+`sorted()` lists the best priorities first. The repr includes the class,
+`min`, `shards` and up to 20 entries. Copies and pickles preserve `min` and
 `shards`. Length and truthiness are exact when no write is in flight.
-`clear()` requires exclusive access and raises `RuntimeError("Already borrowed")`
-if another call holds a borrow.
+
+`clear()`, `drain()` and `shrink_to_fit()` require exclusive access and raise
+`RuntimeError("Already borrowed")` if another call holds a borrow. `drain()`
+returns all `(key, priority)` pairs in arbitrary order and keeps allocated
+pages. `shrink_to_fit()` shrinks shard storage and frees the index pages of
+empty shards.
 
 ## Free-threaded CPython
 

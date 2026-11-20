@@ -11,7 +11,7 @@ use pyo3::exceptions::{PyIndexError, PyKeyError, PyMemoryError, PyOverflowError,
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
-use crate::convert::{insert_key, lookup_key};
+use crate::convert::{insert_key, lookup_key, visit_pairs};
 
 use crate::storage::QueueInner;
 
@@ -78,32 +78,14 @@ where
 {
     let mut pairs = Vec::new();
     if let Some(items) = items {
-        // As with dict(items), a keys attribute selects the mapping protocol,
-        // even on a dict subclass. For an exact dict, snapshot its items:
-        // conversion callbacks may resize it.
-        let mut push = |key: &Bound<'py, PyAny>, priority: &Bound<'py, PyAny>| -> PyResult<()> {
-            pairs.push((insert_key(key)?, priority.extract::<T>()?.check()?));
-            Ok(())
-        };
-        if let Ok(dict) = items.cast_exact::<PyDict>() {
-            for item in dict.items().iter() {
-                let (key, priority): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
-                push(&key, &priority)?;
-            }
-        } else if let Some(keys) = items.getattr_opt("keys")? {
-            for key in keys.call0()?.try_iter()? {
-                let key = key?;
-                let priority = items.get_item(&key)?;
-                push(&key, &priority)?;
-            }
-        } else {
-            for item in items.try_iter()? {
-                // Keep the pair alive while its key and priority convert.
-                let item = item?;
-                let (key, priority): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
-                push(&key, &priority)?;
-            }
-        }
+        visit_pairs(
+            items,
+            |item| item.extract(),
+            |key, priority| {
+                pairs.push((insert_key(key)?, priority.extract::<T>()?.check()?));
+                Ok(())
+            },
+        )?;
     }
     Ok(pairs)
 }
@@ -134,10 +116,34 @@ macro_rules! priority_queue {
             fn entries(&self) -> Vec<(u32, $t)> {
                 self.queue.iter().map(|(k, p)| (*k, p.value)).collect()
             }
-            fn push_number(&mut self, key: u32, value: $t) -> PyResult<Option<$t>> {
+            fn check_entry_room(&self, key: u32) -> PyResult<()> {
                 if !has_entry_room(self.queue.len(), self.queue.contains_key(&key)) {
                     return Err(PyValueError::new_err(concat!($pyname, " is full")));
                 }
+                Ok(())
+            }
+
+            fn push_conditional(
+                slf: &Bound<'_, Self>,
+                key: &Bound<'_, PyAny>,
+                priority: &Bound<'_, PyAny>,
+                increase: bool,
+            ) -> PyResult<bool> {
+                let key = insert_key(key)?;
+                let value = priority.extract::<$t>()?.check()?;
+                let mut this = slf.try_borrow_mut()?;
+                this.check_entry_room(key)?;
+                let priority = Prio { value, min: this.min };
+                // Min queues reverse the heap order, not the numeric comparison.
+                Ok(if increase != this.min {
+                    this.queue.push_increase(key, priority)
+                } else {
+                    this.queue.push_decrease(key, priority)
+                })
+            }
+
+            fn push_number(&mut self, key: u32, value: $t) -> PyResult<Option<$t>> {
+                self.check_entry_room(key)?;
                 Ok(self.queue.push(key, Prio { value, min: self.min }).map(|old| old.value))
             }
         }
@@ -237,6 +243,26 @@ macro_rules! priority_queue {
                 let k = insert_key(key)?;
                 let p = priority.extract::<$t>()?.check()?;
                 slf.try_borrow_mut()?.push_number(k, p)
+            }
+
+            /// Insert an absent key or update it only for a strictly greater
+            /// numeric priority, even with ``min=True``. Return whether it changed.
+            fn push_increase(
+                slf: &Bound<'_, Self>,
+                key: &Bound<'_, PyAny>,
+                priority: &Bound<'_, PyAny>,
+            ) -> PyResult<bool> {
+                Self::push_conditional(slf, key, priority, true)
+            }
+
+            /// Insert an absent key or update it only for a strictly smaller
+            /// numeric priority, even with ``min=True``. Return whether it changed.
+            fn push_decrease(
+                slf: &Bound<'_, Self>,
+                key: &Bound<'_, PyAny>,
+                priority: &Bound<'_, PyAny>,
+            ) -> PyResult<bool> {
+                Self::push_conditional(slf, key, priority, false)
             }
 
             /// Removes and returns ``(key, priority)`` with the greatest

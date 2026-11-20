@@ -33,8 +33,8 @@ const QUEUE_COPY_ERROR: &str =
 
 /// An unbounded FIFO of Python objects for shared pushes and pops.
 /// Length and truthiness are approximate under concurrency and exact when
-/// no operation is in flight. Clear and drain require exclusive access and
-/// raise RuntimeError (Already borrowed) when another call holds a borrow.
+/// no operation is in flight. Clear, drain and shrink_to_fit require exclusive
+/// access and raise RuntimeError (Already borrowed) if another call holds a borrow.
 /// There is no iteration, peek, copy, or pickle support. Reference cycles
 /// through this queue are not collected by Python's garbage collector.
 #[pyclass(module = "paged_collections._core", weakref)]
@@ -108,6 +108,17 @@ impl ConcurrentQueue {
         self.queue.drain().collect()
     }
 
+    /// Free pages that the current entries do not need. Requires exclusive access.
+    fn shrink_to_fit(&mut self) {
+        self.queue.shrink_to_fit();
+    }
+
+    /// Return the number of allocated pages, including pages pooled for reuse.
+    #[getter]
+    fn allocated_pages(&self) -> usize {
+        self.queue.allocated_pages()
+    }
+
     fn __repr__(&self) -> String {
         format!("ConcurrentQueue(len={})", self.queue.len())
     }
@@ -134,7 +145,7 @@ macro_rules! concurrent_priority_queue {
             "Ties have unspecified order. Length and truthiness are approximate under ",
             "concurrency and exact when no write is in flight. Items, sorted, copies and ",
             "pickling use one snapshot, consistent within each shard and weakly consistent ",
-            "across shards. Clear requires exclusive access and conflicting calls raise ",
+            "across shards. Clear, drain and shrink_to_fit require exclusive access. Conflicts raise ",
             "RuntimeError (Already borrowed)."
         )]
         // `mapping`: no sequence fallback, so iter() raises TypeError rather
@@ -207,6 +218,40 @@ macro_rules! concurrent_priority_queue {
                 let key = insert_key(key)?;
                 let value = priority.extract::<$t>()?.check()?;
                 Ok(self.queue.push(key, Prio { value, min: self.min }).map(|old| old.value))
+            }
+
+            /// Insert an absent key or update it only for a strictly greater
+            /// numeric priority, even with ``min=True``. Return whether it changed.
+            fn push_increase(
+                &self,
+                key: &Bound<'_, PyAny>,
+                priority: &Bound<'_, PyAny>,
+            ) -> PyResult<bool> {
+                let key = insert_key(key)?;
+                let value = priority.extract::<$t>()?.check()?;
+                let priority = Prio { value, min: self.min };
+                Ok(if self.min {
+                    self.queue.push_decrease(key, priority)
+                } else {
+                    self.queue.push_increase(key, priority)
+                })
+            }
+
+            /// Insert an absent key or update it only for a strictly smaller
+            /// numeric priority, even with ``min=True``. Return whether it changed.
+            fn push_decrease(
+                &self,
+                key: &Bound<'_, PyAny>,
+                priority: &Bound<'_, PyAny>,
+            ) -> PyResult<bool> {
+                let key = insert_key(key)?;
+                let value = priority.extract::<$t>()?.check()?;
+                let priority = Prio { value, min: self.min };
+                Ok(if self.min {
+                    self.queue.push_increase(key, priority)
+                } else {
+                    self.queue.push_decrease(key, priority)
+                })
             }
 
             fn __setitem__(&self, key: &Bound<'_, PyAny>, priority: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -283,6 +328,18 @@ macro_rules! concurrent_priority_queue {
                 self.queue.clear();
             }
 
+            /// Shrink shard storage and free index pages of empty shards.
+            /// Requires exclusive access.
+            fn shrink_to_fit(&mut self) {
+                self.queue.shrink_to_fit();
+            }
+
+            /// Remove and return all entries in arbitrary order, retaining
+            /// allocated pages for reuse. Requires exclusive access.
+            fn drain(&mut self) -> Vec<(Key, $t)> {
+                self.queue.drain().map(|(key, priority)| (key, priority.value)).collect()
+            }
+
             /// Return (key, priority) pairs from a weakly consistent snapshot.
             fn items(&self, py: Python<'_>) -> Vec<(Key, $t)> {
                 py.detach(|| {
@@ -295,6 +352,13 @@ macro_rules! concurrent_priority_queue {
                 py.detach(|| {
                     self.queue.snapshot().into_sorted_iter().map(|(key, priority)| (key, priority.value)).collect()
                 })
+            }
+
+            /// Show the class, direction, shard count and a truncated snapshot of entries.
+            fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+                let items = crate::repr_items(self.items(py).into_iter(), py)?;
+                let min = if self.min { "True" } else { "False" };
+                Ok(format!("{}({{{items}}}, min={min}, shards={})", stringify!($name), self.shards()))
             }
 
             /// Return an independent queue rebuilt from a weakly consistent snapshot.

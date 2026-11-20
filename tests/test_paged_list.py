@@ -1,5 +1,6 @@
 """PagedList's list protocol, reentrancy and stable page-view contract."""
 
+from collections.abc import MutableSequence
 import copy
 import gc
 import operator
@@ -36,6 +37,17 @@ def data(cls, values):
 
 def scalar(cls, value):
     return data(cls, [value])[0]
+
+
+def test_mutable_sequence_registration(list_cls):
+    values = list_cls()
+    assert isinstance(values, MutableSequence)
+    a, b = data(list_cls, [1, 2])
+    values.insert(0, a)
+    values[0] = b
+    assert list(values) == [b]
+    del values[0]
+    assert not values
 
 
 @pytest.mark.parametrize("length", [0, 1, 1023, 1024, 1025, 2047, 2048, 2049])

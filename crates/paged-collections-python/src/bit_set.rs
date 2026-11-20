@@ -350,6 +350,15 @@ impl BitSet {
         Ok(())
     }
 
+    /// Flip membership of the key and return whether it is now present.
+    fn toggle(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let key = insert_key(key)?;
+        let mut this = slf.try_borrow_mut()?;
+        let present = this.set.toggle(key);
+        this.record_change(true);
+        Ok(present)
+    }
+
     fn discard(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>) -> PyResult<()> {
         if let Some(key) = lookup_key(key) {
             let mut this = slf.try_borrow_mut()?;
@@ -372,9 +381,24 @@ impl BitSet {
 
     /// Remove and return the smallest key. Raise KeyError if empty.
     fn pop(&mut self) -> PyResult<Key> {
+        self.pop_first()
+    }
+
+    /// Remove and return the smallest key. Raise KeyError if empty.
+    fn pop_first(&mut self) -> PyResult<Key> {
         let key = self
             .set
             .pop_first()
+            .ok_or_else(|| PyKeyError::new_err("pop from an empty BitSet"))?;
+        self.record_change(true);
+        Ok(key)
+    }
+
+    /// Remove and return the largest key. Raise KeyError if empty.
+    fn pop_last(&mut self) -> PyResult<Key> {
+        let key = self
+            .set
+            .pop_last()
             .ok_or_else(|| PyKeyError::new_err("pop from an empty BitSet"))?;
         self.record_change(true);
         Ok(key)
