@@ -69,8 +69,10 @@ The Rust example prints `range = [30, 20]` in place of the last line: it queries
 | [`PagedSparseMap<K, V>`](sparse-map.md) | `SparseMap`, `SparseMapF64`, ... | index | Sparse set with a dense value array |
 | [`PagedDirectMap<K, V>`](direct-map.md) | `DirectMap`, `DirectMapF64`, ... | index | Values stored in place; key order and range queries |
 | [`PagedPriorityQueue<K, P>`](priority-queue.md) | `PriorityQueue`, `PriorityQueueF64` | index | Indexed heap with priority changes and removal by key |
+| [`ConcurrentPriorityQueue<K, P>`](concurrent.md#concurrentpriorityqueue) | Rust only | index | Sharded max-priority queue; relaxed `pop`, exact `pop_exact` |
 | [`PagedVec<T>`](paged-vec.md) | `PagedList`, `PagedListF64`, ... | storage | Growable vector with stable addresses |
 | [`PagedDeque<T>`](deque.md) | `PagedDeque` | storage | Double-ended queue with stable addresses |
+| [`ConcurrentQueue<T>`](concurrent.md#concurrentqueue) | Rust only | storage | Shared FIFO queue; waits at page boundaries |
 | [`Hive<T>`](hive.md) | `Hive` | storage | Unordered slots with generational ids |
 | [`IdAllocator`](ids.md) | `IdAllocator`, `IdMap` | none | Generational id allocation for use as keys |
 

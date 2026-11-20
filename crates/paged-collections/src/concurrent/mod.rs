@@ -25,6 +25,15 @@
 //! hole-free prefix which can lag while an earlier push is in flight. When
 //! no push is in flight, the prefix equals the number of reservations.
 //!
+//! [`ConcurrentQueue`] is an unbounded multi-producer, multi-consumer FIFO
+//! adapted from Crossbeam's `SegQueue`; it recycles pages through a free stack.
+//! It waits at page boundaries, and a pop can wait for a claimed value to be
+//! published. Shared iteration and peeking are unavailable.
+//!
+//! [`ConcurrentPriorityQueue`] is an indexed max-priority queue sharded by key
+//! page. Its `pop` is relaxed: it samples up to two shard tops and does not
+//! guarantee the global maximum. Use `pop_exact` for the global maximum.
+//!
 //! [`ConcurrentSparseSet`] and [`ConcurrentSparseMap`] allow shared insertion
 //! and return ordinary shared references. Entries cannot be removed or
 //! changed while shared. Insertions of the same slot wait for its writer;
@@ -90,6 +99,34 @@
 //! fn identity_10(x: ConcurrentSparseMap<usize, &'static u8, 4, Radix>) -> ConcurrentSparseMap<usize, &'static u8, 4, Radix> { x }
 //! fn identity_11(x: ConcurrentDirectMap<&'static K, (), 4, Radix>) -> ConcurrentDirectMap<&'static K, (), 4, Radix> { x }
 //! fn identity_12(x: ConcurrentDirectMap<usize, &'static u8, 4, Radix>) -> ConcurrentDirectMap<usize, &'static u8, 4, Radix> { x }
+//! fn identity_13(x: ConcurrentQueue<&'static u8>) -> ConcurrentQueue<&'static u8> { x }
+//! fn identity_14(x: ConcurrentPriorityQueue<&'static K, ()>) -> ConcurrentPriorityQueue<&'static K, ()> { x }
+//! fn identity_15(x: ConcurrentPriorityQueue<usize, &'static u8>) -> ConcurrentPriorityQueue<usize, &'static u8> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentQueue;
+//! fn shorten<'a>(x: ConcurrentQueue<&'static u8>) -> ConcurrentQueue<&'a u8> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentPriorityQueue;
+//! use paged_collections::key::Key;
+//! #[derive(PartialEq, Eq)]
+//! struct K(usize);
+//! impl Key for &K { fn index(self) -> usize { self.0 } }
+//! fn shorten<'a>(x: ConcurrentPriorityQueue<&'static K, ()>) -> ConcurrentPriorityQueue<&'a K, ()> { x }
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # #[cfg(feature = "concurrent")] {
+//! use paged_collections::concurrent::ConcurrentPriorityQueue;
+//! fn shorten<'a>(x: ConcurrentPriorityQueue<usize, &'static u8>) -> ConcurrentPriorityQueue<usize, &'a u8> { x }
 //! # }
 //! ```
 //!

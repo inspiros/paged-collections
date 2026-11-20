@@ -10,6 +10,8 @@ They come from one machine and serve as a reference.
 | Key-ordered iteration, range and nearest-key queries over dense ranges | `PagedDirectMap` | `BTreeMap` | keys are sparse inside their pages (iteration scans whole pages) |
 | Entries as contiguous slices or arrays | `PagedSparseMap` (`key_slice`, `value_slice`; Python views) | `HashMap` | |
 | Priority changes or removal by key | `PagedPriorityQueue` | `priority-queue` crate | priorities never change: `BinaryHeap` is faster |
+| Shared FIFO queue | [`ConcurrentQueue`](concurrent.md#concurrentqueue) (Rust only) | | |
+| Shared indexed max-priority queue | [`ConcurrentPriorityQueue`](concurrent.md#concurrentpriorityqueue) (Rust only); relaxed `pop`, exact `pop_exact` | | |
 | References that survive growth | `PagedVec`, `PagedDeque` | `Vec`, `VecDeque` | random access dominates and addresses need not be stable |
 | Handles that detect removal (stale ids) | `Hive`, or `IdAllocator` with a paged map | `slotmap` | raw lookup speed matters more than stable addresses |
 | Shared insertion from many threads | [concurrent containers](concurrent.md) | a `Mutex` around a plain container | a single thread mutates: the plain types are faster |

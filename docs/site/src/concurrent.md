@@ -28,6 +28,8 @@ need `&mut self`.
 | `ConcurrentHive<T>` | insert, remove, take | iteration with `&mut`, drain, `shrink_to_fit`, `into_hive` | `Ref` guard (two atomic writes per lookup) |
 | `ConcurrentAppendHive<T>` | insert | remove, mutable access, `shrink_to_fit`, `into_hive` | `&T` (one Acquire load) |
 | `ConcurrentPagedVec<T>` | push | removal, editing, conversion | `&T` |
+| `ConcurrentQueue<T>` (Rust only) | push, pop | clear, drain, `shrink_to_fit` | owned value from `pop` |
+| `ConcurrentPriorityQueue<K, P>` (Rust only) | push, change priority, remove, pop | clear, drain, `shrink_to_fit` | cloned priority or closure |
 | `ConcurrentSparseSet<K>`, `ConcurrentSparseMap<K, V>` | insert | removal, clear, conversion | `&K`, `&V` |
 | `ConcurrentDirectMap<K, V>` | insert, replace, remove, entry (per-page `RwLock`) | `reset`, `into_inner` | closures (`with`), clones (`get_cloned`), entry guards |
 | `AtomicDirectMap` (`usize -> u64`) | lock-free insert, update, remove | | copied `u64` |
@@ -56,6 +58,33 @@ Notes per type:
 - **AtomicDirectMap, AtomicIdMap**: prefer them over `ConcurrentDirectMap`
   when values fit: `u64` values below `u64::MAX`, or any `u32` value keyed by
   `Id`. Traversals copy values in index order.
+
+## ConcurrentQueue
+
+`ConcurrentQueue` is an unbounded multi-producer, multi-consumer FIFO queue,
+adapted from Crossbeam's `SegQueue`. It recycles pages through a free stack and
+waits at page boundaries. A pop can also wait for a push that has claimed a
+slot to publish its value. Shared peeking, iteration, cloning, snapshots and
+serialization are unavailable; an owned queue can be converted to a
+`PagedDeque` for serialization. This type is Rust-only.
+
+```rust
+{{#include ../../../crates/paged-collections/examples/doc_concurrent.rs:queue}}
+```
+
+## ConcurrentPriorityQueue
+
+`ConcurrentPriorityQueue` is an indexed max-priority queue split into shards
+by key page. Its `pop` is relaxed: it chooses the greatest of up to two sampled
+shard tops, with a fallback scan, and does not guarantee the global maximum.
+Use `pop_exact` to select the global maximum. Per-key operations lock one
+shard; `pop_exact` locks all shards. Callbacks and user trait implementations
+run under shard locks and must not call back into the same queue. This type is
+Rust-only.
+
+```rust
+{{#include ../../../crates/paged-collections/examples/doc_concurrent.rs:priority_queue}}
+```
 
 ## Directories
 

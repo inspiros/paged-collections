@@ -32,7 +32,9 @@
 //! - `serde`: serialization support.
 //! - `rayon`: parallel iteration through `rayon::prelude`. Enables `std`.
 //! - `concurrent`: thread-safe variants in [`concurrent`], which use `unsafe`
-//!   code and atomics. Off by default.
+//!   code and atomics. Includes an MPMC FIFO `ConcurrentQueue` that waits at
+//!   page boundaries and a sharded `ConcurrentPriorityQueue` with relaxed
+//!   `pop` and exact `pop_exact`. Off by default.
 
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
